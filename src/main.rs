@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ use x11rb::errors::ReplyError;
 use x11rb::image::{BitsPerPixel, Image, ImageOrder, ScanlinePad};
 use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
 use x11rb::protocol::shape::{self, ConnectionExt as ShapeConnectionExt};
+use x11rb::protocol::xfixes::{self, ConnectionExt as XFixesConnectionExt};
 use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::{ErrorKind, Event};
@@ -714,6 +715,7 @@ struct Aurora {
     folder_drag: Option<PathBuf>,
     xdnd_source: Option<Window>,
     dock_last_click: Option<DockClickState>,
+    icon_cache: HashMap<String, Option<Vec<u8>>>,
     last_clock_label: String,
     last_tick: Instant,
     last_media_tick: Instant,
@@ -893,6 +895,7 @@ impl Aurora {
             folder_drag: None,
             xdnd_source: None,
             dock_last_click: None,
+            icon_cache: HashMap::new(),
             last_clock_label: format_clock(),
             last_tick: Instant::now(),
             last_media_tick: Instant::now(),
@@ -1097,8 +1100,37 @@ impl Aurora {
         self.conn.map_window(self.ui.topbar)?;
         self.conn.map_window(self.ui.dock)?;
         self.conn.map_window(self.ui.settings)?;
+        self.install_pointer_cursor()?;
         self.raise_ui()?;
         self.conn.flush()?;
+        Ok(())
+    }
+
+    fn install_pointer_cursor(&self) -> AnyResult<()> {
+        let mut windows = vec![
+            self.root,
+            self.ui.topbar,
+            self.ui.dock,
+            self.ui.settings,
+            self.ui.folder,
+            self.ui.app_menu,
+        ];
+        windows.extend(self.ui.media);
+        windows.extend(self.clients.values().map(|info| info.frame));
+
+        for window in windows {
+            self.conn.change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().cursor(self.cursor),
+            )?;
+        }
+        if self
+            .conn
+            .extension_information(xfixes::X11_EXTENSION_NAME)?
+            .is_some()
+        {
+            let _ = self.conn.xfixes_show_cursor(self.root);
+        }
         Ok(())
     }
 
@@ -1903,6 +1935,10 @@ impl Aurora {
             .reparent_window(window, frame, 0, title_h as i16)?;
         self.conn.map_window(window)?;
         self.conn.map_window(frame)?;
+        self.conn.change_window_attributes(
+            frame,
+            &ChangeWindowAttributesAux::new().cursor(self.cursor),
+        )?;
         let info = ClientInfo {
             window,
             frame,
@@ -2266,6 +2302,7 @@ impl Aurora {
             self.screen_width,
             self.screen_height,
         )?;
+        self.install_pointer_cursor()?;
         if let Some(old) = self.wallpaper_pixmap.replace(pixmap) {
             let _ = self.conn.free_pixmap(old);
         }
@@ -2325,7 +2362,7 @@ impl Aurora {
         self.upload_canvas(self.ui.topbar, &c)
     }
 
-    fn redraw_dock(&self) -> AnyResult<()> {
+    fn redraw_dock(&mut self) -> AnyResult<()> {
         let (x, y, w, h) = self.dock_geometry();
         self.conn.configure_window(
             self.ui.dock,
@@ -2375,9 +2412,12 @@ impl Aurora {
             } else if let Some(client) = task_windows
                 .get(i - 5)
                 .and_then(|window| self.clients.get(window))
+                .copied()
             {
                 let title = self.window_title(client.window);
-                if !self.paint_window_icon(&mut c, client.window, icon_x + 8, icon_y + 8, 28) {
+                if !self.paint_window_icon(&mut c, client.window, icon_x + 8, icon_y + 8, 28)
+                    && !self.paint_desktop_icon(&mut c, client.window, icon_x + 8, icon_y + 8, 28)
+                {
                     draw_client_task_icon(
                         &mut c,
                         &self.bold,
@@ -4325,7 +4365,7 @@ impl Aurora {
         };
         let Ok(cookie) =
             self.conn
-                .get_property(false, window, atom.atom, AtomEnum::CARDINAL, 0, 4096)
+                .get_property(false, window, atom.atom, AtomEnum::CARDINAL, 0, 262_144)
         else {
             return false;
         };
@@ -4373,6 +4413,30 @@ impl Aurora {
                 canvas.blend_pixel(x + xx, y + yy, Color::rgba(r, g, b, a));
             }
         }
+        true
+    }
+
+    fn paint_desktop_icon(
+        &mut self,
+        canvas: &mut Canvas,
+        window: Window,
+        x: i32,
+        y: i32,
+        size: i32,
+    ) -> bool {
+        let class = self.window_class(window);
+        let title = self.window_title(window).to_ascii_lowercase();
+        let key = format!("{class}|{title}");
+        if !self.icon_cache.contains_key(&key) {
+            let icon = resolve_window_icon(&class, &title)
+                .and_then(|path| fs::read(path).ok())
+                .and_then(|bytes| decode_icon_pixels(&bytes, size).ok());
+            self.icon_cache.insert(key.clone(), icon);
+        }
+        let Some(Some(pixels)) = self.icon_cache.get(&key) else {
+            return false;
+        };
+        paint_rgba_pixels(canvas, pixels, x, y, size, size);
         true
     }
 
@@ -5087,6 +5151,174 @@ fn paint_bgr_pixels(c: &mut Canvas, pixels: &[u8], x: i32, y: i32, w: i32, h: i3
             }
         }
     }
+}
+
+fn paint_rgba_pixels(c: &mut Canvas, pixels: &[u8], x: i32, y: i32, w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    for yy in 0..h {
+        for xx in 0..w {
+            let idx = ((yy * w + xx) * 4) as usize;
+            if idx + 3 < pixels.len() {
+                c.blend_pixel(
+                    x + xx,
+                    y + yy,
+                    Color::rgba(
+                        pixels[idx],
+                        pixels[idx + 1],
+                        pixels[idx + 2],
+                        pixels[idx + 3],
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn decode_icon_pixels(bytes: &[u8], size: i32) -> AnyResult<Vec<u8>> {
+    let img = image::load_from_memory(bytes)?.to_rgba8();
+    let resized = image::imageops::resize(
+        &img,
+        size.max(1) as u32,
+        size.max(1) as u32,
+        FilterType::Triangle,
+    );
+    Ok(resized.into_raw())
+}
+
+fn resolve_window_icon(class: &str, title: &str) -> Option<PathBuf> {
+    let terms = window_match_terms(class, title);
+    let icon_name = find_desktop_icon_name(&terms)?;
+    resolve_icon_path(&icon_name)
+}
+
+fn window_match_terms(class: &str, title: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw in class.split('\0').chain(title.split([' ', '-', '_', '.'])) {
+        let term = raw.trim().trim_matches(char::from(0)).to_ascii_lowercase();
+        if term.len() >= 2 && !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+fn find_desktop_icon_name(terms: &[String]) -> Option<String> {
+    for dir in desktop_search_dirs() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
+                continue;
+            }
+            if let Some(icon) = desktop_icon_if_matches(&path, terms) {
+                return Some(icon);
+            }
+        }
+    }
+    None
+}
+
+fn desktop_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(home) = env::var("HOME") {
+        dirs.push(PathBuf::from(home).join(".local/share/applications"));
+    }
+    if let Ok(data_home) = env::var("XDG_DATA_HOME") {
+        dirs.push(PathBuf::from(data_home).join("applications"));
+    }
+    if let Ok(data_dirs) = env::var("XDG_DATA_DIRS") {
+        dirs.extend(
+            data_dirs
+                .split(':')
+                .filter(|dir| !dir.is_empty())
+                .map(|dir| PathBuf::from(dir).join("applications")),
+        );
+    }
+    dirs.push(PathBuf::from("/usr/share/applications"));
+    dirs
+}
+
+fn desktop_icon_if_matches(path: &Path, terms: &[String]) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut name = String::new();
+    let mut startup_class = String::new();
+    let mut icon = String::new();
+    let mut no_display = false;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "Name" => name = value.to_ascii_lowercase(),
+            "StartupWMClass" => startup_class = value.to_ascii_lowercase(),
+            "Icon" => icon = value.trim().to_string(),
+            "NoDisplay" => no_display = value.eq_ignore_ascii_case("true"),
+            _ => {}
+        }
+    }
+    if icon.is_empty() || no_display {
+        return None;
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let matched = terms.iter().any(|term| {
+        startup_class == *term
+            || stem == *term
+            || stem.ends_with(&format!(".{term}"))
+            || name == *term
+            || (!name.is_empty() && name.contains(term))
+    });
+    matched.then_some(icon)
+}
+
+fn resolve_icon_path(icon_name: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(icon_name);
+    if direct.is_absolute() && direct.exists() {
+        return Some(direct);
+    }
+    let candidates = icon_candidate_paths(icon_name);
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn icon_candidate_paths(icon_name: &str) -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Ok(home) = env::var("HOME") {
+        bases.push(PathBuf::from(home).join(".local/share/icons"));
+    }
+    bases.push(PathBuf::from("/usr/share/icons/hicolor"));
+    bases.push(PathBuf::from("/usr/share/icons"));
+    bases.push(PathBuf::from("/usr/share/pixmaps"));
+
+    let sizes = [
+        "64x64", "48x48", "32x32", "128x128", "256x256", "scalable", "symbolic",
+    ];
+    let contexts = ["apps", "categories", "places", "mimetypes"];
+    let exts = ["png", "webp", "jpg", "jpeg", "gif"];
+    let mut paths = Vec::new();
+    for base in bases {
+        for size in sizes {
+            for context in contexts {
+                for ext in exts {
+                    paths.push(
+                        base.join(size)
+                            .join(context)
+                            .join(format!("{icon_name}.{ext}")),
+                    );
+                }
+            }
+        }
+        for ext in exts {
+            paths.push(base.join(format!("{icon_name}.{ext}")));
+        }
+    }
+    paths
 }
 
 fn paint_file_preview(c: &mut Canvas, path: &std::path::Path, x: i32, y: i32, w: i32, h: i32) {
