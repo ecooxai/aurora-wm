@@ -12,23 +12,28 @@ use image::imageops::FilterType;
 use rusttype::{Font, Scale, point};
 use time::OffsetDateTime;
 use x11rb::CURRENT_TIME;
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ReplyError;
 use x11rb::image::{BitsPerPixel, Image, ImageOrder, ScanlinePad};
+use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
+use x11rb::protocol::shape::{self, ConnectionExt as ShapeConnectionExt};
 use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const TOPBAR_HEIGHT: u16 = 40;
 const DOCK_HEIGHT: u16 = 76;
 const TITLEBAR_HEIGHT: u16 = 34;
+const FRAME_CORNER_RADIUS: i32 = 8;
 const SETTINGS_MIN_WIDTH: u16 = 420;
 const SETTINGS_TARGET_WIDTH: u16 = 600;
 const SETTINGS_MARGIN: u16 = 24;
 const SIDEBAR_WIDTH: i32 = 58;
+const SETTINGS_SIDEBAR_TOP: i32 = 26;
 const MEDIA_SLOT_COUNT: usize = 5;
 const MEDIA_WIDTH: u16 = 600;
 const RESIZE_EDGE: i16 = 10;
@@ -392,6 +397,7 @@ struct SettingsState {
     sleep_after_secs: u32,
     power_mode: PowerMode,
     selected_mode: usize,
+    scroll: i32,
 }
 
 impl Default for SettingsState {
@@ -401,6 +407,7 @@ impl Default for SettingsState {
             sleep_after_secs: 600,
             power_mode: PowerMode::Balanced,
             selected_mode: 0,
+            scroll: 0,
         }
     }
 }
@@ -528,6 +535,21 @@ enum DragKind {
     Resize,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ResizeEdges {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TitleButton {
+    Close,
+    Minimize,
+    Maximize,
+}
+
 #[derive(Clone, Copy)]
 struct DragState {
     client: Window,
@@ -540,6 +562,7 @@ struct DragState {
     start_w: u16,
     start_h: u16,
     kind: DragKind,
+    resize_edges: ResizeEdges,
 }
 
 #[derive(Clone, Copy)]
@@ -586,6 +609,8 @@ struct FolderEntry {
 #[derive(Clone)]
 struct MediaState {
     entry: FolderEntry,
+    playing: bool,
+    progress: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -621,6 +646,7 @@ enum AppAction {
     Music,
     Videos,
     Settings,
+    More,
 }
 
 #[derive(Clone, Copy)]
@@ -628,6 +654,11 @@ struct AppMenuItem {
     label: &'static str,
     hint: &'static str,
     action: AppAction,
+}
+
+struct DesktopEntry {
+    name: String,
+    category: String,
 }
 
 struct Aurora {
@@ -642,7 +673,11 @@ struct Aurora {
     screen_height: u16,
     wallpaper_index: usize,
     wallpaper_pixels: Vec<u8>,
+    wallpaper_cache: Vec<Option<Vec<u8>>>,
+    wallpaper_previews: Vec<Vec<u8>>,
     wallpaper_pixmap: Option<Pixmap>,
+    compositor_enabled: bool,
+    shape_supported: bool,
     ui: UiWindows,
     regular: Font<'static>,
     bold: Font<'static>,
@@ -652,13 +687,16 @@ struct Aurora {
     metrics: Metrics,
     clients: HashMap<Window, ClientInfo>,
     drag: Option<DragState>,
+    title_hover: Option<(Window, TitleButton)>,
     ignored_unmaps: Vec<Window>,
     settings_visible: bool,
     settings_front: bool,
     folder_mode: FolderMode,
     folder_entries: Vec<FolderEntry>,
+    folder_places: Vec<PlaceEntry>,
     folder_path: PathBuf,
     folder_selected: Option<PathBuf>,
+    folder_scroll: usize,
     folder_front: bool,
     folder_more_open: bool,
     media: Option<MediaState>,
@@ -668,13 +706,17 @@ struct Aurora {
     media_front_slot: Option<usize>,
     app_menu_visible: bool,
     app_menu_more: bool,
+    app_menu_scroll: usize,
     folder_context_open: bool,
     folder_context_pos: (i32, i32),
     folder_clipboard: Option<(PathBuf, bool)>,
     folder_info: Option<String>,
+    folder_drag: Option<PathBuf>,
+    xdnd_source: Option<Window>,
     dock_last_click: Option<DockClickState>,
     last_clock_label: String,
     last_tick: Instant,
+    last_media_tick: Instant,
 }
 
 fn main() {
@@ -716,6 +758,36 @@ fn become_wm(conn: &RustConnection, screen: &Screen) -> Result<(), ReplyError> {
     res
 }
 
+fn init_light_compositor(conn: &RustConnection, root: Window) -> bool {
+    let Ok(Some(_)) = conn.extension_information(composite::X11_EXTENSION_NAME) else {
+        eprintln!("aurora-wm: Composite extension unavailable; compositor disabled");
+        return false;
+    };
+    let Ok(cookie) = conn.composite_query_version(0, 4) else {
+        eprintln!("aurora-wm: Composite version query failed; compositor disabled");
+        return false;
+    };
+    if cookie.reply().is_err() {
+        eprintln!("aurora-wm: Composite version query failed; compositor disabled");
+        return false;
+    }
+    let Ok(cookie) = conn.composite_redirect_subwindows(root, composite::Redirect::AUTOMATIC)
+    else {
+        eprintln!("aurora-wm: light compositor disabled: redirect request failed");
+        return false;
+    };
+    match cookie.check() {
+        Ok(()) => {
+            eprintln!("aurora-wm: light compositor enabled");
+            true
+        }
+        Err(err) => {
+            eprintln!("aurora-wm: light compositor disabled: {err}");
+            false
+        }
+    }
+}
+
 impl Aurora {
     fn new(conn: RustConnection, display: String, screen: &Screen) -> AnyResult<Self> {
         let gc = conn.generate_id()?;
@@ -740,6 +812,16 @@ impl Aurora {
             screen.width_in_pixels,
             screen.height_in_pixels,
         )?;
+        let mut wallpaper_cache = vec![None; WALLPAPERS.len()];
+        wallpaper_cache[0] = Some(wallpaper_pixels.clone());
+        let wallpaper_previews = WALLPAPERS
+            .iter()
+            .map(|asset| render_asset_preview_pixels(asset.bytes, 92, 56).unwrap_or_default())
+            .collect();
+        let compositor_enabled = init_light_compositor(&conn, screen.root);
+        let shape_supported = conn
+            .extension_information(shape::X11_EXTENSION_NAME)?
+            .is_some();
         let ui = UiWindows {
             topbar: conn.generate_id()?,
             dock: conn.generate_id()?,
@@ -770,7 +852,11 @@ impl Aurora {
             screen_height: screen.height_in_pixels,
             wallpaper_index: 0,
             wallpaper_pixels,
+            wallpaper_cache,
+            wallpaper_previews,
             wallpaper_pixmap: None,
+            compositor_enabled,
+            shape_supported,
             ui,
             regular,
             bold,
@@ -780,13 +866,16 @@ impl Aurora {
             metrics,
             clients: HashMap::new(),
             drag: None,
+            title_hover: None,
             ignored_unmaps: Vec::new(),
             settings_visible: true,
             settings_front: false,
             folder_mode: FolderMode::Home,
             folder_entries: folder_entries_for(FolderMode::Home),
+            folder_places: place_entries(),
             folder_path: folder_path_for(FolderMode::Home),
             folder_selected: None,
+            folder_scroll: 0,
             folder_front: false,
             folder_more_open: false,
             media: None,
@@ -796,13 +885,17 @@ impl Aurora {
             media_front_slot: None,
             app_menu_visible: false,
             app_menu_more: false,
+            app_menu_scroll: 0,
             folder_context_open: false,
             folder_context_pos: (0, 0),
             folder_clipboard: None,
             folder_info: None,
+            folder_drag: None,
+            xdnd_source: None,
             dock_last_click: None,
             last_clock_label: format_clock(),
             last_tick: Instant::now(),
+            last_media_tick: Instant::now(),
         };
         app.create_ui_windows()?;
         Ok(app)
@@ -817,6 +910,9 @@ impl Aurora {
                     if self.drag.is_some() {
                         handled_event = true;
                         pending_motion = Some(ev);
+                    } else {
+                        handled_event = true;
+                        self.handle_motion_notify(ev)?;
                     }
                 } else {
                     handled_event = true;
@@ -832,6 +928,13 @@ impl Aurora {
 
             if handled_event {
                 self.conn.flush()?;
+            }
+
+            if self.last_media_tick.elapsed() >= Duration::from_millis(250) {
+                self.last_media_tick = Instant::now();
+                if self.advance_internal_media()? {
+                    self.conn.flush()?;
+                }
             }
 
             if self.last_tick.elapsed() >= Duration::from_millis(2000) {
@@ -925,7 +1028,12 @@ impl Aurora {
         let folder = self.folder_geometry();
         let folder_aux = CreateWindowAux::new()
             .override_redirect(1)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::POINTER_MOTION,
+            )
             .cursor(self.cursor)
             .background_pixel(0);
         self.conn.create_window(
@@ -941,6 +1049,7 @@ impl Aurora {
             self.visual,
             &folder_aux,
         )?;
+        self.init_folder_dnd()?;
 
         let menu = self.app_menu_geometry();
         let menu_aux = CreateWindowAux::new()
@@ -993,6 +1102,19 @@ impl Aurora {
         Ok(())
     }
 
+    fn init_folder_dnd(&self) -> AnyResult<()> {
+        let xdnd_aware = self.atom(b"XdndAware")?;
+        let atom_type = self.atom(b"ATOM")?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.ui.folder,
+            xdnd_aware,
+            atom_type,
+            &[5],
+        )?;
+        Ok(())
+    }
+
     fn scan_existing_windows(&mut self) -> AnyResult<()> {
         let reply = self.conn.query_tree(self.root)?.reply()?;
         for window in reply.children {
@@ -1013,8 +1135,19 @@ impl Aurora {
         match event {
             Event::Expose(ev) => self.handle_expose(ev)?,
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
-            Event::ButtonRelease(_) => self.end_drag()?,
+            Event::ButtonRelease(ev) => {
+                if ev.event == self.ui.folder {
+                    self.handle_folder_release(ev)?;
+                } else {
+                    self.end_drag()?;
+                }
+            }
             Event::MotionNotify(ev) => self.handle_motion_notify(ev)?,
+            Event::LeaveNotify(ev) => self.handle_leave_notify(ev)?,
+            Event::EnterNotify(ev) => self.handle_enter_notify(ev)?,
+            Event::ClientMessage(ev) => self.handle_client_message(ev)?,
+            Event::SelectionRequest(ev) => self.handle_selection_request(ev)?,
+            Event::SelectionNotify(ev) => self.handle_selection_notify(ev)?,
             Event::MapRequest(ev) => self.manage_window(ev.window)?,
             Event::ConfigureRequest(ev) => self.handle_configure_request(ev)?,
             Event::DestroyNotify(ev) => self.remove_client(ev.window)?,
@@ -1027,6 +1160,7 @@ impl Aurora {
             }
             Event::PropertyNotify(ev) => {
                 if self.clients.contains_key(&ev.window) {
+                    self.update_client_chrome(ev.window)?;
                     self.redraw_dock()?;
                 }
             }
@@ -1055,7 +1189,12 @@ impl Aurora {
         } else if ev.window == self.ui.app_menu && self.app_menu_visible {
             self.redraw_app_menu()?;
         } else if let Some(slot) = self.media_slot_for_window(ev.window) {
-            if self.media_slots.get(slot).and_then(|m| m.as_ref()).is_some() {
+            if self
+                .media_slots
+                .get(slot)
+                .and_then(|m| m.as_ref())
+                .is_some()
+            {
                 self.redraw_media_slot(slot)?;
             }
         } else if let Some(client) = self.client_key_for(ev.window) {
@@ -1073,6 +1212,11 @@ impl Aurora {
 
     fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
         if ev.event == self.ui.settings {
+            if ev.detail == 4 || ev.detail == 5 {
+                self.handle_settings_scroll(ev.detail, i32::from(ev.event_x))?;
+                self.conn.flush()?;
+                return Ok(());
+            }
             self.settings_front = true;
             self.folder_front = false;
             self.media_front = false;
@@ -1081,13 +1225,22 @@ impl Aurora {
         } else if ev.event == self.ui.dock {
             self.handle_dock_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if ev.event == self.ui.folder {
+            if ev.detail == 4 || ev.detail == 5 {
+                self.handle_folder_scroll(ev.detail)?;
+                self.conn.flush()?;
+                return Ok(());
+            }
             self.folder_front = true;
             self.settings_front = false;
             self.media_front = false;
             self.raise_ui()?;
-            self.handle_folder_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
+            if ev.detail == 3 {
+                self.handle_folder_context(i32::from(ev.event_x), i32::from(ev.event_y))?;
+            } else {
+                self.handle_folder_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
+            }
         } else if ev.event == self.ui.app_menu {
-            self.handle_app_menu_click(i32::from(ev.event_y))?;
+            self.handle_app_menu_click(ev.detail, i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if let Some(slot) = self.media_slot_for_window(ev.event) {
             self.media_front = true;
             self.media_front_slot = Some(slot);
@@ -1096,7 +1249,26 @@ impl Aurora {
             self.handle_media_click(slot, i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if ev.event == self.ui.topbar {
             let x = i32::from(ev.event_x);
-            if x > i32::from(self.screen_width) - 120 {
+            let right = i32::from(self.screen_width) - 22;
+            if x >= right - 212 && x <= right - 188 {
+                self.settings.tab = SettingsTab::Audio;
+                self.settings_visible = true;
+                self.settings_front = true;
+                self.folder_front = false;
+                self.media_front = false;
+                self.conn.map_window(self.ui.settings)?;
+                self.raise_ui()?;
+                self.redraw_settings()?;
+            } else if x >= right - 170 && x <= right - 146 {
+                self.settings.tab = SettingsTab::Network;
+                self.settings_visible = true;
+                self.settings_front = true;
+                self.folder_front = false;
+                self.media_front = false;
+                self.conn.map_window(self.ui.settings)?;
+                self.raise_ui()?;
+                self.redraw_settings()?;
+            } else if x > i32::from(self.screen_width) - 120 {
                 self.settings_visible = !self.settings_visible;
                 if self.settings_visible {
                     self.settings_front = true;
@@ -1115,7 +1287,7 @@ impl Aurora {
             {
                 self.handle_frame_click(client, ev)?;
             } else {
-                self.focus_window(client)?;
+                self.handle_client_click(client, ev)?;
             }
         }
         self.conn.flush()?;
@@ -1124,29 +1296,323 @@ impl Aurora {
 
     fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<()> {
         let Some(drag) = self.drag else {
+            if let Some(client) = self.client_key_for(ev.event) {
+                let next = self
+                    .clients
+                    .get(&client)
+                    .filter(|info| info.frame == ev.event && info.titlebar)
+                    .and_then(|_| {
+                        hover_title_button(ev.event_x, ev.event_y).map(|button| (client, button))
+                    });
+                if next != self.title_hover {
+                    let old = self.title_hover.take().map(|(client, _)| client);
+                    self.title_hover = next;
+                    if let Some(old) = old {
+                        self.redraw_frame_titlebar(old)?;
+                    }
+                    if let Some((client, _)) = self.title_hover {
+                        self.redraw_frame_titlebar(client)?;
+                    }
+                }
+            }
             return Ok(());
         };
         let Some(mut info) = self.clients.get(&drag.client).copied() else {
             self.drag = None;
             return Ok(());
         };
-        info.x = ev.root_x.saturating_sub(drag.offset_x);
-        info.y = ev.root_y.saturating_sub(drag.offset_y);
+        match drag.kind {
+            DragKind::Move => {
+                info.x = ev.root_x.saturating_sub(drag.offset_x);
+                info.y = ev.root_y.saturating_sub(drag.offset_y);
+                if self
+                    .clients
+                    .get(&drag.client)
+                    .is_some_and(|old| old.x == info.x && old.y == info.y)
+                {
+                    return Ok(());
+                }
+                self.conn.configure_window(
+                    info.frame,
+                    &ConfigureWindowAux::new()
+                        .x(i32::from(info.x))
+                        .y(i32::from(info.y)),
+                )?;
+            }
+            DragKind::Resize => {
+                let dx = i32::from(ev.root_x) - i32::from(drag.start_root_x);
+                let dy = i32::from(ev.root_y) - i32::from(drag.start_root_y);
+                let min_w = 180;
+                let min_h = 120;
+                let mut new_x = i32::from(drag.start_x);
+                let mut new_y = i32::from(drag.start_y);
+                let mut new_w = i32::from(drag.start_w);
+                let mut new_h = i32::from(drag.start_h);
+                if drag.resize_edges.right {
+                    new_w = (i32::from(drag.start_w) + dx).max(min_w);
+                }
+                if drag.resize_edges.left {
+                    new_w = (i32::from(drag.start_w) - dx).max(min_w);
+                    new_x = i32::from(drag.start_x) + i32::from(drag.start_w) - new_w;
+                }
+                if drag.resize_edges.bottom {
+                    new_h = (i32::from(drag.start_h) + dy).max(min_h);
+                }
+                if drag.resize_edges.top {
+                    new_h = (i32::from(drag.start_h) - dy).max(min_h);
+                    new_y = i32::from(drag.start_y) + i32::from(drag.start_h) - new_h;
+                }
+                info.x = new_x.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+                info.y = new_y.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+                info.width = new_w as u16;
+                info.height = new_h as u16;
+                let title_h = self.titlebar_height(&info);
+                self.conn.configure_window(
+                    info.frame,
+                    &ConfigureWindowAux::new()
+                        .x(i32::from(info.x))
+                        .y(i32::from(info.y))
+                        .width(u32::from(info.width))
+                        .height(u32::from(info.height + title_h)),
+                )?;
+                self.conn.configure_window(
+                    info.window,
+                    &ConfigureWindowAux::new()
+                        .x(0)
+                        .y(i32::from(title_h))
+                        .width(u32::from(info.width))
+                        .height(u32::from(info.height)),
+                )?;
+                self.apply_frame_shape(&info)?;
+                if title_h > 0 {
+                    self.redraw_frame_titlebar(drag.client)?;
+                }
+            }
+        }
+        self.clients.insert(drag.client, info);
+        Ok(())
+    }
+
+    fn handle_leave_notify(&mut self, ev: LeaveNotifyEvent) -> AnyResult<()> {
+        let Some((client, _)) = self.title_hover else {
+            return Ok(());
+        };
         if self
             .clients
-            .get(&drag.client)
-            .is_some_and(|old| old.x == info.x && old.y == info.y)
+            .get(&client)
+            .is_some_and(|info| info.frame == ev.event)
         {
+            self.title_hover = None;
+            self.redraw_frame_titlebar(client)?;
+        }
+        Ok(())
+    }
+
+    fn handle_enter_notify(&mut self, _ev: EnterNotifyEvent) -> AnyResult<()> {
+        Ok(())
+    }
+
+    fn handle_client_message(&mut self, ev: ClientMessageEvent) -> AnyResult<()> {
+        let Ok(cookie) = self.conn.intern_atom(false, b"_NET_WM_MOVERESIZE") else {
+            return Ok(());
+        };
+        let Ok(atom) = cookie.reply() else {
+            return Ok(());
+        };
+        if ev.type_ != atom.atom {
+            self.handle_xdnd_message(ev)?;
             return Ok(());
         }
-        self.conn.configure_window(
-            info.frame,
-            &ConfigureWindowAux::new()
-                .x(i32::from(info.x))
-                .y(i32::from(info.y)),
-        )?;
-        self.clients.insert(drag.client, info);
-        self.conn.flush()?;
+        let data = ev.data.as_data32();
+        let Some(client) = self.client_key_for(ev.window) else {
+            return Ok(());
+        };
+        let root_x = data[0].min(i16::MAX as u32) as i16;
+        let root_y = data[1].min(i16::MAX as u32) as i16;
+        match data[2] {
+            8 => self.start_drag(client, root_x, root_y)?,
+            0 => self.start_resize(
+                client,
+                root_x,
+                root_y,
+                ResizeEdges {
+                    top: true,
+                    left: true,
+                    ..ResizeEdges::default()
+                },
+            )?,
+            1 => self.start_resize(
+                client,
+                root_x,
+                root_y,
+                ResizeEdges {
+                    top: true,
+                    ..ResizeEdges::default()
+                },
+            )?,
+            2 => self.start_resize(
+                client,
+                root_x,
+                root_y,
+                ResizeEdges {
+                    top: true,
+                    right: true,
+                    ..ResizeEdges::default()
+                },
+            )?,
+            3 => self.start_resize(
+                client,
+                root_x,
+                root_y,
+                ResizeEdges {
+                    right: true,
+                    ..ResizeEdges::default()
+                },
+            )?,
+            4 => self.start_resize(
+                client,
+                root_x,
+                root_y,
+                ResizeEdges {
+                    right: true,
+                    bottom: true,
+                    ..ResizeEdges::default()
+                },
+            )?,
+            5 => self.start_resize(
+                client,
+                root_x,
+                root_y,
+                ResizeEdges {
+                    bottom: true,
+                    ..ResizeEdges::default()
+                },
+            )?,
+            6 => self.start_resize(
+                client,
+                root_x,
+                root_y,
+                ResizeEdges {
+                    bottom: true,
+                    left: true,
+                    ..ResizeEdges::default()
+                },
+            )?,
+            7 => self.start_resize(
+                client,
+                root_x,
+                root_y,
+                ResizeEdges {
+                    left: true,
+                    ..ResizeEdges::default()
+                },
+            )?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_xdnd_message(&mut self, ev: ClientMessageEvent) -> AnyResult<()> {
+        let xdnd_enter = self.atom(b"XdndEnter")?;
+        let xdnd_position = self.atom(b"XdndPosition")?;
+        let xdnd_drop = self.atom(b"XdndDrop")?;
+        if ev.type_ == xdnd_enter {
+            self.xdnd_source = Some(ev.data.as_data32()[0]);
+        } else if ev.type_ == xdnd_position {
+            let data = ev.data.as_data32();
+            let source = data[0];
+            self.xdnd_source = Some(source);
+            let status = self.atom(b"XdndStatus")?;
+            let action_copy = self.atom(b"XdndActionCopy")?;
+            let msg =
+                ClientMessageEvent::new(32, source, status, [self.ui.folder, 1, 0, 0, action_copy]);
+            self.conn
+                .send_event(false, source, EventMask::NO_EVENT, msg)?;
+        } else if ev.type_ == xdnd_drop {
+            let source = ev.data.as_data32()[0];
+            self.xdnd_source = Some(source);
+            let selection = self.atom(b"XdndSelection")?;
+            let uri = self.atom(b"text/uri-list")?;
+            self.conn
+                .convert_selection(self.ui.folder, selection, uri, selection, CURRENT_TIME)?;
+        }
+        Ok(())
+    }
+
+    fn handle_selection_request(&self, ev: SelectionRequestEvent) -> AnyResult<()> {
+        let selection = self.atom(b"XdndSelection")?;
+        let uri = self.atom(b"text/uri-list")?;
+        let mut property = x11rb::NONE;
+        if ev.selection == selection && ev.target == uri {
+            if let Some(path) = self.folder_drag.as_ref() {
+                property = if ev.property == x11rb::NONE {
+                    ev.target
+                } else {
+                    ev.property
+                };
+                let data = format!("{}\r\n", file_uri(path));
+                self.conn.change_property8(
+                    PropMode::REPLACE,
+                    ev.requestor,
+                    property,
+                    uri,
+                    data.as_bytes(),
+                )?;
+            }
+        }
+        let reply = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: ev.time,
+            requestor: ev.requestor,
+            selection: ev.selection,
+            target: ev.target,
+            property,
+        };
+        self.conn
+            .send_event(false, ev.requestor, EventMask::NO_EVENT, reply)?;
+        Ok(())
+    }
+
+    fn handle_selection_notify(&mut self, ev: SelectionNotifyEvent) -> AnyResult<()> {
+        let selection = self.atom(b"XdndSelection")?;
+        if ev.selection != selection || ev.property == x11rb::NONE {
+            return Ok(());
+        }
+        let uri = self.atom(b"text/uri-list")?;
+        let reply = self
+            .conn
+            .get_property(false, self.ui.folder, ev.property, uri, 0, 65535)?
+            .reply()?;
+        let text = String::from_utf8_lossy(&reply.value);
+        let mut copied = 0usize;
+        for line in text.lines() {
+            if let Some(path) = path_from_file_uri(line.trim()) {
+                if path.is_file() {
+                    let dst = self.folder_path.join(path.file_name().unwrap_or_default());
+                    if fs::copy(&path, dst).is_ok() {
+                        copied += 1;
+                    }
+                }
+            }
+        }
+        if copied > 0 {
+            self.folder_entries = folder_entries_in(self.folder_path.clone());
+            self.folder_info = Some(format!("Dropped {copied} file(s)"));
+            self.redraw_folder()?;
+        }
+        if let Some(source) = self.xdnd_source {
+            let finished = self.atom(b"XdndFinished")?;
+            let action_copy = self.atom(b"XdndActionCopy")?;
+            let msg = ClientMessageEvent::new(
+                32,
+                source,
+                finished,
+                [self.ui.folder, 1, action_copy, 0, 0],
+            );
+            self.conn
+                .send_event(false, source, EventMask::NO_EVENT, msg)?;
+        }
         Ok(())
     }
 
@@ -1155,19 +1621,78 @@ impl Aurora {
             return Ok(());
         };
         self.focus_window(client)?;
-        if ev.event_y >= i16::try_from(TITLEBAR_HEIGHT).unwrap_or(i16::MAX) {
+        if let Some(edges) =
+            resize_edges_for_frame(&info, self.titlebar_height(&info), ev.event_x, ev.event_y)
+        {
+            self.start_resize(client, ev.root_x, ev.root_y, edges)?;
+            return Ok(());
+        }
+        let title_h = self.titlebar_height(&info);
+        if title_h == 0 || ev.event_y >= i16::try_from(title_h).unwrap_or(i16::MAX) {
             return Ok(());
         }
         let x = ev.event_x;
         if (12..=26).contains(&x) {
             self.close_client(client)?;
         } else if (34..=50).contains(&x) {
-            self.conn.configure_window(
-                info.frame,
-                &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
-            )?;
+            self.minimize_client(client)?;
+        } else if (57..=73).contains(&x) {
+            self.toggle_maximize_client(client)?;
         } else {
             self.start_drag(client, ev.root_x, ev.root_y)?;
+        }
+        Ok(())
+    }
+
+    fn handle_client_click(&mut self, client: Window, ev: ButtonPressEvent) -> AnyResult<()> {
+        let Some(info) = self.clients.get(&client).copied() else {
+            return Ok(());
+        };
+        if let Some(edges) = resize_edges_for_client(&info, ev.event_x, ev.event_y) {
+            self.start_resize(client, ev.root_x, ev.root_y, edges)?;
+        } else {
+            self.focus_window(client)?;
+            self.conn
+                .allow_events(Allow::REPLAY_POINTER, CURRENT_TIME)?;
+        }
+        Ok(())
+    }
+
+    fn grab_client_buttons(&self, window: Window) -> AnyResult<()> {
+        let lock = u16::from(ModMask::LOCK);
+        let num_lock = u16::from(ModMask::M2);
+        let modifiers = [0, lock, num_lock, lock | num_lock];
+        let buttons = [
+            ButtonIndex::M1,
+            ButtonIndex::M2,
+            ButtonIndex::M3,
+            ButtonIndex::M4,
+            ButtonIndex::M5,
+        ];
+
+        for modifier in modifiers {
+            for button in buttons {
+                let res = self
+                    .conn
+                    .grab_button(
+                        false,
+                        window,
+                        EventMask::BUTTON_PRESS,
+                        GrabMode::ASYNC,
+                        GrabMode::ASYNC,
+                        x11rb::NONE,
+                        x11rb::NONE,
+                        button,
+                        ModMask::from(modifier),
+                    )?
+                    .check();
+                if let Err(ReplyError::X11Error(ref err)) = res {
+                    if err.error_kind == ErrorKind::Access {
+                        continue;
+                    }
+                }
+                res?;
+            }
         }
         Ok(())
     }
@@ -1187,10 +1712,51 @@ impl Aurora {
             start_w: info.width,
             start_h: info.height,
             kind: DragKind::Move,
+            resize_edges: ResizeEdges::default(),
         });
         self.settings_front = false;
         self.folder_front = false;
         self.media_front = false;
+        self.focus_window(client)?;
+        let _ = self
+            .conn
+            .grab_pointer(
+                false,
+                self.root,
+                EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                self.cursor,
+                CURRENT_TIME,
+            )?
+            .reply();
+        Ok(())
+    }
+
+    fn start_resize(
+        &mut self,
+        client: Window,
+        root_x: i16,
+        root_y: i16,
+        resize_edges: ResizeEdges,
+    ) -> AnyResult<()> {
+        let Some(info) = self.clients.get(&client).copied() else {
+            return Ok(());
+        };
+        self.drag = Some(DragState {
+            client,
+            offset_x: 0,
+            offset_y: 0,
+            start_root_x: root_x,
+            start_root_y: root_y,
+            start_x: info.x,
+            start_y: info.y,
+            start_w: info.width,
+            start_h: info.height,
+            kind: DragKind::Resize,
+            resize_edges,
+        });
         self.focus_window(client)?;
         let _ = self
             .conn
@@ -1235,25 +1801,29 @@ impl Aurora {
             if mask_has(ev.value_mask, ConfigWindow::HEIGHT) {
                 info.height = ev.height.max(120);
             }
+            let title_h = self.titlebar_height(&info);
             self.conn.configure_window(
                 info.frame,
                 &ConfigureWindowAux::new()
                     .x(i32::from(info.x))
                     .y(i32::from(info.y))
                     .width(u32::from(info.width))
-                    .height(u32::from(info.height + TITLEBAR_HEIGHT)),
+                    .height(u32::from(info.height + title_h)),
             )?;
             self.conn.configure_window(
                 info.window,
                 &ConfigureWindowAux::new()
                     .x(0)
-                    .y(i32::from(TITLEBAR_HEIGHT))
+                    .y(i32::from(title_h))
                     .width(u32::from(info.width))
                     .height(u32::from(info.height))
                     .border_width(0),
             )?;
+            self.apply_frame_shape(&info)?;
             self.clients.insert(client, info);
-            self.redraw_frame_titlebar(client)?;
+            if title_h > 0 {
+                self.redraw_frame_titlebar(client)?;
+            }
             return Ok(());
         }
         let aux = ConfigureWindowAux::from_configure_request(&ev);
@@ -1271,10 +1841,13 @@ impl Aurora {
             return Ok(());
         }
         let geom = self.conn.get_geometry(window)?.reply()?;
+        let titlebar =
+            !client_uses_own_chrome(&self.window_class(window), &self.window_title(window));
+        let title_h = if titlebar { TITLEBAR_HEIGHT } else { 0 };
         let max_w = self.screen_width.saturating_sub(80).max(300);
         let max_h = self
             .screen_height
-            .saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + TITLEBAR_HEIGHT + 62)
+            .saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + title_h + 62)
             .max(240);
         let width = geom.width.min(max_w);
         let height = geom.height.min(max_h);
@@ -1291,6 +1864,7 @@ impl Aurora {
                     | EventMask::BUTTON_PRESS
                     | EventMask::BUTTON_RELEASE
                     | EventMask::POINTER_MOTION
+                    | EventMask::LEAVE_WINDOW
                     | EventMask::SUBSTRUCTURE_NOTIFY,
             )
             .cursor(self.cursor)
@@ -1302,7 +1876,7 @@ impl Aurora {
             x,
             y,
             width,
-            height + TITLEBAR_HEIGHT,
+            height + title_h,
             0,
             WindowClass::INPUT_OUTPUT,
             self.visual,
@@ -1310,43 +1884,41 @@ impl Aurora {
         )?;
         self.conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new().event_mask(
-                EventMask::PROPERTY_CHANGE
-                    | EventMask::STRUCTURE_NOTIFY
-                    | EventMask::ENTER_WINDOW
-                    | EventMask::BUTTON_PRESS,
-            ),
+            &ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
         )?;
+        self.grab_client_buttons(window)?;
         self.conn.change_save_set(SetMode::INSERT, window)?;
         self.conn.configure_window(
             window,
             &ConfigureWindowAux::new()
                 .x(0)
-                .y(i32::from(TITLEBAR_HEIGHT))
+                .y(i32::from(title_h))
                 .width(u32::from(width))
                 .height(u32::from(height))
                 .border_width(0),
         )?;
         self.ignored_unmaps.push(window);
         self.conn
-            .reparent_window(window, frame, 0, TITLEBAR_HEIGHT as i16)?;
+            .reparent_window(window, frame, 0, title_h as i16)?;
         self.conn.map_window(window)?;
         self.conn.map_window(frame)?;
-        self.clients.insert(
+        let info = ClientInfo {
             window,
-            ClientInfo {
-                window,
-                frame,
-                mapped: true,
-                x,
-                y,
-                width,
-                height,
-                titlebar: true,
-                saved: None,
-            },
-        );
-        self.redraw_frame_titlebar(window)?;
+            frame,
+            mapped: true,
+            x,
+            y,
+            width,
+            height,
+            titlebar,
+            saved: None,
+        };
+        self.apply_frame_shape(&info)?;
+        self.clients.insert(window, info);
+        if titlebar {
+            self.redraw_frame_titlebar(window)?;
+        }
         self.focus_window(window)?;
         self.redraw_dock()?;
         Ok(())
@@ -1368,6 +1940,60 @@ impl Aurora {
         Ok(())
     }
 
+    fn minimize_client(&mut self, client: Window) -> AnyResult<()> {
+        if let Some(info) = self.clients.get_mut(&client) {
+            info.mapped = false;
+            self.conn.unmap_window(info.frame)?;
+            self.redraw_dock()?;
+        }
+        Ok(())
+    }
+
+    fn toggle_maximize_client(&mut self, client: Window) -> AnyResult<()> {
+        let Some(mut info) = self.clients.get(&client).copied() else {
+            return Ok(());
+        };
+        if let Some((x, y, w, h)) = info.saved.take() {
+            info.x = x;
+            info.y = y;
+            info.width = w;
+            info.height = h;
+        } else {
+            info.saved = Some((info.x, info.y, info.width, info.height));
+            info.x = 8;
+            info.y = TOPBAR_HEIGHT as i16 + 6;
+            info.width = self.screen_width.saturating_sub(16);
+            info.height = self
+                .screen_height
+                .saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + self.titlebar_height(&info) + 18);
+        }
+        let title_h = self.titlebar_height(&info);
+        self.conn.configure_window(
+            info.frame,
+            &ConfigureWindowAux::new()
+                .x(i32::from(info.x))
+                .y(i32::from(info.y))
+                .width(u32::from(info.width))
+                .height(u32::from(info.height + title_h))
+                .stack_mode(StackMode::ABOVE),
+        )?;
+        self.conn.configure_window(
+            info.window,
+            &ConfigureWindowAux::new()
+                .x(0)
+                .y(i32::from(title_h))
+                .width(u32::from(info.width))
+                .height(u32::from(info.height)),
+        )?;
+        self.apply_frame_shape(&info)?;
+        self.clients.insert(client, info);
+        if title_h > 0 {
+            self.redraw_frame_titlebar(client)?;
+        }
+        self.focus_window(client)?;
+        Ok(())
+    }
+
     fn focus_window(&mut self, window: Window) -> AnyResult<()> {
         let Some(client) = self.client_key_for(window) else {
             return Ok(());
@@ -1375,6 +2001,13 @@ impl Aurora {
         let Some(info) = self.clients.get(&client).copied() else {
             return Ok(());
         };
+        if !info.mapped {
+            let mut mapped = info;
+            mapped.mapped = true;
+            self.clients.insert(client, mapped);
+            self.conn.map_window(mapped.frame)?;
+            self.redraw_dock()?;
+        }
         self.conn
             .set_input_focus(InputFocus::POINTER_ROOT, info.window, CURRENT_TIME)?;
         self.settings_front = false;
@@ -1419,6 +2052,39 @@ impl Aurora {
         Ok(())
     }
 
+    fn titlebar_height(&self, info: &ClientInfo) -> u16 {
+        if info.titlebar { TITLEBAR_HEIGHT } else { 0 }
+    }
+
+    fn update_client_chrome(&mut self, client: Window) -> AnyResult<()> {
+        let Some(mut info) = self.clients.get(&client).copied() else {
+            return Ok(());
+        };
+        if !info.titlebar
+            || !client_uses_own_chrome(&self.window_class(client), &self.window_title(client))
+        {
+            return Ok(());
+        }
+        info.titlebar = false;
+        self.conn.configure_window(
+            info.frame,
+            &ConfigureWindowAux::new()
+                .width(u32::from(info.width))
+                .height(u32::from(info.height)),
+        )?;
+        self.conn.configure_window(
+            info.window,
+            &ConfigureWindowAux::new()
+                .x(0)
+                .y(0)
+                .width(u32::from(info.width))
+                .height(u32::from(info.height)),
+        )?;
+        self.apply_frame_shape(&info)?;
+        self.clients.insert(client, info);
+        Ok(())
+    }
+
     fn close_client(&self, client: Window) -> AnyResult<()> {
         if let Some(info) = self.clients.get(&client) {
             let wm_protocols = self.conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
@@ -1456,7 +2122,7 @@ impl Aurora {
             0,
             i32::from(info.width),
             i32::from(TITLEBAR_HEIGHT) + 16,
-            14,
+            FRAME_CORNER_RADIUS,
             Color::rgba(250, 254, 255, 225),
         );
         c.draw_rect(
@@ -1466,15 +2132,53 @@ impl Aurora {
             1,
             Color::rgba(178, 202, 214, 105),
         );
-        c.draw_circle(19, 17, 6, Color::rgba(241, 126, 135, 220));
-        c.draw_circle(42, 17, 6, Color::rgba(246, 203, 111, 220));
-        c.draw_circle(65, 17, 6, Color::rgba(116, 213, 198, 220));
+        c.draw_circle(19, 17, 8, Color::rgba(241, 96, 105, 235));
+        c.draw_circle(42, 17, 8, Color::rgba(246, 190, 82, 235));
+        c.draw_circle(65, 17, 8, Color::rgba(76, 197, 178, 235));
+        if let Some((hover_client, button)) = self.title_hover {
+            if hover_client == client {
+                match button {
+                    TitleButton::Close => {
+                        c.draw_line(15, 13, 23, 21, 2, Color::rgba(80, 20, 25, 230));
+                        c.draw_line(23, 13, 15, 21, 2, Color::rgba(80, 20, 25, 230));
+                    }
+                    TitleButton::Minimize => {
+                        c.draw_line(37, 17, 47, 17, 2, Color::rgba(90, 60, 15, 235));
+                    }
+                    TitleButton::Maximize => {
+                        c.draw_round_rect(60, 12, 10, 10, 2, Color::rgba(30, 90, 82, 225));
+                        c.draw_round_rect(62, 14, 6, 6, 1, Color::rgba(250, 254, 255, 190));
+                    }
+                }
+            }
+        }
         let title = compact(
             &self.window_title(info.window),
             ((info.width / 9).max(8)) as usize,
         );
         c.draw_text(&self.bold, &title, 92, 9, 13.0, INK);
         self.upload_canvas(info.frame, &c)
+    }
+
+    fn apply_frame_shape(&self, info: &ClientInfo) -> AnyResult<()> {
+        if !self.shape_supported {
+            return Ok(());
+        }
+
+        let title_h = self.titlebar_height(info);
+        let frame_h = info.height + title_h;
+        let radius = if title_h > 0 { FRAME_CORNER_RADIUS } else { 0 };
+        let rects = rounded_top_shape_rects(info.width, frame_h, radius);
+        self.conn.shape_rectangles(
+            shape::SO::SET,
+            shape::SK::BOUNDING,
+            ClipOrdering::YX_BANDED,
+            info.frame,
+            0,
+            0,
+            &rects,
+        )?;
+        Ok(())
     }
 
     fn window_title(&self, window: Window) -> String {
@@ -1495,6 +2199,19 @@ impl Aurora {
         }
     }
 
+    fn window_class(&self, window: Window) -> String {
+        let Ok(cookie) =
+            self.conn
+                .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 128)
+        else {
+            return String::new();
+        };
+        let Ok(reply) = cookie.reply() else {
+            return String::new();
+        };
+        String::from_utf8_lossy(&reply.value).to_ascii_lowercase()
+    }
+
     fn redraw_everything(&mut self) -> AnyResult<()> {
         self.redraw_wallpaper()?;
         self.redraw_folder()?;
@@ -1505,7 +2222,12 @@ impl Aurora {
             self.redraw_app_menu()?;
         }
         for slot in 0..MEDIA_SLOT_COUNT {
-            if self.media_slots.get(slot).and_then(|m| m.as_ref()).is_some() {
+            if self
+                .media_slots
+                .get(slot)
+                .and_then(|m| m.as_ref())
+                .is_some()
+            {
                 self.redraw_media_slot(slot)?;
             }
         }
@@ -1588,19 +2310,18 @@ impl Aurora {
         );
 
         let right = i32::from(self.screen_width) - 22;
-        draw_power_icon(&mut c, right - 10, 20, MINT_LIGHT);
+        draw_gear_icon(&mut c, right - 10, 20, MINT_LIGHT);
         let battery = self.metrics.battery.as_deref().unwrap_or("100%");
         c.draw_text_right(
             &self.regular,
             battery,
-            right - 34,
-            11,
-            15.0,
+            right - 42,
+            9,
+            17.0,
             Color::rgb(239, 252, 250),
         );
-        draw_battery_icon(&mut c, right - 126, 17, 26, 13, MINT_LIGHT);
-        draw_wifi_icon(&mut c, right - 166, 23, MINT_LIGHT);
-        draw_speaker_icon(&mut c, right - 208, 20, MINT_LIGHT);
+        draw_wifi_icon_small(&mut c, right - 158, 23, MINT_LIGHT);
+        draw_speaker_icon_small(&mut c, right - 200, 20, MINT_LIGHT);
         self.upload_canvas(self.ui.topbar, &c)
     }
 
@@ -1656,14 +2377,16 @@ impl Aurora {
                 .and_then(|window| self.clients.get(window))
             {
                 let title = self.window_title(client.window);
-                draw_client_task_icon(
-                    &mut c,
-                    &self.bold,
-                    icon_x + 22,
-                    icon_y + 22,
-                    client.mapped,
-                    &title,
-                );
+                if !self.paint_window_icon(&mut c, client.window, icon_x + 8, icon_y + 8, 28) {
+                    draw_client_task_icon(
+                        &mut c,
+                        &self.bold,
+                        icon_x + 22,
+                        icon_y + 22,
+                        client.mapped,
+                        &title,
+                    );
+                }
             }
             bx += stride;
         }
@@ -1703,13 +2426,16 @@ impl Aurora {
             i32::from(h) - 40,
             Color::rgba(176, 198, 210, 100),
         );
-        c.draw_text(&self.bold, "Settings", 22, 22, 18.0, INK);
         self.draw_settings_sidebar(&mut c);
 
         match self.settings.tab {
             SettingsTab::Display => self.draw_display_tab(&mut c),
             SettingsTab::Power => self.draw_power_tab(&mut c),
             SettingsTab::Wallpaper => self.draw_wallpaper_tab(&mut c),
+            SettingsTab::Audio => self.draw_audio_tab(&mut c),
+            SettingsTab::Network => self.draw_network_tab(&mut c),
+            SettingsTab::Bluetooth => self.draw_bluetooth_tab(&mut c),
+            SettingsTab::Startup => self.draw_startup_tab(&mut c),
             SettingsTab::About => self.draw_about_tab(&mut c),
         }
         self.upload_canvas(self.ui.settings, &c)
@@ -1743,14 +2469,13 @@ impl Aurora {
         );
         c.draw_round_rect(18, 18, 30, 30, 10, Color::rgba(255, 255, 255, 155));
         draw_home_icon(&mut c, 33, 33, MINT_DARK);
-        c.draw_text(&self.bold, self.folder_mode.title(), 60, 16, 20.0, INK);
         c.draw_text(
-            &self.regular,
-            &compact_path(&self.folder_path, 34),
+            &self.bold,
+            &compact_path(&self.folder_path, 32),
             60,
-            45,
-            11.0,
-            MUTED,
+            27,
+            14.0,
+            MINT_DARK,
         );
         c.draw_round_rect(
             i32::from(w) - 50,
@@ -1761,7 +2486,6 @@ impl Aurora {
             Color::rgba(255, 255, 255, 155),
         );
         draw_more_icon(&mut c, i32::from(w) - 35, 33, MINT_DARK);
-        draw_dock_icon(&mut c, self.folder_mode.icon_index(), i32::from(w) - 82, 33);
         c.draw_rect(
             18,
             72,
@@ -1780,7 +2504,13 @@ impl Aurora {
                 MUTED,
             );
         } else {
-            for (idx, entry) in self.folder_entries.iter().take(9).enumerate() {
+            for (idx, entry) in self
+                .folder_entries
+                .iter()
+                .skip(self.folder_scroll)
+                .take(9)
+                .enumerate()
+            {
                 let row_y = 90 + idx as i32 * 42;
                 let selected = self.folder_selected.as_ref() == Some(&entry.path);
                 c.draw_round_rect(
@@ -1811,8 +2541,7 @@ impl Aurora {
         if self.folder_more_open {
             let menu_x = i32::from(w) - 214;
             let menu_y = 54;
-            let places = place_entries();
-            let menu_h = 44 + places.len().min(6) as i32 * 28;
+            let menu_h = 44 + self.folder_places.len().min(6) as i32 * 28;
             c.draw_round_rect(
                 menu_x,
                 menu_y,
@@ -1822,7 +2551,7 @@ impl Aurora {
                 Color::rgba(250, 254, 255, 238),
             );
             c.draw_text(&self.bold, "Places", menu_x + 14, menu_y + 12, 14.0, INK);
-            for (idx, place) in places.iter().take(6).enumerate() {
+            for (idx, place) in self.folder_places.iter().take(6).enumerate() {
                 let y = menu_y + 40 + idx as i32 * 28;
                 c.draw_round_rect(
                     menu_x + 8,
@@ -1842,6 +2571,61 @@ impl Aurora {
                     INK,
                 );
             }
+        }
+        if self.folder_context_open {
+            let menu_x = self.folder_context_pos.0.min(i32::from(w) - 166).max(10);
+            let menu_y = self.folder_context_pos.1.min(i32::from(h) - 178).max(78);
+            let items = ["Open other app", "Copy", "Cut", "Paste", "Info"];
+            c.draw_round_rect(
+                menu_x,
+                menu_y,
+                156,
+                164,
+                10,
+                Color::rgba(250, 254, 255, 242),
+            );
+            for (idx, item) in items.iter().enumerate() {
+                let y = menu_y + 14 + idx as i32 * 29;
+                c.draw_text(&self.regular, item, menu_x + 14, y, 12.0, INK);
+            }
+        }
+        if let Some(info) = self.folder_info.as_ref() {
+            c.draw_round_rect(
+                16,
+                i32::from(h) - 64,
+                i32::from(w) - 32,
+                44,
+                10,
+                Color::rgba(250, 254, 255, 230),
+            );
+            c.draw_text(
+                &self.regular,
+                &compact(info, 46),
+                28,
+                i32::from(h) - 49,
+                12.0,
+                INK,
+            );
+        }
+        if self.folder_entries.len() > 9 {
+            let track_h = i32::from(h) - 100;
+            let track_x = i32::from(w) - 13;
+            c.draw_round_rect(track_x, 84, 5, track_h, 3, Color::rgba(176, 198, 210, 90));
+            let thumb_h = ((track_h as f32 * 9.0 / self.folder_entries.len() as f32) as i32)
+                .max(34)
+                .min(track_h);
+            let max_scroll = self.folder_entries.len().saturating_sub(9).max(1);
+            let thumb_y = 84
+                + ((track_h - thumb_h) as f32 * self.folder_scroll.min(max_scroll) as f32
+                    / max_scroll as f32) as i32;
+            c.draw_round_rect(
+                track_x,
+                thumb_y,
+                5,
+                thumb_h,
+                3,
+                Color::rgba(29, 145, 137, 180),
+            );
         }
         self.upload_canvas(self.ui.folder, &c)
     }
@@ -1879,6 +2663,58 @@ impl Aurora {
             draw_launcher_icon(&mut c, idx, 34, row_y + 12);
             c.draw_text(&self.bold, app.label, 58, row_y, 13.0, INK);
             c.draw_text(&self.regular, app.hint, 58, row_y + 17, 10.0, MUTED);
+        }
+        if self.app_menu_more {
+            let x0 = 280;
+            c.draw_rect(
+                x0 - 12,
+                20,
+                1,
+                i32::from(h) - 40,
+                Color::rgba(176, 198, 210, 100),
+            );
+            c.draw_text(&self.bold, "Desktop Apps", x0, 18, 18.0, INK);
+            let entries = read_desktop_entries();
+            let visible = 15usize;
+            let start = self.app_menu_scroll.min(entries.len().saturating_sub(1));
+            let mut y = 56;
+            let mut current = String::new();
+            for entry in entries.iter().skip(start).take(visible) {
+                if entry.category != current {
+                    current = entry.category.clone();
+                    c.draw_text(&self.bold, &current, x0, y, 12.0, MINT_DARK);
+                    y += 22;
+                }
+                c.draw_text(
+                    &self.regular,
+                    &compact(&entry.name, 30),
+                    x0 + 14,
+                    y,
+                    12.0,
+                    INK,
+                );
+                y += 24;
+            }
+            if entries.len() > visible {
+                let track_x = i32::from(w) - 22;
+                let track_h = i32::from(h) - 86;
+                c.draw_round_rect(track_x, 54, 6, track_h, 3, Color::rgba(176, 198, 210, 95));
+                let thumb_h = ((track_h as f32 * visible as f32 / entries.len() as f32) as i32)
+                    .max(34)
+                    .min(track_h);
+                let max_scroll = entries.len().saturating_sub(visible).max(1);
+                let thumb_y = 54
+                    + ((track_h - thumb_h) as f32 * self.app_menu_scroll.min(max_scroll) as f32
+                        / max_scroll as f32) as i32;
+                c.draw_round_rect(
+                    track_x,
+                    thumb_y,
+                    6,
+                    thumb_h,
+                    3,
+                    Color::rgba(29, 145, 137, 185),
+                );
+            }
         }
         self.upload_canvas(self.ui.app_menu, &c)
     }
@@ -2013,9 +2849,46 @@ impl Aurora {
                     4200.0,
                     MINT_DARK,
                 );
+                c.draw_text_center(
+                    &self.bold,
+                    if media.playing {
+                        "Playing audio"
+                    } else {
+                        "Audio ready"
+                    },
+                    i32::from(w) / 2,
+                    preview_y + 20,
+                    14.0,
+                    INK,
+                );
             }
             FileKind::Video => {
-                draw_play_icon(&mut c, i32::from(w) / 2, preview_y + 82, BLUE);
+                let frame_color = if media.playing {
+                    Color::rgba(73, 156, 231, 80)
+                } else {
+                    Color::rgba(23, 34, 42, 38)
+                };
+                c.draw_round_rect(
+                    preview_x + 18,
+                    preview_y + 16,
+                    preview_w - 36,
+                    preview_h - 54,
+                    10,
+                    frame_color,
+                );
+                draw_play_icon(&mut c, i32::from(w) / 2, preview_y + 72, BLUE);
+                c.draw_text_center(
+                    &self.bold,
+                    if media.playing {
+                        "Playing video"
+                    } else {
+                        "Video ready"
+                    },
+                    i32::from(w) / 2,
+                    preview_y + 20,
+                    14.0,
+                    INK,
+                );
                 c.draw_round_rect(
                     preview_x + 34,
                     preview_y + 122,
@@ -2027,7 +2900,7 @@ impl Aurora {
                 c.draw_round_rect(
                     preview_x + 34,
                     preview_y + 122,
-                    (preview_w - 68) / 3,
+                    ((preview_w - 68) as f32 * media.progress.clamp(0.0, 1.0)) as i32,
                     10,
                     5,
                     Color::rgba(73, 156, 231, 150),
@@ -2063,8 +2936,25 @@ impl Aurora {
                 13,
                 Color::rgba(116, 213, 198, 88),
             );
-            draw_play_icon(&mut c, 50, 325, MINT_DARK);
-            c.draw_text(&self.bold, "Play with installed player", 80, 315, 13.0, INK);
+            if media.playing {
+                c.draw_rect(44, 316, 5, 18, MINT_DARK);
+                c.draw_rect(54, 316, 5, 18, MINT_DARK);
+                c.draw_text(&self.bold, "Pause in Aurora", 80, 315, 13.0, INK);
+            } else {
+                draw_play_icon(&mut c, 50, 325, MINT_DARK);
+                c.draw_text(&self.bold, "Play in Aurora", 80, 315, 13.0, INK);
+            }
+            let bar_x = 250;
+            let bar_w = i32::from(w) - bar_x - 48;
+            c.draw_round_rect(bar_x, 321, bar_w, 8, 4, Color::rgba(255, 255, 255, 140));
+            c.draw_round_rect(
+                bar_x,
+                321,
+                (bar_w as f32 * media.progress.clamp(0.0, 1.0)) as i32,
+                8,
+                4,
+                Color::rgba(29, 145, 137, 190),
+            );
         } else {
             c.draw_text(
                 &self.regular,
@@ -2080,13 +2970,17 @@ impl Aurora {
 
     fn draw_settings_sidebar(&self, c: &mut Canvas) {
         let items = [
-            (SettingsTab::Display, "Display"),
-            (SettingsTab::Power, "Power"),
-            (SettingsTab::Wallpaper, "Wallpaper"),
-            (SettingsTab::About, "About"),
+            SettingsTab::Display,
+            SettingsTab::Power,
+            SettingsTab::Wallpaper,
+            SettingsTab::Audio,
+            SettingsTab::Network,
+            SettingsTab::Bluetooth,
+            SettingsTab::Startup,
+            SettingsTab::About,
         ];
-        for (idx, (tab, label)) in items.iter().enumerate() {
-            let y = 66 + idx as i32 * 48;
+        for (idx, tab) in items.iter().enumerate() {
+            let y = SETTINGS_SIDEBAR_TOP + idx as i32 * 48;
             let active = *tab == self.settings.tab;
             if active {
                 c.draw_round_rect(
@@ -2099,26 +2993,18 @@ impl Aurora {
                 );
             }
             draw_sidebar_icon(c, idx, 28, y + 12, if active { MINT_DARK } else { MUTED });
-            c.draw_text(
-                if active { &self.bold } else { &self.regular },
-                label,
-                45,
-                y + 3,
-                13.0,
-                if active { MINT_DARK } else { SOFT_INK },
-            );
         }
     }
 
     fn draw_display_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
-        c.draw_text(&self.bold, "Display", sx, 24, 22.0, INK);
+        c.draw_text(&self.bold, "Display", sx, 22, 24.0, INK);
         c.draw_text(
             &self.regular,
             "Resolution, refresh rate, and idle sleep.",
             sx,
             54,
-            12.0,
+            13.0,
             MUTED,
         );
 
@@ -2185,13 +3071,13 @@ impl Aurora {
 
     fn draw_power_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
-        c.draw_text(&self.bold, "Power", sx, 24, 22.0, INK);
+        c.draw_text(&self.bold, "Power", sx, 22, 24.0, INK);
         c.draw_text(
             &self.regular,
             "Battery mode and live resource pressure.",
             sx,
             54,
-            12.0,
+            13.0,
             MUTED,
         );
         draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 126);
@@ -2259,13 +3145,13 @@ impl Aurora {
 
     fn draw_wallpaper_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
-        c.draw_text(&self.bold, "Wallpaper", sx, 24, 22.0, INK);
+        c.draw_text(&self.bold, "Wallpaper", sx, 22, 24.0, INK);
         c.draw_text(
             &self.regular,
             "Select one of the embedded wallpapers.",
             sx,
             54,
-            12.0,
+            13.0,
             MUTED,
         );
         for (idx, asset) in WALLPAPERS.iter().enumerate() {
@@ -2273,7 +3159,9 @@ impl Aurora {
             draw_card(c, sx, y, i32::from(c.width) - sx - 24, 94);
             let preview_x = sx + 14;
             let preview_y = y + 14;
-            paint_asset_preview(c, asset.bytes, preview_x, preview_y, 92, 56);
+            if let Some(preview) = self.wallpaper_previews.get(idx) {
+                paint_bgr_pixels(c, preview, preview_x, preview_y, 92, 56);
+            }
             c.draw_round_rect(
                 preview_x,
                 preview_y,
@@ -2326,9 +3214,149 @@ impl Aurora {
         }
     }
 
+    fn draw_audio_tab(&self, c: &mut Canvas) {
+        let sx = SIDEBAR_WIDTH + 24;
+        c.draw_text(&self.bold, "Audio", sx, 22, 24.0, INK);
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 112);
+        c.draw_text(&self.bold, "Volume", sx + 16, 106, 15.0, INK);
+        c.draw_round_rect(sx + 16, 142, 230, 10, 5, Color::rgba(211, 225, 232, 170));
+        c.draw_round_rect(sx + 16, 142, 138, 10, 5, Color::rgba(116, 213, 198, 210));
+        c.draw_text(&self.regular, "60%", sx + 262, 136, 15.0, INK);
+        draw_card(c, sx, 220, i32::from(c.width) - sx - 24, 150);
+        c.draw_text(&self.bold, "Output device", sx + 16, 240, 15.0, INK);
+        for (idx, dev) in read_audio_devices("Sink").iter().take(3).enumerate() {
+            c.draw_text(
+                &self.regular,
+                &compact(dev, 48),
+                sx + 16,
+                272 + idx as i32 * 28,
+                12.0,
+                INK,
+            );
+        }
+        draw_card(c, sx, 392, i32::from(c.width) - sx - 24, 108);
+        c.draw_text(&self.bold, "Input device", sx + 16, 412, 15.0, INK);
+        for (idx, dev) in read_audio_devices("Source").iter().take(2).enumerate() {
+            c.draw_text(
+                &self.regular,
+                &compact(dev, 48),
+                sx + 16,
+                444 + idx as i32 * 28,
+                12.0,
+                INK,
+            );
+        }
+    }
+
+    fn draw_network_tab(&self, c: &mut Canvas) {
+        let sx = SIDEBAR_WIDTH + 24;
+        c.draw_text(&self.bold, "Network", sx, 22, 24.0, INK);
+        c.draw_text(
+            &self.regular,
+            "Wired and Wi-Fi interfaces.",
+            sx,
+            54,
+            13.0,
+            MUTED,
+        );
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 394);
+        let start = (self.settings.scroll / 29).max(0) as usize;
+        for (idx, line) in read_network_details()
+            .iter()
+            .skip(start)
+            .take(12)
+            .enumerate()
+        {
+            c.draw_text(
+                &self.regular,
+                &compact(line, 62),
+                sx + 16,
+                112 + idx as i32 * 29,
+                13.0,
+                if idx % 3 == 0 { INK } else { MUTED },
+            );
+        }
+    }
+
+    fn draw_bluetooth_tab(&self, c: &mut Canvas) {
+        let sx = SIDEBAR_WIDTH + 24;
+        c.draw_text(&self.bold, "Bluetooth", sx, 22, 24.0, INK);
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 116);
+        c.draw_text(&self.bold, "Connected devices", sx + 16, 106, 15.0, INK);
+        let devices = read_bluetooth_devices();
+        if devices.is_empty() {
+            c.draw_text(
+                &self.regular,
+                "No connected devices",
+                sx + 16,
+                140,
+                12.0,
+                MUTED,
+            );
+        } else {
+            for (idx, dev) in devices.iter().take(3).enumerate() {
+                c.draw_text(
+                    &self.regular,
+                    &compact(dev, 50),
+                    sx + 16,
+                    140 + idx as i32 * 26,
+                    12.0,
+                    INK,
+                );
+            }
+        }
+        draw_card(c, sx, 224, i32::from(c.width) - sx - 24, 76);
+        c.draw_text(&self.bold, "Add device", sx + 16, 246, 15.0, INK);
+        c.draw_text(
+            &self.regular,
+            "Click to open bluetoothctl pairing helper",
+            sx + 16,
+            274,
+            12.0,
+            MUTED,
+        );
+    }
+
+    fn draw_startup_tab(&self, c: &mut Canvas) {
+        let sx = SIDEBAR_WIDTH + 24;
+        c.draw_text(&self.bold, "Startup", sx, 22, 24.0, INK);
+        c.draw_text(
+            &self.regular,
+            "Autostart apps for this desktop.",
+            sx,
+            54,
+            13.0,
+            MUTED,
+        );
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 394);
+        let apps = read_autostart_apps();
+        if apps.is_empty() {
+            c.draw_text(
+                &self.regular,
+                "No autostart entries",
+                sx + 16,
+                116,
+                12.0,
+                MUTED,
+            );
+        } else {
+            let start = (self.settings.scroll / 28).max(0) as usize;
+            for (idx, app) in apps.iter().skip(start).take(12).enumerate() {
+                c.draw_text(
+                    &self.regular,
+                    &compact(app, 54),
+                    sx + 16,
+                    116 + idx as i32 * 28,
+                    13.0,
+                    INK,
+                );
+            }
+        }
+    }
+
     fn draw_about_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
-        c.draw_text(&self.bold, "About", sx, 24, 22.0, INK);
+        c.draw_text(&self.bold, "About", sx, 22, 24.0, INK);
         c.draw_text(
             &self.regular,
             "Hardware and network telemetry.",
@@ -2428,15 +3456,23 @@ impl Aurora {
 
     fn handle_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         if x < SIDEBAR_WIDTH {
-            let tab = match (y - 62) / 48 {
+            if y < SETTINGS_SIDEBAR_TOP - 4 {
+                return Ok(());
+            }
+            let tab = match (y - (SETTINGS_SIDEBAR_TOP - 4)) / 48 {
                 0 => Some(SettingsTab::Display),
                 1 => Some(SettingsTab::Power),
                 2 => Some(SettingsTab::Wallpaper),
-                3 => Some(SettingsTab::About),
+                3 => Some(SettingsTab::Audio),
+                4 => Some(SettingsTab::Network),
+                5 => Some(SettingsTab::Bluetooth),
+                6 => Some(SettingsTab::Startup),
+                7 => Some(SettingsTab::About),
                 _ => None,
             };
             if let Some(tab) = tab {
                 self.settings.tab = tab;
+                self.settings.scroll = 0;
                 self.redraw_settings()?;
             }
             return Ok(());
@@ -2446,8 +3482,37 @@ impl Aurora {
             SettingsTab::Display => self.handle_display_click(x, y)?,
             SettingsTab::Power => self.handle_power_click(x, y)?,
             SettingsTab::Wallpaper => self.handle_wallpaper_click(y)?,
+            SettingsTab::Bluetooth if y >= 224 && y <= 300 => {
+                self.spawn_first_available(&["blueman-manager", "bluetoothctl"], &[]);
+            }
+            SettingsTab::Audio
+            | SettingsTab::Network
+            | SettingsTab::Bluetooth
+            | SettingsTab::Startup => {}
             SettingsTab::About => {}
         }
+        Ok(())
+    }
+
+    fn handle_settings_scroll(&mut self, button: u8, x: i32) -> AnyResult<()> {
+        if x <= SIDEBAR_WIDTH {
+            return Ok(());
+        }
+        let max_scroll = match self.settings.tab {
+            SettingsTab::Network | SettingsTab::Startup | SettingsTab::About => 180,
+            SettingsTab::Audio | SettingsTab::Wallpaper => 80,
+            SettingsTab::Display | SettingsTab::Power | SettingsTab::Bluetooth => 40,
+        };
+        let old_scroll = self.settings.scroll;
+        if button == 4 {
+            self.settings.scroll = self.settings.scroll.saturating_sub(36);
+        } else {
+            self.settings.scroll = (self.settings.scroll + 36).min(max_scroll);
+        }
+        if self.settings.scroll == old_scroll {
+            return Ok(());
+        }
+        self.redraw_settings()?;
         Ok(())
     }
 
@@ -2501,12 +3566,20 @@ impl Aurora {
         for idx in 0..WALLPAPERS.len() {
             let row_y = 88 + idx as i32 * 116;
             if y >= row_y && y <= row_y + 94 {
+                if idx == self.wallpaper_index {
+                    return Ok(());
+                }
                 self.wallpaper_index = idx;
-                self.wallpaper_pixels = render_wallpaper_pixels(
-                    WALLPAPERS[idx].bytes,
-                    self.screen_width,
-                    self.screen_height,
-                )?;
+                if self.wallpaper_cache[idx].is_none() {
+                    self.wallpaper_cache[idx] = Some(render_wallpaper_pixels(
+                        WALLPAPERS[idx].bytes,
+                        self.screen_width,
+                        self.screen_height,
+                    )?);
+                }
+                if let Some(pixels) = self.wallpaper_cache[idx].as_ref() {
+                    self.wallpaper_pixels.clone_from(pixels);
+                }
                 self.redraw_everything()?;
                 return Ok(());
             }
@@ -2631,6 +3704,7 @@ impl Aurora {
         self.folder_path = folder_path_for(mode);
         self.folder_entries = folder_entries_for(mode);
         self.folder_selected = None;
+        self.folder_scroll = 0;
         self.folder_front = front;
         self.folder_more_open = false;
         if front {
@@ -2659,12 +3733,29 @@ impl Aurora {
 
     fn handle_folder_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let (_, _, w, _) = self.folder_geometry();
+        if self.folder_context_open {
+            if let Some(action) = self.folder_context_action_at(x, y) {
+                self.run_folder_context_action(action)?;
+                self.folder_context_open = false;
+                self.redraw_folder()?;
+                return Ok(());
+            }
+            self.folder_context_open = false;
+        }
         if (18..=48).contains(&x) && (18..=48).contains(&y) {
             self.folder_mode = FolderMode::Home;
             self.folder_path = folder_path_for(FolderMode::Home);
             self.folder_entries = folder_entries_for(FolderMode::Home);
             self.folder_selected = None;
+            self.folder_scroll = 0;
             self.folder_more_open = false;
+            self.folder_info = None;
+            self.redraw_folder()?;
+            return Ok(());
+        }
+        if x >= 58 && x <= i32::from(w) - 58 && (22..=52).contains(&y) {
+            copy_text_to_clipboard(&self.folder_path.to_string_lossy());
+            self.folder_info = Some("Path copied to clipboard".to_string());
             self.redraw_folder()?;
             return Ok(());
         }
@@ -2675,14 +3766,14 @@ impl Aurora {
         }
         if self.folder_more_open {
             let menu_x = i32::from(w) - 214;
-            let places = place_entries();
-            for (idx, place) in places.iter().take(6).enumerate() {
+            for (idx, place) in self.folder_places.iter().take(6).enumerate() {
                 let row_y = 94 + idx as i32 * 28;
                 if x >= menu_x + 8 && x <= menu_x + 186 && y >= row_y - 5 && y <= row_y + 18 {
                     self.folder_mode = FolderMode::Home;
                     self.folder_path = place.path.clone();
                     self.folder_entries = folder_entries_in(place.path.clone());
                     self.folder_selected = None;
+                    self.folder_scroll = 0;
                     self.folder_more_open = false;
                     self.redraw_folder()?;
                     return Ok(());
@@ -2690,6 +3781,7 @@ impl Aurora {
             }
         }
         self.folder_more_open = false;
+        self.folder_info = None;
         if y < 86 {
             self.redraw_folder()?;
             return Ok(());
@@ -2699,18 +3791,28 @@ impl Aurora {
             self.redraw_folder()?;
             return Ok(());
         }
-        let Some(entry) = self.folder_entries.get(idx as usize).cloned() else {
+        let Some(entry) = self
+            .folder_entries
+            .get(self.folder_scroll + idx as usize)
+            .cloned()
+        else {
             self.redraw_folder()?;
             return Ok(());
         };
+        self.folder_drag = Some(entry.path.clone());
         match entry.kind {
             FileKind::Directory => {
                 self.folder_path = entry.path.clone();
                 self.folder_entries = folder_entries_in(entry.path);
                 self.folder_selected = None;
+                self.folder_scroll = 0;
                 self.redraw_folder()?;
             }
-            FileKind::Image | FileKind::Audio | FileKind::Video | FileKind::Other => {
+            FileKind::Text
+            | FileKind::Image
+            | FileKind::Audio
+            | FileKind::Video
+            | FileKind::Other => {
                 if self.folder_selected.as_ref() == Some(&entry.path) {
                     self.open_media(entry)?;
                 } else {
@@ -2722,10 +3824,166 @@ impl Aurora {
         Ok(())
     }
 
+    fn handle_folder_release(&mut self, _ev: ButtonReleaseEvent) -> AnyResult<()> {
+        let Some(path) = self.folder_drag.take() else {
+            return Ok(());
+        };
+        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+        let mut target = pointer.child;
+        if target == x11rb::NONE || target == self.ui.folder || self.is_ui_window(target) {
+            return Ok(());
+        }
+        if let Some(client) = self.client_key_for(target) {
+            if let Some(info) = self.clients.get(&client) {
+                target = info.window;
+            }
+        }
+        self.folder_drag = Some(path);
+        let selection = self.atom(b"XdndSelection")?;
+        self.conn
+            .set_selection_owner(self.ui.folder, selection, CURRENT_TIME)?;
+        let xdnd_enter = self.atom(b"XdndEnter")?;
+        let xdnd_position = self.atom(b"XdndPosition")?;
+        let xdnd_drop = self.atom(b"XdndDrop")?;
+        let uri = self.atom(b"text/uri-list")?;
+        let action_copy = self.atom(b"XdndActionCopy")?;
+        let packed_xy =
+            ((u32::from(pointer.root_x as u16)) << 16) | u32::from(pointer.root_y as u16);
+        self.conn.send_event(
+            false,
+            target,
+            EventMask::NO_EVENT,
+            ClientMessageEvent::new(32, target, xdnd_enter, [self.ui.folder, 5 << 24, uri, 0, 0]),
+        )?;
+        self.conn.send_event(
+            false,
+            target,
+            EventMask::NO_EVENT,
+            ClientMessageEvent::new(
+                32,
+                target,
+                xdnd_position,
+                [self.ui.folder, 0, packed_xy, CURRENT_TIME, action_copy],
+            ),
+        )?;
+        self.conn.send_event(
+            false,
+            target,
+            EventMask::NO_EVENT,
+            ClientMessageEvent::new(
+                32,
+                target,
+                xdnd_drop,
+                [self.ui.folder, 0, CURRENT_TIME, 0, 0],
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn handle_folder_context(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        if y >= 86 {
+            let idx = (y - 86) / 42;
+            if (0..9).contains(&idx) {
+                if let Some(entry) = self.folder_entries.get(self.folder_scroll + idx as usize) {
+                    self.folder_selected = Some(entry.path.clone());
+                }
+            }
+        }
+        self.folder_context_open = true;
+        self.folder_context_pos = (x, y);
+        self.folder_more_open = false;
+        self.redraw_folder()?;
+        Ok(())
+    }
+
+    fn handle_folder_scroll(&mut self, button: u8) -> AnyResult<()> {
+        let max_scroll = self.folder_entries.len().saturating_sub(9);
+        let old_scroll = self.folder_scroll;
+        if button == 4 {
+            self.folder_scroll = self.folder_scroll.saturating_sub(3);
+        } else {
+            self.folder_scroll = (self.folder_scroll + 3).min(max_scroll);
+        }
+        if self.folder_scroll == old_scroll {
+            return Ok(());
+        }
+        self.redraw_folder()?;
+        Ok(())
+    }
+
+    fn folder_context_action_at(&self, x: i32, y: i32) -> Option<FolderContextAction> {
+        let (_, _, w, h) = self.folder_geometry();
+        let menu_x = self.folder_context_pos.0.min(i32::from(w) - 166).max(10);
+        let menu_y = self.folder_context_pos.1.min(i32::from(h) - 178).max(78);
+        if x < menu_x || x > menu_x + 156 || y < menu_y || y > menu_y + 164 {
+            return None;
+        }
+        match (y - menu_y - 8) / 29 {
+            0 => Some(FolderContextAction::OpenExternal),
+            1 => Some(FolderContextAction::Copy),
+            2 => Some(FolderContextAction::Cut),
+            3 => Some(FolderContextAction::Paste),
+            4 => Some(FolderContextAction::Info),
+            _ => None,
+        }
+    }
+
+    fn run_folder_context_action(&mut self, action: FolderContextAction) -> AnyResult<()> {
+        match action {
+            FolderContextAction::Copy => {
+                if let Some(path) = self.folder_selected.clone() {
+                    self.folder_clipboard = Some((path, false));
+                    self.folder_info = Some("Copied".to_string());
+                }
+            }
+            FolderContextAction::Cut => {
+                if let Some(path) = self.folder_selected.clone() {
+                    self.folder_clipboard = Some((path, true));
+                    self.folder_info = Some("Cut".to_string());
+                }
+            }
+            FolderContextAction::Paste => {
+                if let Some((src, cut)) = self.folder_clipboard.clone() {
+                    let dst = self.folder_path.join(src.file_name().unwrap_or_default());
+                    if cut {
+                        let _ = fs::rename(&src, &dst);
+                        self.folder_clipboard = None;
+                    } else if src.is_file() {
+                        let _ = fs::copy(&src, &dst);
+                    }
+                    self.folder_entries = folder_entries_in(self.folder_path.clone());
+                    self.folder_info = Some("Pasted".to_string());
+                }
+            }
+            FolderContextAction::Info => {
+                if let Some(path) = self.folder_selected.as_ref() {
+                    let meta = fs::metadata(path).ok();
+                    self.folder_info = Some(format!(
+                        "{}  {} bytes",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("Item"),
+                        meta.map(|m| m.len()).unwrap_or(0)
+                    ));
+                }
+            }
+            FolderContextAction::OpenExternal => {
+                if let Some(path) = self.folder_selected.as_ref() {
+                    let mut cmd = Command::new("xdg-open");
+                    cmd.env("DISPLAY", &self.display).arg(path);
+                    spawn_detached(cmd);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn open_media(&mut self, entry: FolderEntry) -> AnyResult<()> {
         let slot = self.media_next_slot % MEDIA_SLOT_COUNT;
         self.media_next_slot = (slot + 1) % MEDIA_SLOT_COUNT;
-        let state = MediaState { entry };
+        let state = MediaState {
+            entry,
+            playing: false,
+            progress: 0.0,
+        };
         self.media = Some(state.clone());
         self.media_slots[slot] = Some(state);
         self.media_front = true;
@@ -2760,28 +4018,53 @@ impl Aurora {
             self.conn.unmap_window(self.ui.media[slot])?;
             return Ok(());
         }
-        if let Some(media) = self.media_slots.get(slot).and_then(|m| m.as_ref()) {
+        if let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) {
             let playable = matches!(media.entry.kind, FileKind::Audio | FileKind::Video);
             if playable && x >= 26 && x <= i32::from(w) - 26 && y >= 275 && y <= 330 {
-                self.play_media_entry(&media.entry);
+                media.playing = !media.playing;
+                self.media = self.media_slots.iter().rev().find_map(|m| m.clone());
+                self.redraw_media_slot(slot)?;
             }
         }
         self.raise_media()?;
         Ok(())
     }
 
-    fn play_media_entry(&self, entry: &FolderEntry) {
-        for name in ["mpv", "vlc", "ffplay", "xdg-open"] {
-            if command_exists(name) {
-                let mut cmd = Command::new(name);
-                cmd.env("DISPLAY", &self.display).arg(&entry.path);
-                spawn_detached(cmd);
-                break;
+    fn advance_internal_media(&mut self) -> AnyResult<bool> {
+        let mut changed = false;
+        for slot in 0..MEDIA_SLOT_COUNT {
+            let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) else {
+                continue;
+            };
+            if !media.playing || !matches!(media.entry.kind, FileKind::Audio | FileKind::Video) {
+                continue;
             }
+            media.progress += 0.006;
+            if media.progress >= 1.0 {
+                media.progress = 0.0;
+                media.playing = false;
+            }
+            self.redraw_media_slot(slot)?;
+            changed = true;
         }
+        if changed {
+            self.media = self.media_slots.iter().rev().find_map(|m| m.clone());
+        }
+        Ok(changed)
     }
 
-    fn handle_app_menu_click(&mut self, y: i32) -> AnyResult<()> {
+    fn handle_app_menu_click(&mut self, button: u8, x: i32, y: i32) -> AnyResult<()> {
+        if self.app_menu_more && x >= 270 && (button == 4 || button == 5) {
+            let entries = read_desktop_entries();
+            let max_scroll = entries.len().saturating_sub(15);
+            if button == 4 {
+                self.app_menu_scroll = self.app_menu_scroll.saturating_sub(3);
+            } else {
+                self.app_menu_scroll = (self.app_menu_scroll + 3).min(max_scroll);
+            }
+            self.redraw_app_menu()?;
+            return Ok(());
+        }
         let idx = (y - 53) / 42;
         if idx < 0 {
             return Ok(());
@@ -2809,8 +4092,23 @@ impl Aurora {
                 self.raise_ui()?;
                 self.redraw_settings()?;
             }
+            AppAction::More => {
+                self.app_menu_more = !self.app_menu_more;
+                self.app_menu_scroll = 0;
+                let menu = self.app_menu_geometry();
+                self.conn.configure_window(
+                    self.ui.app_menu,
+                    &ConfigureWindowAux::new()
+                        .width(u32::from(menu.2))
+                        .height(u32::from(menu.3)),
+                )?;
+                self.redraw_app_menu()?;
+                return Ok(());
+            }
         }
         self.app_menu_visible = false;
+        self.app_menu_more = false;
+        self.app_menu_scroll = 0;
         self.conn.unmap_window(self.ui.app_menu)?;
         Ok(())
     }
@@ -2862,11 +4160,13 @@ impl Aurora {
         }
         self.screen_width = geom.width;
         self.screen_height = geom.height;
+        self.wallpaper_cache = vec![None; WALLPAPERS.len()];
         self.wallpaper_pixels = render_wallpaper_pixels(
             WALLPAPERS[self.wallpaper_index].bytes,
             self.screen_width,
             self.screen_height,
         )?;
+        self.wallpaper_cache[self.wallpaper_index] = Some(self.wallpaper_pixels.clone());
         let dock = self.dock_geometry();
         let settings = self.settings_geometry();
         let folder = self.folder_geometry();
@@ -3005,6 +4305,77 @@ impl Aurora {
         Ok(())
     }
 
+    fn atom(&self, name: &[u8]) -> AnyResult<Atom> {
+        Ok(self.conn.intern_atom(false, name)?.reply()?.atom)
+    }
+
+    fn paint_window_icon(
+        &self,
+        canvas: &mut Canvas,
+        window: Window,
+        x: i32,
+        y: i32,
+        size: i32,
+    ) -> bool {
+        let Ok(cookie) = self.conn.intern_atom(false, b"_NET_WM_ICON") else {
+            return false;
+        };
+        let Ok(atom) = cookie.reply() else {
+            return false;
+        };
+        let Ok(cookie) =
+            self.conn
+                .get_property(false, window, atom.atom, AtomEnum::CARDINAL, 0, 4096)
+        else {
+            return false;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return false;
+        };
+        let Some(values) = reply.value32() else {
+            return false;
+        };
+        let data = values.collect::<Vec<_>>();
+        let mut pos = 0usize;
+        let mut best: Option<(usize, usize, usize)> = None;
+        while pos + 2 <= data.len() {
+            let w = data[pos] as usize;
+            let h = data[pos + 1] as usize;
+            pos += 2;
+            let count = w.saturating_mul(h);
+            if w == 0 || h == 0 || pos + count > data.len() {
+                break;
+            }
+            let score = (w as i32 - size).abs() + (h as i32 - size).abs();
+            let replace = best
+                .map(|(_, bw, bh)| score < (bw as i32 - size).abs() + (bh as i32 - size).abs())
+                .unwrap_or(true);
+            if replace {
+                best = Some((pos, w, h));
+            }
+            pos += count;
+        }
+        let Some((start, w, h)) = best else {
+            return false;
+        };
+        for yy in 0..size {
+            for xx in 0..size {
+                let sx = (xx as usize * w / size as usize).min(w - 1);
+                let sy = (yy as usize * h / size as usize).min(h - 1);
+                let argb = data[start + sy * w + sx];
+                let a = ((argb >> 24) & 0xff) as u8;
+                if a == 0 {
+                    continue;
+                }
+                let r = ((argb >> 16) & 0xff) as u8;
+                let g = ((argb >> 8) & 0xff) as u8;
+                let b = (argb & 0xff) as u8;
+                canvas.blend_pixel(x + xx, y + yy, Color::rgba(r, g, b, a));
+            }
+        }
+        true
+    }
+
     fn dock_geometry(&self) -> (i16, i16, u16, u16) {
         let buttons = self.dock_button_count().max(5);
         let width = (buttons as u16 * 58 + 28)
@@ -3044,24 +4415,28 @@ impl Aurora {
     }
 
     fn app_menu_geometry(&self) -> (i16, i16, u16, u16) {
-        let width = 260u16;
-        let height = 316u16;
+        let width = if self.app_menu_more { 590u16 } else { 260u16 };
+        let height = if self.app_menu_more { 500u16 } else { 360u16 };
         let dock = self.dock_geometry();
         let x = dock.0.max(18);
         let y = dock.1.saturating_sub(height as i16 + 10);
         (x, y, width, height)
     }
 
-    fn media_geometry(&self) -> (i16, i16, u16, u16) {
-        let width = 430u16
+    fn media_geometry(&self, slot: usize) -> (i16, i16, u16, u16) {
+        let folder = self.folder_geometry();
+        let width = MEDIA_WIDTH
             .min(self.screen_width.saturating_sub(48))
             .max(320.min(self.screen_width));
-        let height = 368u16
+        let height = folder
+            .3
             .min(self.screen_height.saturating_sub(TOPBAR_HEIGHT + 56))
             .max(300.min(self.screen_height));
-        let x = self.screen_width.saturating_sub(width + 24) as i16;
-        let y = (TOPBAR_HEIGHT + 56) as i16;
-        (x, y, width, height)
+        let desired_x = i32::from(folder.0) + i32::from(folder.2);
+        let max_x = i32::from(self.screen_width.saturating_sub(width));
+        let x = desired_x.min(max_x).max(0) as i16;
+        let y = i32::from(folder.1) + (slot.min(4) as i32 * 10);
+        (x, y as i16, width, height)
     }
 
     fn dock_button_count(&self) -> usize {
@@ -3090,7 +4465,11 @@ impl Aurora {
             || window == self.ui.settings
             || window == self.ui.folder
             || window == self.ui.app_menu
-            || window == self.ui.media
+            || self.ui.media.contains(&window)
+    }
+
+    fn media_slot_for_window(&self, window: Window) -> Option<usize> {
+        self.ui.media.iter().position(|&media| media == window)
     }
 }
 
@@ -3136,6 +4515,89 @@ fn draw_info_row(c: &mut Canvas, font: &Font<'static>, x: i32, y: i32, key: &str
 
 fn mask_has(mask: ConfigWindow, flag: ConfigWindow) -> bool {
     u16::from(mask) & u16::from(flag) != 0
+}
+
+fn hover_title_button(x: i16, y: i16) -> Option<TitleButton> {
+    if !(8..=28).contains(&x) || !(6..=28).contains(&y) {
+        if (31..=53).contains(&x) && (6..=28).contains(&y) {
+            return Some(TitleButton::Minimize);
+        }
+        if (54..=76).contains(&x) && (6..=28).contains(&y) {
+            return Some(TitleButton::Maximize);
+        }
+        return None;
+    }
+    Some(TitleButton::Close)
+}
+
+fn resize_edges_for_frame(info: &ClientInfo, title_h: u16, x: i16, y: i16) -> Option<ResizeEdges> {
+    let frame_h = i16::try_from(info.height + title_h).unwrap_or(i16::MAX);
+    let width = i16::try_from(info.width).unwrap_or(i16::MAX);
+    let edges = ResizeEdges {
+        left: x <= RESIZE_EDGE,
+        right: x >= width - RESIZE_EDGE,
+        top: y <= RESIZE_EDGE,
+        bottom: y >= frame_h - RESIZE_EDGE,
+    };
+    (edges.left || edges.right || edges.top || edges.bottom).then_some(edges)
+}
+
+fn resize_edges_for_client(info: &ClientInfo, x: i16, y: i16) -> Option<ResizeEdges> {
+    let width = i16::try_from(info.width).unwrap_or(i16::MAX);
+    let height = i16::try_from(info.height).unwrap_or(i16::MAX);
+    let edges = ResizeEdges {
+        left: x <= RESIZE_EDGE,
+        right: x >= width - RESIZE_EDGE,
+        top: y <= RESIZE_EDGE,
+        bottom: y >= height - RESIZE_EDGE,
+    };
+    (edges.left || edges.right || edges.top || edges.bottom).then_some(edges)
+}
+
+fn client_uses_own_chrome(class: &str, title: &str) -> bool {
+    let text = format!("{} {}", class, title.to_ascii_lowercase());
+    ["firefox", "chromium", "google-chrome", "brave", "vivaldi"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn rounded_top_shape_rects(width: u16, height: u16, radius: i32) -> Vec<Rectangle> {
+    let width_i = i32::from(width);
+    let height_i = i32::from(height);
+    let r = radius.max(0).min(width_i / 2).min(height_i);
+    if r == 0 {
+        return vec![Rectangle {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }];
+    }
+
+    let mut rects = Vec::with_capacity(usize::try_from(r + 1).unwrap_or(1));
+    for y in 0..r {
+        let dy = y - r;
+        let dx = ((r * r - dy * dy) as f64).sqrt().round() as i32;
+        let inset = (r - dx).clamp(0, width_i / 2);
+        let row_w = (width_i - inset * 2).max(0) as u16;
+        if row_w > 0 {
+            rects.push(Rectangle {
+                x: inset as i16,
+                y: y as i16,
+                width: row_w,
+                height: 1,
+            });
+        }
+    }
+    if height_i > r {
+        rects.push(Rectangle {
+            x: 0,
+            y: r as i16,
+            width,
+            height: (height_i - r) as u16,
+        });
+    }
+    rects
 }
 
 fn create_anime_cursor(conn: &RustConnection, root: Window) -> AnyResult<Cursor> {
@@ -3198,28 +4660,6 @@ fn create_anime_cursor(conn: &RustConnection, root: Window) -> AnyResult<Cursor>
         PolyShape::CONVEX,
         CoordMode::ORIGIN,
         &source_points,
-    )?;
-    conn.poly_line(
-        CoordMode::ORIGIN,
-        mask,
-        mask_gc,
-        &[
-            Point { x: 20, y: 10 },
-            Point { x: 20, y: 16 },
-            Point { x: 17, y: 13 },
-            Point { x: 23, y: 13 },
-        ],
-    )?;
-    conn.poly_line(
-        CoordMode::ORIGIN,
-        source,
-        source_gc,
-        &[
-            Point { x: 20, y: 10 },
-            Point { x: 20, y: 16 },
-            Point { x: 17, y: 13 },
-            Point { x: 23, y: 13 },
-        ],
     )?;
     conn.create_cursor(
         cursor,
@@ -3342,6 +4782,20 @@ fn draw_client_icon(c: &mut Canvas, cx: i32, cy: i32, active: bool) {
     c.draw_line(cx - 12, cy + 10, cx + 12, cy + 10, 2, color);
 }
 
+fn draw_text_file_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_round_rect(
+        cx - 10,
+        cy - 13,
+        20,
+        26,
+        4,
+        Color::rgba(color.r, color.g, color.b, 48),
+    );
+    for y in [-6, 0, 6] {
+        c.draw_line(cx - 5, cy + y, cx + 6, cy + y, 2, color);
+    }
+}
+
 fn draw_client_task_icon(
     c: &mut Canvas,
     font: &Font<'static>,
@@ -3377,6 +4831,7 @@ fn draw_client_task_icon(
 fn draw_file_kind_icon(c: &mut Canvas, kind: FileKind, cx: i32, cy: i32) {
     match kind {
         FileKind::Directory => draw_folder_icon(c, cx, cy, MINT_DARK),
+        FileKind::Text => draw_text_file_icon(c, cx, cy, SOFT_INK),
         FileKind::Image => draw_picture_icon(c, cx, cy, MINT_DARK),
         FileKind::Audio => draw_music_icon(c, cx, cy, MINT_DARK),
         FileKind::Video => draw_play_icon(c, cx, cy, BLUE),
@@ -3387,6 +4842,7 @@ fn draw_file_kind_icon(c: &mut Canvas, kind: FileKind, cx: i32, cy: i32) {
 fn file_kind_label(kind: FileKind) -> &'static str {
     match kind {
         FileKind::Directory => "Folder",
+        FileKind::Text => "Text file",
         FileKind::Image => "Image file",
         FileKind::Audio => "Audio file",
         FileKind::Video => "Video file",
@@ -3535,20 +4991,37 @@ fn draw_battery_icon(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, color: Colo
 }
 
 fn draw_wifi_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_line(cx - 12, cy - 8, cx, cy - 14, 2, color);
-    c.draw_line(cx, cy - 14, cx + 12, cy - 8, 2, color);
-    c.draw_line(cx - 8, cy - 3, cx, cy - 7, 2, color);
-    c.draw_line(cx, cy - 7, cx + 8, cy - 3, 2, color);
-    c.draw_circle(cx, cy + 2, 2, color);
+    c.draw_circle(cx, cy - 4, 15, Color::rgba(color.r, color.g, color.b, 44));
+    c.draw_rect(cx - 15, cy - 2, 30, 16, Color::rgba(23, 34, 42, 178));
+    c.draw_circle(cx, cy - 1, 10, Color::rgba(color.r, color.g, color.b, 110));
+    c.draw_rect(cx - 10, cy + 1, 20, 12, Color::rgba(23, 34, 42, 178));
+    c.draw_circle(cx, cy + 2, 4, color);
+}
+
+fn draw_wifi_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_circle(cx, cy - 3, 12, Color::rgba(color.r, color.g, color.b, 42));
+    c.draw_rect(cx - 12, cy - 1, 24, 13, Color::rgba(23, 34, 42, 178));
+    c.draw_circle(cx, cy, 8, Color::rgba(color.r, color.g, color.b, 115));
+    c.draw_rect(cx - 8, cy + 2, 16, 10, Color::rgba(23, 34, 42, 178));
+    c.draw_circle(cx, cy + 3, 3, color);
 }
 
 fn draw_speaker_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_rect(cx - 12, cy - 4, 5, 8, color);
-    c.draw_line(cx - 7, cy - 4, cx, cy - 10, 2, color);
-    c.draw_line(cx, cy - 10, cx, cy + 10, 2, color);
-    c.draw_line(cx, cy + 10, cx - 7, cy + 4, 2, color);
-    c.draw_line(cx + 5, cy - 5, cx + 8, cy, 2, color);
-    c.draw_line(cx + 8, cy, cx + 5, cy + 5, 2, color);
+    c.draw_rect(cx - 13, cy - 5, 6, 10, color);
+    c.draw_line(cx - 7, cy - 5, cx, cy - 11, 4, color);
+    c.draw_line(cx, cy - 11, cx, cy + 11, 4, color);
+    c.draw_line(cx, cy + 11, cx - 7, cy + 5, 4, color);
+    c.draw_circle(cx + 7, cy, 6, Color::rgba(color.r, color.g, color.b, 60));
+    c.draw_rect(cx + 2, cy - 8, 5, 16, Color::rgba(23, 34, 42, 178));
+}
+
+fn draw_speaker_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_rect(cx - 10, cy - 4, 5, 8, color);
+    c.draw_line(cx - 5, cy - 4, cx + 1, cy - 9, 3, color);
+    c.draw_line(cx + 1, cy - 9, cx + 1, cy + 9, 3, color);
+    c.draw_line(cx + 1, cy + 9, cx - 5, cy + 4, 3, color);
+    c.draw_circle(cx + 6, cy, 5, Color::rgba(color.r, color.g, color.b, 58));
+    c.draw_rect(cx + 1, cy - 7, 4, 14, Color::rgba(23, 34, 42, 178));
 }
 
 fn render_wallpaper_pixels(
@@ -3563,7 +5036,7 @@ fn render_wallpaper_pixels(
     let scale = (sw as f32 / iw as f32).max(sh as f32 / ih as f32);
     let nw = (iw as f32 * scale).ceil() as u32;
     let nh = (ih as f32 * scale).ceil() as u32;
-    let resized = image::imageops::resize(&img, nw, nh, FilterType::Lanczos3);
+    let resized = image::imageops::resize(&img, nw, nh, FilterType::Triangle);
     let ox = (nw.saturating_sub(sw)) / 2;
     let oy = (nh.saturating_sub(sh)) / 2;
     let cropped = image::imageops::crop_imm(&resized, ox, oy, sw, sh).to_image();
@@ -3577,22 +5050,41 @@ fn render_wallpaper_pixels(
     Ok(out)
 }
 
-fn paint_asset_preview(c: &mut Canvas, bytes: &[u8], x: i32, y: i32, w: i32, h: i32) {
-    let Ok(img) = image::load_from_memory(bytes).map(|img| img.to_rgba8()) else {
-        return;
-    };
+fn render_asset_preview_pixels(bytes: &[u8], w: u16, h: u16) -> AnyResult<Vec<u8>> {
+    let img = image::load_from_memory(bytes)?.to_rgba8();
     let (iw, ih) = img.dimensions();
-    let scale = (w as f32 / iw as f32).max(h as f32 / ih as f32);
+    let scale = (f32::from(w) / iw as f32).max(f32::from(h) / ih as f32);
     let nw = (iw as f32 * scale).ceil() as u32;
     let nh = (ih as f32 * scale).ceil() as u32;
     let resized = image::imageops::resize(&img, nw, nh, FilterType::Triangle);
-    let ox = (nw.saturating_sub(w as u32)) / 2;
-    let oy = (nh.saturating_sub(h as u32)) / 2;
-    let cropped = image::imageops::crop_imm(&resized, ox, oy, w as u32, h as u32).to_image();
+    let ox = (nw.saturating_sub(u32::from(w))) / 2;
+    let oy = (nh.saturating_sub(u32::from(h))) / 2;
+    let cropped =
+        image::imageops::crop_imm(&resized, ox, oy, u32::from(w), u32::from(h)).to_image();
+    let mut out = vec![0; usize::from(w) * usize::from(h) * 4];
+    for (idx, px) in cropped.pixels().enumerate() {
+        out[idx * 4] = px[2];
+        out[idx * 4 + 1] = px[1];
+        out[idx * 4 + 2] = px[0];
+        out[idx * 4 + 3] = 0;
+    }
+    Ok(out)
+}
+
+fn paint_bgr_pixels(c: &mut Canvas, pixels: &[u8], x: i32, y: i32, w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
     for yy in 0..h {
         for xx in 0..w {
-            let p = cropped.get_pixel(xx as u32, yy as u32);
-            c.blend_pixel(x + xx, y + yy, Color::rgba(p[0], p[1], p[2], 255));
+            let idx = ((yy * w + xx) * 4) as usize;
+            if idx + 2 < pixels.len() {
+                c.blend_pixel(
+                    x + xx,
+                    y + yy,
+                    Color::rgba(pixels[idx + 2], pixels[idx + 1], pixels[idx], 255),
+                );
+            }
         }
     }
 }
@@ -3619,6 +5111,33 @@ fn paint_file_preview(c: &mut Canvas, path: &std::path::Path, x: i32, y: i32, w:
             let p = resized.get_pixel(xx as u32, yy as u32);
             c.blend_pixel(dx + xx, dy + yy, Color::rgba(p[0], p[1], p[2], 255));
         }
+    }
+}
+
+fn draw_text_preview(
+    c: &mut Canvas,
+    font: &Font<'static>,
+    path: &std::path::Path,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    let mut buf = String::new();
+    let _ = file.by_ref().take(4096).read_to_string(&mut buf);
+    let max_lines = (h / 18).max(1) as usize;
+    for (idx, line) in buf.lines().take(max_lines).enumerate() {
+        c.draw_text(
+            font,
+            &compact(line.trim_end(), (w / 7).max(12) as usize),
+            x,
+            y + idx as i32 * 18,
+            12.0,
+            INK,
+        );
     }
 }
 
@@ -3792,6 +5311,135 @@ fn read_nics() -> Vec<String> {
     out
 }
 
+fn read_audio_devices(kind: &str) -> Vec<String> {
+    let Ok(output) = Command::new("pactl")
+        .arg("list")
+        .arg("short")
+        .arg(kind)
+        .output()
+    else {
+        return vec!["PulseAudio/PipeWire device list unavailable".to_string()];
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .collect()
+}
+
+fn read_network_details() -> Vec<String> {
+    let mut out = Vec::new();
+    for nic in read_nics() {
+        let state = fs::read_to_string(format!("/sys/class/net/{nic}/operstate"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        out.push(format!("{nic}  {state}"));
+        if let Ok(output) = Command::new("ip")
+            .args(["-o", "addr", "show", "dev", &nic])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let parts = line.split_whitespace().collect::<Vec<_>>();
+                if parts.len() > 3 && (parts[2] == "inet" || parts[2] == "inet6") {
+                    out.push(format!("{} {}", parts[2], parts[3]));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push("No network devices found".to_string());
+    }
+    out
+}
+
+fn read_bluetooth_devices() -> Vec<String> {
+    let Ok(output) = Command::new("bluetoothctl")
+        .arg("devices")
+        .arg("Connected")
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim_start_matches("Device ").to_string())
+        .collect()
+}
+
+fn read_autostart_apps() -> Vec<String> {
+    let mut apps = Vec::new();
+    for dir in [
+        home_dir().join(".config/autostart"),
+        PathBuf::from("/etc/xdg/autostart"),
+    ] {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let text = fs::read_to_string(entry.path()).unwrap_or_default();
+            let name = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Name=").map(str::to_string))
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string());
+            apps.push(name);
+        }
+    }
+    apps.sort();
+    apps.dedup();
+    apps
+}
+
+fn read_desktop_entries() -> Vec<DesktopEntry> {
+    let mut entries = Vec::new();
+    let mut dirs = vec![
+        home_dir().join(".local/share/applications"),
+        PathBuf::from("/usr/local/share/applications"),
+        PathBuf::from("/usr/share/applications"),
+    ];
+    dirs.dedup();
+    for dir in dirs {
+        let Ok(read_dir) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let text = fs::read_to_string(entry.path()).unwrap_or_default();
+            if text.lines().any(|line| line == "NoDisplay=true") {
+                continue;
+            }
+            let name = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Name=").map(str::to_string))
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string());
+            let cats = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Categories=").map(str::to_string))
+                .unwrap_or_default();
+            let category = if cats.contains("Network") {
+                "Internet"
+            } else if cats.contains("System") || cats.contains("Settings") {
+                "System"
+            } else if cats.contains("Utility") || cats.contains("Development") {
+                "Program"
+            } else if cats.contains("Audio") || cats.contains("Video") || cats.contains("Graphics")
+            {
+                "Media"
+            } else {
+                "Other"
+            }
+            .to_string();
+            entries.push(DesktopEntry { name, category });
+        }
+    }
+    entries.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+    entries
+}
+
 fn read_net_totals() -> Option<NetTotals> {
     let text = fs::read_to_string("/proc/net/dev").ok()?;
     let mut rx = 0u64;
@@ -3920,6 +5568,68 @@ fn spawn_detached(mut cmd: Command) {
     }
 }
 
+fn copy_text_to_clipboard(text: &str) {
+    for name in ["xclip", "xsel", "wl-copy"] {
+        if !command_exists(name) {
+            continue;
+        }
+        let mut cmd = Command::new(name);
+        match name {
+            "xclip" => {
+                cmd.args(["-selection", "clipboard"]);
+            }
+            "xsel" => {
+                cmd.args(["--clipboard", "--input"]);
+            }
+            _ => {}
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(mut child) = cmd.spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            break;
+        }
+    }
+}
+
+fn file_uri(path: &std::path::Path) -> String {
+    let mut out = String::from("file://");
+    for ch in path.to_string_lossy().chars() {
+        match ch {
+            ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '%' => out.push_str("%25"),
+            '\n' | '\r' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let raw = uri.strip_prefix("file://")?;
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let a = chars.next()?;
+            let b = chars.next()?;
+            let hex = format!("{a}{b}");
+            if let Ok(v) = u8::from_str_radix(&hex, 16) {
+                out.push(v as char);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Some(PathBuf::from(out))
+}
+
 fn app_menu_items() -> Vec<AppMenuItem> {
     vec![
         AppMenuItem {
@@ -3951,6 +5661,11 @@ fn app_menu_items() -> Vec<AppMenuItem> {
             label: "Settings",
             hint: "Display and power",
             action: AppAction::Settings,
+        },
+        AppMenuItem {
+            label: "More",
+            hint: "All desktop apps",
+            action: AppAction::More,
         },
     ]
 }
@@ -3996,7 +5711,7 @@ fn folder_entries_in(path: PathBuf) -> Vec<FolderEntry> {
         if name.starts_with('.') {
             continue;
         }
-        let kind = if entry_path.is_dir() {
+        let kind = if entry.file_type().is_ok_and(|ty| ty.is_dir()) {
             FileKind::Directory
         } else {
             file_kind_for(&entry_path)
@@ -4009,6 +5724,9 @@ fn folder_entries_in(path: PathBuf) -> Vec<FolderEntry> {
             path: entry_path,
             kind,
         });
+        if entries.len() >= 64 {
+            break;
+        }
     }
     entries.sort_by_key(|entry| {
         (
@@ -4028,6 +5746,8 @@ fn file_kind_for(path: &std::path::Path) -> FileKind {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
+        "txt" | "md" | "rs" | "toml" | "json" | "yaml" | "yml" | "log" | "conf" | "ini" | "csv"
+        | "html" | "css" | "js" | "ts" | "sh" => FileKind::Text,
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => FileKind::Image,
         "mp3" | "flac" | "ogg" | "wav" | "m4a" | "aac" => FileKind::Audio,
         "mp4" | "mkv" | "webm" | "mov" | "avi" => FileKind::Video,
