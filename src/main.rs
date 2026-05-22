@@ -960,7 +960,7 @@ impl Aurora {
                     Duration::from_millis(3)
                 }
             } else {
-                Duration::from_millis(80)
+                Duration::from_millis(8)
             });
         }
     }
