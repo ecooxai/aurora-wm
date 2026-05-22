@@ -1440,7 +1440,13 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_enter_notify(&mut self, _ev: EnterNotifyEvent) -> AnyResult<()> {
+    fn handle_enter_notify(&mut self, ev: EnterNotifyEvent) -> AnyResult<()> {
+        if ev.mode != NotifyMode::NORMAL {
+            return Ok(());
+        }
+        if let Some(client) = self.client_key_for(ev.event) {
+            self.focus_window(client)?;
+        }
         Ok(())
     }
 
@@ -1693,7 +1699,8 @@ impl Aurora {
     fn grab_client_buttons(&self, window: Window) -> AnyResult<()> {
         let lock = u16::from(ModMask::LOCK);
         let num_lock = u16::from(ModMask::M2);
-        let modifiers = [0, lock, num_lock, lock | num_lock];
+        let alt = u16::from(ModMask::M1);
+        let modifiers = [alt, alt | lock, alt | num_lock, alt | lock | num_lock];
         let buttons = [
             ButtonIndex::M1,
             ButtonIndex::M2,
@@ -1897,6 +1904,7 @@ impl Aurora {
                     | EventMask::BUTTON_RELEASE
                     | EventMask::POINTER_MOTION
                     | EventMask::LEAVE_WINDOW
+                    | EventMask::ENTER_WINDOW
                     | EventMask::SUBSTRUCTURE_NOTIFY,
             )
             .cursor(self.cursor)
@@ -1917,7 +1925,11 @@ impl Aurora {
         self.conn.change_window_attributes(
             window,
             &ChangeWindowAttributesAux::new()
-                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
+                .event_mask(
+                    EventMask::PROPERTY_CHANGE
+                        | EventMask::STRUCTURE_NOTIFY
+                        | EventMask::ENTER_WINDOW,
+                ),
         )?;
         self.grab_client_buttons(window)?;
         self.conn.change_save_set(SetMode::INSERT, window)?;
