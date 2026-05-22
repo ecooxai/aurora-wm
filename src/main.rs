@@ -801,7 +801,7 @@ impl Aurora {
                 .foreground(screen.black_pixel)
                 .background(screen.white_pixel),
         )?;
-        let cursor = create_anime_cursor(&conn, screen.root)?;
+        let cursor = create_pointer_cursor(&conn, screen.root)?;
         conn.change_window_attributes(
             screen.root,
             &ChangeWindowAttributesAux::new().cursor(cursor),
@@ -4664,7 +4664,34 @@ fn rounded_top_shape_rects(width: u16, height: u16, radius: i32) -> Vec<Rectangl
     rects
 }
 
-fn create_anime_cursor(conn: &RustConnection, root: Window) -> AnyResult<Cursor> {
+fn create_pointer_cursor(conn: &RustConnection, root: Window) -> AnyResult<Cursor> {
+    create_standard_left_ptr_cursor(conn).or_else(|_| create_pixmap_pointer_cursor(conn, root))
+}
+
+fn create_standard_left_ptr_cursor(conn: &RustConnection) -> AnyResult<Cursor> {
+    const XC_LEFT_PTR: u16 = 68;
+
+    let font = conn.generate_id()?;
+    let cursor = conn.generate_id()?;
+    conn.open_font(font, b"cursor")?;
+    conn.create_glyph_cursor(
+        cursor,
+        font,
+        font,
+        XC_LEFT_PTR,
+        XC_LEFT_PTR + 1,
+        0,
+        0,
+        0,
+        0xffff,
+        0xffff,
+        0xffff,
+    )?;
+    conn.close_font(font)?;
+    Ok(cursor)
+}
+
+fn create_pixmap_pointer_cursor(conn: &RustConnection, root: Window) -> AnyResult<Cursor> {
     let source = conn.generate_id()?;
     let mask = conn.generate_id()?;
     let source_gc = conn.generate_id()?;
