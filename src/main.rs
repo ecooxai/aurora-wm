@@ -5270,61 +5270,132 @@ fn draw_sparkline(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, value: f64, co
 
 fn draw_sidebar_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32, color: Color) {
     match idx {
-        0 => {
-            c.draw_round_rect(
-                cx - 9,
-                cy - 6,
-                18,
-                12,
-                2,
-                Color::rgba(color.r, color.g, color.b, 38),
-            );
-            c.draw_line(cx - 9, cy + 7, cx + 9, cy + 7, 2, color);
-            c.draw_line(cx, cy + 7, cx, cy + 11, 2, color);
-        }
-        1 => {
-            c.draw_circle(cx, cy, 10, Color::rgba(color.r, color.g, color.b, 38));
-            c.draw_line(cx, cy - 7, cx, cy + 1, 2, color);
-            c.draw_line(cx, cy + 1, cx + 5, cy + 6, 2, color);
-        }
-        2 => {
-            c.draw_round_rect(
-                cx - 9,
-                cy - 7,
-                18,
-                14,
-                3,
-                Color::rgba(color.r, color.g, color.b, 38),
-            );
-            c.draw_circle(cx - 4, cy - 2, 2, color);
-            c.draw_line(cx - 7, cy + 5, cx - 1, cy, 2, color);
-            c.draw_line(cx - 1, cy, cx + 8, cy + 6, 2, color);
-        }
-        7 => {
-            c.draw_round_rect(
-                cx - 10,
-                cy - 8,
-                20,
-                16,
-                3,
-                Color::rgba(color.r, color.g, color.b, 38),
-            );
-            c.draw_line(cx - 6, cy - 3, cx - 2, cy, 2, color);
-            c.draw_line(cx - 2, cy, cx - 6, cy + 3, 2, color);
-            c.draw_line(cx, cy + 3, cx + 6, cy + 3, 2, color);
-        }
-        _ => {
-            c.draw_circle(cx, cy, 9, Color::rgba(color.r, color.g, color.b, 38));
-            c.draw_text_center(
-                &Font::try_from_bytes(FONT_BOLD).unwrap(),
-                "i",
-                cx,
-                cy - 10,
-                16.0,
-                color,
-            );
-        }
+        0 => draw_sidebar_display_icon(c, cx, cy, color),
+        1 => draw_power_icon(c, cx, cy, color),
+        2 => draw_sidebar_wallpaper_icon(c, cx, cy, color),
+        3 => draw_sidebar_audio_icon(c, cx, cy, color),
+        4 => draw_sidebar_network_icon(c, cx, cy, color),
+        5 => draw_sidebar_bluetooth_icon(c, cx, cy, color),
+        6 => draw_sidebar_startup_icon(c, cx, cy, color),
+        7 => draw_sidebar_apps_icon(c, cx, cy, color),
+        _ => draw_sidebar_about_icon(c, cx, cy, color),
     }
+}
+
+fn draw_round_line(
+    c: &mut Canvas,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    thickness: i32,
+    color: Color,
+) {
+    c.draw_line(x0, y0, x1, y1, thickness, color);
+    let radius = (thickness.max(1) + 1) / 2;
+    c.draw_circle(x0, y0, radius, color);
+    c.draw_circle(x1, y1, radius, color);
+}
+
+fn draw_arc(
+    c: &mut Canvas,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    start_degrees: f32,
+    end_degrees: f32,
+    steps: i32,
+    thickness: i32,
+    color: Color,
+) {
+    let point = |degrees: f32| {
+        let radians = degrees.to_radians();
+        (
+            cx + (radians.cos() * radius as f32).round() as i32,
+            cy + (radians.sin() * radius as f32).round() as i32,
+        )
+    };
+    let mut previous = point(start_degrees);
+    for step in 1..=steps {
+        let degrees = start_degrees + (end_degrees - start_degrees) * step as f32 / steps as f32;
+        let current = point(degrees);
+        draw_round_line(
+            c, previous.0, previous.1, current.0, current.1, thickness, color,
+        );
+        previous = current;
+    }
+}
+
+fn draw_sidebar_tile(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_circle(cx, cy, 12, Color::rgba(color.r, color.g, color.b, 34));
+}
+
+fn draw_sidebar_display_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    c.draw_round_rect(cx - 8, cy - 7, 16, 11, 3, color);
+    c.draw_round_rect(cx - 5, cy - 4, 10, 5, 1, Color::rgba(255, 255, 255, 130));
+    c.draw_round_rect(cx - 5, cy + 7, 10, 3, 2, color);
+    c.draw_round_rect(cx - 1, cy + 3, 2, 5, 1, color);
+}
+
+fn draw_sidebar_wallpaper_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    c.draw_round_rect(
+        cx - 9,
+        cy - 8,
+        18,
+        16,
+        4,
+        Color::rgba(color.r, color.g, color.b, 42),
+    );
+    c.draw_circle(cx - 4, cy - 3, 2, color);
+    draw_round_line(c, cx - 7, cy + 5, cx - 1, cy, 3, color);
+    draw_round_line(c, cx - 1, cy, cx + 7, cy + 6, 3, color);
+}
+
+fn draw_sidebar_audio_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    draw_speaker_icon_small(c, cx, cy, color);
+}
+
+fn draw_sidebar_network_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    draw_wifi_icon_small(c, cx, cy, color);
+}
+
+fn draw_sidebar_bluetooth_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    draw_round_line(c, cx, cy - 10, cx, cy + 10, 3, color);
+    draw_round_line(c, cx, cy - 10, cx + 6, cy - 5, 3, color);
+    draw_round_line(c, cx + 6, cy - 5, cx - 5, cy + 5, 3, color);
+    draw_round_line(c, cx - 5, cy - 5, cx + 6, cy + 5, 3, color);
+    draw_round_line(c, cx + 6, cy + 5, cx, cy + 10, 3, color);
+}
+
+fn draw_sidebar_startup_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    c.draw_circle(cx, cy, 9, Color::rgba(color.r, color.g, color.b, 38));
+    draw_round_line(c, cx - 3, cy - 6, cx - 3, cy + 6, 2, color);
+    draw_round_line(c, cx - 3, cy - 6, cx + 6, cy, 2, color);
+    draw_round_line(c, cx + 6, cy, cx - 3, cy + 6, 2, color);
+}
+
+fn draw_sidebar_apps_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    for (x, y) in [
+        (cx - 8, cy - 8),
+        (cx + 2, cy - 8),
+        (cx - 8, cy + 2),
+        (cx + 2, cy + 2),
+    ] {
+        c.draw_round_rect(x, y, 6, 6, 2, color);
+    }
+}
+
+fn draw_sidebar_about_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    c.draw_circle(cx, cy - 6, 2, color);
+    c.draw_round_rect(cx - 2, cy - 1, 4, 10, 2, color);
 }
 
 fn draw_dock_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32) {
@@ -5550,10 +5621,9 @@ fn draw_gear_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 }
 
 fn draw_power_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_circle(cx, cy, 9, Color::rgba(color.r, color.g, color.b, 34));
-    c.draw_line(cx, cy - 9, cx, cy - 2, 2, color);
-    c.draw_line(cx - 5, cy - 5, cx - 6, cy + 4, 2, color);
-    c.draw_line(cx + 5, cy - 5, cx + 6, cy + 4, 2, color);
+    draw_sidebar_tile(c, cx, cy, color);
+    draw_arc(c, cx, cy, 8, -45.0, 225.0, 16, 2, color);
+    draw_round_line(c, cx, cy - 10, cx, cy - 1, 2, color);
 }
 
 fn draw_battery_icon(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, color: Color) {
@@ -5578,11 +5648,9 @@ fn draw_wifi_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 }
 
 fn draw_wifi_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_circle(cx, cy - 3, 12, Color::rgba(color.r, color.g, color.b, 42));
-    c.draw_rect(cx - 12, cy - 1, 24, 13, Color::rgba(23, 34, 42, 178));
-    c.draw_circle(cx, cy, 8, Color::rgba(color.r, color.g, color.b, 115));
-    c.draw_rect(cx - 8, cy + 2, 16, 10, Color::rgba(23, 34, 42, 178));
-    c.draw_circle(cx, cy + 3, 3, color);
+    draw_arc(c, cx, cy + 6, 14, 220.0, 320.0, 10, 2, color);
+    draw_arc(c, cx, cy + 7, 8, 220.0, 320.0, 8, 2, color);
+    c.draw_circle(cx, cy + 7, 3, color);
 }
 
 fn draw_speaker_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -5595,12 +5663,11 @@ fn draw_speaker_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 }
 
 fn draw_speaker_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_rect(cx - 10, cy - 4, 5, 8, color);
-    c.draw_line(cx - 5, cy - 4, cx + 1, cy - 9, 3, color);
-    c.draw_line(cx + 1, cy - 9, cx + 1, cy + 9, 3, color);
-    c.draw_line(cx + 1, cy + 9, cx - 5, cy + 4, 3, color);
-    c.draw_circle(cx + 6, cy, 5, Color::rgba(color.r, color.g, color.b, 58));
-    c.draw_rect(cx + 1, cy - 7, 4, 14, Color::rgba(23, 34, 42, 178));
+    c.draw_round_rect(cx - 10, cy - 4, 5, 8, 2, color);
+    draw_round_line(c, cx - 5, cy - 4, cx + 1, cy - 9, 2, color);
+    draw_round_line(c, cx + 1, cy - 9, cx + 1, cy + 9, 2, color);
+    draw_round_line(c, cx + 1, cy + 9, cx - 5, cy + 4, 2, color);
+    draw_arc(c, cx + 1, cy, 7, -55.0, 55.0, 6, 2, color);
 }
 
 fn render_wallpaper_pixels(
