@@ -94,6 +94,7 @@ const MINT_DARK: Color = Color::rgb(29, 145, 137);
 const MINT_LIGHT: Color = Color::rgb(160, 238, 220);
 const BLUE: Color = Color::rgb(73, 156, 231);
 const CARD_LINE: Color = Color::rgba(198, 214, 224, 130);
+const TOPBAR_ICON_SPACING: i32 = 33;
 
 #[derive(Clone)]
 struct Canvas {
@@ -568,6 +569,15 @@ struct UiWindows {
 }
 
 #[derive(Clone, Copy)]
+struct TopbarControls {
+    display_x: i32,
+    audio_x: i32,
+    network_x: i32,
+    battery_left: i32,
+    battery_right: i32,
+}
+
+#[derive(Clone, Copy)]
 struct ClientInfo {
     window: Window,
     frame: Window,
@@ -637,15 +647,6 @@ impl FolderMode {
             Self::Pictures => "Pictures",
             Self::Music => "Music",
             Self::Videos => "Videos",
-        }
-    }
-
-    fn icon_index(self) -> usize {
-        match self {
-            Self::Home => 0,
-            Self::Pictures => 1,
-            Self::Music => 2,
-            Self::Videos => 3,
         }
     }
 }
@@ -736,7 +737,6 @@ struct Aurora {
     wallpaper_cache: Vec<Option<Vec<u8>>>,
     wallpaper_previews: Vec<Vec<u8>>,
     wallpaper_pixmap: Option<Pixmap>,
-    compositor_enabled: bool,
     shape_supported: bool,
     ui: UiWindows,
     regular: Font<'static>,
@@ -883,7 +883,7 @@ impl Aurora {
             .iter()
             .map(|asset| render_asset_preview_pixels(asset.bytes, 92, 56).unwrap_or_default())
             .collect();
-        let compositor_enabled = init_light_compositor(&conn, screen.root);
+        init_light_compositor(&conn, screen.root);
         let shape_supported = conn
             .extension_information(shape::X11_EXTENSION_NAME)?
             .is_some();
@@ -921,7 +921,6 @@ impl Aurora {
             wallpaper_cache,
             wallpaper_previews,
             wallpaper_pixmap: None,
-            compositor_enabled,
             shape_supported,
             ui,
             regular,
@@ -1366,35 +1365,15 @@ impl Aurora {
             self.handle_media_click(slot, i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if ev.event == self.ui.topbar {
             let x = i32::from(ev.event_x);
-            let right = i32::from(self.screen_width) - 22;
-            if x >= right - 212 && x <= right - 188 {
-                self.settings.tab = SettingsTab::Audio;
-                self.settings_visible = true;
-                self.settings_front = true;
-                self.folder_front = false;
-                self.media_front = false;
-                self.conn.map_window(self.ui.settings)?;
-                self.raise_ui()?;
-                self.redraw_settings()?;
-            } else if x >= right - 170 && x <= right - 146 {
-                self.settings.tab = SettingsTab::Network;
-                self.settings_visible = true;
-                self.settings_front = true;
-                self.folder_front = false;
-                self.media_front = false;
-                self.conn.map_window(self.ui.settings)?;
-                self.raise_ui()?;
-                self.redraw_settings()?;
-            } else if x > i32::from(self.screen_width) - 120 {
-                self.settings_visible = !self.settings_visible;
-                if self.settings_visible {
-                    self.settings_front = true;
-                    self.conn.map_window(self.ui.settings)?;
-                    self.raise_ui()?;
-                    self.redraw_settings()?;
-                } else {
-                    self.conn.unmap_window(self.ui.settings)?;
-                }
+            let controls = self.topbar_controls();
+            if (controls.display_x - 15..=controls.display_x + 15).contains(&x) {
+                self.open_settings_tab(SettingsTab::Display)?;
+            } else if (controls.audio_x - 15..=controls.audio_x + 15).contains(&x) {
+                self.open_settings_tab(SettingsTab::Audio)?;
+            } else if (controls.network_x - 15..=controls.network_x + 15).contains(&x) {
+                self.open_settings_tab(SettingsTab::Network)?;
+            } else if (controls.battery_left..=controls.battery_right).contains(&x) {
+                self.open_settings_tab(SettingsTab::Power)?;
             }
         } else if let Some(client) = self.client_key_for(ev.event) {
             if self
@@ -2408,6 +2387,22 @@ impl Aurora {
         Ok(())
     }
 
+    fn topbar_controls(&self) -> TopbarControls {
+        let battery = self.metrics.battery.as_deref().unwrap_or("100%");
+        let battery_right = i32::from(self.screen_width) - 16;
+        let battery_left = battery_right - measure_text(&self.bold, battery, 19.0) - 20;
+        let network_x = battery_left - 18;
+        let audio_x = network_x - TOPBAR_ICON_SPACING;
+        let display_x = audio_x - TOPBAR_ICON_SPACING;
+        TopbarControls {
+            display_x,
+            audio_x,
+            network_x,
+            battery_left,
+            battery_right,
+        }
+    }
+
     fn redraw_topbar(&self) -> AnyResult<()> {
         let mut c = Canvas::from_wallpaper_crop(
             &self.wallpaper_pixels,
@@ -2424,8 +2419,9 @@ impl Aurora {
             i32::from(c.height),
             Color::rgba(23, 34, 42, 178),
         );
+        c.draw_circle(25, 20, 10, Color::rgba(160, 238, 220, 38));
         c.draw_circle(25, 20, 7, MINT_LIGHT);
-        c.draw_circle(25, 18, 3, Color::rgb(245, 255, 252));
+        c.draw_circle(23, 18, 2, Color::rgb(248, 255, 254));
         c.draw_text(
             &self.bold,
             "Aurora",
@@ -2445,19 +2441,27 @@ impl Aurora {
             Color::rgb(239, 252, 250),
         );
 
-        let right = i32::from(self.screen_width) - 22;
-        draw_gear_icon(&mut c, right - 10, 20, MINT_LIGHT);
+        let controls = self.topbar_controls();
+        draw_sidebar_display_icon(&mut c, controls.display_x, 20, MINT_LIGHT);
+        draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
+        draw_sidebar_network_icon(&mut c, controls.network_x, 20, MINT_LIGHT);
         let battery = self.metrics.battery.as_deref().unwrap_or("100%");
-        c.draw_text_right(
-            &self.regular,
+        c.draw_round_rect(
+            controls.battery_left,
+            6,
+            controls.battery_right - controls.battery_left,
+            28,
+            14,
+            Color::rgba(160, 238, 220, 38),
+        );
+        c.draw_text(
+            &self.bold,
             battery,
-            right - 42,
+            controls.battery_left + 10,
             9,
-            17.0,
+            19.0,
             Color::rgb(239, 252, 250),
         );
-        draw_wifi_icon_small(&mut c, right - 158, 23, MINT_LIGHT);
-        draw_speaker_icon_small(&mut c, right - 200, 20, MINT_LIGHT);
         self.upload_canvas(self.ui.topbar, &c)
     }
 
@@ -3739,6 +3743,18 @@ impl Aurora {
             self.metrics.net_tx_bps,
             MINT_DARK,
         );
+    }
+
+    fn open_settings_tab(&mut self, tab: SettingsTab) -> AnyResult<()> {
+        self.settings.tab = tab;
+        self.settings.scroll = 0;
+        self.settings_visible = true;
+        self.settings_front = true;
+        self.folder_front = false;
+        self.media_front = false;
+        self.conn.map_window(self.ui.settings)?;
+        self.raise_ui()?;
+        self.redraw_settings()
     }
 
     fn handle_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
@@ -5327,15 +5343,23 @@ fn draw_arc(
 }
 
 fn draw_sidebar_tile(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_circle(cx, cy, 12, Color::rgba(color.r, color.g, color.b, 34));
+    c.draw_round_rect(
+        cx - 13,
+        cy - 13,
+        26,
+        26,
+        10,
+        Color::rgba(color.r, color.g, color.b, 30),
+    );
+    c.draw_circle(cx - 6, cy - 7, 3, Color::rgba(255, 255, 255, 34));
 }
 
 fn draw_sidebar_display_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    c.draw_round_rect(cx - 8, cy - 7, 16, 11, 3, color);
-    c.draw_round_rect(cx - 5, cy - 4, 10, 5, 1, Color::rgba(255, 255, 255, 130));
-    c.draw_round_rect(cx - 5, cy + 7, 10, 3, 2, color);
-    c.draw_round_rect(cx - 1, cy + 3, 2, 5, 1, color);
+    c.draw_round_rect(cx - 9, cy - 7, 18, 12, 4, color);
+    c.draw_round_rect(cx - 7, cy - 5, 14, 8, 3, Color::rgba(249, 255, 254, 205));
+    draw_round_line(c, cx, cy + 5, cx, cy + 8, 2, color);
+    draw_round_line(c, cx - 5, cy + 9, cx + 5, cy + 9, 2, color);
 }
 
 fn draw_sidebar_wallpaper_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -5346,11 +5370,11 @@ fn draw_sidebar_wallpaper_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
         18,
         16,
         4,
-        Color::rgba(color.r, color.g, color.b, 42),
+        Color::rgba(color.r, color.g, color.b, 62),
     );
-    c.draw_circle(cx - 4, cy - 3, 2, color);
-    draw_round_line(c, cx - 7, cy + 5, cx - 1, cy, 3, color);
-    draw_round_line(c, cx - 1, cy, cx + 7, cy + 6, 3, color);
+    c.draw_circle(cx - 4, cy - 3, 2, Color::rgba(255, 255, 255, 205));
+    draw_round_line(c, cx - 7, cy + 5, cx - 2, cy, 2, color);
+    draw_round_line(c, cx - 2, cy, cx + 7, cy + 6, 2, color);
 }
 
 fn draw_sidebar_audio_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -5365,11 +5389,11 @@ fn draw_sidebar_network_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 
 fn draw_sidebar_bluetooth_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    draw_round_line(c, cx, cy - 10, cx, cy + 10, 3, color);
-    draw_round_line(c, cx, cy - 10, cx + 6, cy - 5, 3, color);
-    draw_round_line(c, cx + 6, cy - 5, cx - 5, cy + 5, 3, color);
-    draw_round_line(c, cx - 5, cy - 5, cx + 6, cy + 5, 3, color);
-    draw_round_line(c, cx + 6, cy + 5, cx, cy + 10, 3, color);
+    draw_round_line(c, cx, cy - 9, cx, cy + 9, 2, color);
+    draw_round_line(c, cx, cy - 9, cx + 6, cy - 4, 2, color);
+    draw_round_line(c, cx + 6, cy - 4, cx - 5, cy + 5, 2, color);
+    draw_round_line(c, cx - 5, cy - 5, cx + 6, cy + 4, 2, color);
+    draw_round_line(c, cx + 6, cy + 4, cx, cy + 9, 2, color);
 }
 
 fn draw_sidebar_startup_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -5513,36 +5537,37 @@ fn draw_launcher_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32) {
 
 fn draw_folder_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     c.draw_round_rect(
-        cx - 13,
-        cy - 8,
-        26,
+        cx - 14,
+        cy - 7,
+        28,
         18,
-        5,
-        Color::rgba(color.r, color.g, color.b, 55),
+        6,
+        Color::rgba(color.r, color.g, color.b, 44),
     );
     c.draw_round_rect(
         cx - 12,
-        cy - 12,
+        cy - 11,
         12,
-        7,
+        6,
         4,
-        Color::rgba(color.r, color.g, color.b, 80),
+        Color::rgba(color.r, color.g, color.b, 70),
     );
-    c.draw_line(cx - 10, cy + 8, cx + 10, cy + 8, 2, color);
+    c.draw_round_rect(cx - 12, cy - 5, 24, 14, 5, Color::rgba(255, 255, 255, 104));
+    draw_round_line(c, cx - 9, cy + 8, cx + 9, cy + 8, 2, color);
 }
 
 fn draw_home_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_line(cx - 10, cy, cx, cy - 9, 2, color);
-    c.draw_line(cx, cy - 9, cx + 10, cy, 2, color);
+    draw_round_line(c, cx - 10, cy, cx, cy - 9, 2, color);
+    draw_round_line(c, cx, cy - 9, cx + 10, cy, 2, color);
     c.draw_round_rect(
         cx - 7,
         cy,
         14,
         11,
-        2,
-        Color::rgba(color.r, color.g, color.b, 52),
+        4,
+        Color::rgba(color.r, color.g, color.b, 45),
     );
-    c.draw_rect(cx - 2, cy + 5, 4, 6, color);
+    c.draw_round_rect(cx - 2, cy + 5, 4, 6, 2, color);
 }
 
 fn draw_more_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -5557,13 +5582,18 @@ fn draw_picture_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
         cy - 11,
         26,
         22,
-        4,
-        Color::rgba(color.r, color.g, color.b, 50),
+        7,
+        Color::rgba(color.r, color.g, color.b, 44),
     );
-    c.draw_circle(cx - 6, cy - 4, 3, color);
-    c.draw_line(cx - 11, cy + 7, cx - 3, cy, 2, color);
-    c.draw_line(cx - 3, cy, cx + 4, cy + 6, 2, color);
-    c.draw_line(cx + 4, cy + 6, cx + 11, cy - 2, 2, color);
+    c.draw_circle(
+        cx - 6,
+        cy - 4,
+        3,
+        Color::rgba(color.r, color.g, color.b, 176),
+    );
+    draw_round_line(c, cx - 10, cy + 7, cx - 3, cy, 2, color);
+    draw_round_line(c, cx - 3, cy, cx + 4, cy + 6, 2, color);
+    draw_round_line(c, cx + 4, cy + 6, cx + 10, cy - 2, 2, color);
 }
 
 fn draw_globe_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -5622,52 +5652,22 @@ fn draw_gear_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 
 fn draw_power_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    draw_arc(c, cx, cy, 8, -45.0, 225.0, 16, 2, color);
-    draw_round_line(c, cx, cy - 10, cx, cy - 1, 2, color);
-}
-
-fn draw_battery_icon(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, color: Color) {
-    c.draw_round_rect(x, y, w, h, 3, Color::rgba(color.r, color.g, color.b, 62));
-    c.draw_round_rect(
-        x + 2,
-        y + 2,
-        w - 7,
-        h - 4,
-        2,
-        Color::rgba(116, 213, 198, 150),
-    );
-    c.draw_rect(x + w, y + 4, 3, h - 8, color);
-}
-
-fn draw_wifi_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_circle(cx, cy - 4, 15, Color::rgba(color.r, color.g, color.b, 44));
-    c.draw_rect(cx - 15, cy - 2, 30, 16, Color::rgba(23, 34, 42, 178));
-    c.draw_circle(cx, cy - 1, 10, Color::rgba(color.r, color.g, color.b, 110));
-    c.draw_rect(cx - 10, cy + 1, 20, 12, Color::rgba(23, 34, 42, 178));
-    c.draw_circle(cx, cy + 2, 4, color);
+    draw_arc(c, cx, cy + 1, 8, -45.0, 225.0, 16, 2, color);
+    draw_round_line(c, cx, cy - 9, cx, cy, 2, color);
 }
 
 fn draw_wifi_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    draw_arc(c, cx, cy + 6, 14, 220.0, 320.0, 10, 2, color);
-    draw_arc(c, cx, cy + 7, 8, 220.0, 320.0, 8, 2, color);
-    c.draw_circle(cx, cy + 7, 3, color);
-}
-
-fn draw_speaker_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_rect(cx - 13, cy - 5, 6, 10, color);
-    c.draw_line(cx - 7, cy - 5, cx, cy - 11, 4, color);
-    c.draw_line(cx, cy - 11, cx, cy + 11, 4, color);
-    c.draw_line(cx, cy + 11, cx - 7, cy + 5, 4, color);
-    c.draw_circle(cx + 7, cy, 6, Color::rgba(color.r, color.g, color.b, 60));
-    c.draw_rect(cx + 2, cy - 8, 5, 16, Color::rgba(23, 34, 42, 178));
+    draw_arc(c, cx, cy + 4, 10, 218.0, 322.0, 10, 2, color);
+    draw_arc(c, cx, cy + 5, 6, 218.0, 322.0, 8, 2, color);
+    c.draw_circle(cx, cy + 6, 2, color);
 }
 
 fn draw_speaker_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_round_rect(cx - 10, cy - 4, 5, 8, 2, color);
-    draw_round_line(c, cx - 5, cy - 4, cx + 1, cy - 9, 2, color);
-    draw_round_line(c, cx + 1, cy - 9, cx + 1, cy + 9, 2, color);
-    draw_round_line(c, cx + 1, cy + 9, cx - 5, cy + 4, 2, color);
-    draw_arc(c, cx + 1, cy, 7, -55.0, 55.0, 6, 2, color);
+    c.draw_round_rect(cx - 9, cy - 4, 5, 8, 2, color);
+    draw_round_line(c, cx - 4, cy - 4, cx + 1, cy - 8, 2, color);
+    draw_round_line(c, cx + 1, cy - 8, cx + 1, cy + 8, 2, color);
+    draw_round_line(c, cx + 1, cy + 8, cx - 4, cy + 4, 2, color);
+    draw_arc(c, cx + 1, cy, 7, -48.0, 48.0, 6, 2, color);
 }
 
 fn render_wallpaper_pixels(
