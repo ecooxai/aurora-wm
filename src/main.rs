@@ -38,6 +38,13 @@ const SETTINGS_SIDEBAR_TOP: i32 = 26;
 const MEDIA_SLOT_COUNT: usize = 5;
 const MEDIA_WIDTH: u16 = 600;
 const RESIZE_EDGE: i16 = 10;
+const TERMINAL_FALLBACKS: [&str; 5] = [
+    "xfce4-terminal",
+    "lxterminal",
+    "gnome-terminal",
+    "konsole",
+    "xterm",
+];
 const FONT_REGULAR: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Bold.ttf");
 
@@ -365,6 +372,7 @@ enum SettingsTab {
     Network,
     Bluetooth,
     Startup,
+    Terminal,
     About,
 }
 
@@ -399,6 +407,8 @@ struct SettingsState {
     power_mode: PowerMode,
     selected_mode: usize,
     scroll: i32,
+    terminal_command: String,
+    terminal_editing: bool,
 }
 
 impl Default for SettingsState {
@@ -409,6 +419,8 @@ impl Default for SettingsState {
             power_mode: PowerMode::Balanced,
             selected_mode: 0,
             scroll: 0,
+            terminal_command: read_terminal_command(),
+            terminal_editing: false,
         }
     }
 }
@@ -1011,7 +1023,12 @@ impl Aurora {
         let settings = self.settings_geometry();
         let settings_aux = CreateWindowAux::new()
             .override_redirect(1)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::POINTER_MOTION
+                    | EventMask::KEY_PRESS,
+            )
             .cursor(self.cursor)
             .background_pixel(0);
         self.conn.create_window(
@@ -1166,6 +1183,7 @@ impl Aurora {
     fn handle_event(&mut self, event: Event) -> AnyResult<()> {
         match event {
             Event::Expose(ev) => self.handle_expose(ev)?,
+            Event::KeyPress(ev) => self.handle_key_press(ev)?,
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
             Event::ButtonRelease(ev) => {
                 if ev.event == self.ui.folder {
@@ -2486,6 +2504,7 @@ impl Aurora {
             SettingsTab::Network => self.draw_network_tab(&mut c),
             SettingsTab::Bluetooth => self.draw_bluetooth_tab(&mut c),
             SettingsTab::Startup => self.draw_startup_tab(&mut c),
+            SettingsTab::Terminal => self.draw_terminal_tab(&mut c),
             SettingsTab::About => self.draw_about_tab(&mut c),
         }
         self.upload_canvas(self.ui.settings, &c)
@@ -3027,6 +3046,7 @@ impl Aurora {
             SettingsTab::Network,
             SettingsTab::Bluetooth,
             SettingsTab::Startup,
+            SettingsTab::Terminal,
             SettingsTab::About,
         ];
         for (idx, tab) in items.iter().enumerate() {
@@ -3404,6 +3424,95 @@ impl Aurora {
         }
     }
 
+    fn draw_terminal_tab(&self, c: &mut Canvas) {
+        let sx = SIDEBAR_WIDTH + 24;
+        let card_w = i32::from(c.width) - sx - 24;
+        c.draw_text(&self.bold, "Terminal", sx, 22, 24.0, INK);
+        c.draw_text(
+            &self.regular,
+            "Choose the terminal opened from the application menu.",
+            sx,
+            54,
+            12.0,
+            MUTED,
+        );
+
+        draw_card(c, sx, 84, card_w, 230);
+        c.draw_text(&self.bold, "Default terminal", sx + 16, 104, 15.0, INK);
+        let options = [
+            ("", "Automatic (fallback order)"),
+            ("xfce4-terminal", "xfce4-terminal"),
+            ("lxterminal", "lxterminal"),
+            ("gnome-terminal", "gnome-terminal"),
+            ("konsole", "konsole"),
+            ("xterm", "xterm"),
+        ];
+        for (idx, (value, label)) in options.iter().enumerate() {
+            let y = 134 + idx as i32 * 28;
+            let active = self.settings.terminal_command == *value;
+            c.draw_round_rect(
+                sx + 14,
+                y - 5,
+                card_w - 28,
+                24,
+                8,
+                if active {
+                    Color::rgba(116, 213, 198, 95)
+                } else {
+                    Color::rgba(255, 255, 255, 118)
+                },
+            );
+            c.draw_text(
+                &self.regular,
+                label,
+                sx + 25,
+                y,
+                12.0,
+                if active { MINT_DARK } else { INK },
+            );
+        }
+
+        draw_card(c, sx, 332, card_w, 128);
+        c.draw_text(&self.bold, "Custom command", sx + 16, 352, 15.0, INK);
+        c.draw_round_rect(
+            sx + 14,
+            382,
+            card_w - 28,
+            34,
+            9,
+            if self.settings.terminal_editing {
+                Color::rgba(116, 213, 198, 95)
+            } else {
+                Color::rgba(224, 236, 242, 170)
+            },
+        );
+        let shown = if self.settings.terminal_command.is_empty() {
+            "Click here and type a command"
+        } else {
+            self.settings.terminal_command.as_str()
+        };
+        c.draw_text(
+            &self.regular,
+            &compact(shown, 50),
+            sx + 25,
+            392,
+            12.0,
+            if self.settings.terminal_command.is_empty() {
+                MUTED
+            } else {
+                INK
+            },
+        );
+        c.draw_text(
+            &self.regular,
+            "Press Enter to save. Empty command uses automatic fallback.",
+            sx + 16,
+            430,
+            11.0,
+            MUTED,
+        );
+    }
+
     fn draw_about_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
         c.draw_text(&self.bold, "About", sx, 22, 24.0, INK);
@@ -3517,7 +3626,8 @@ impl Aurora {
                 4 => Some(SettingsTab::Network),
                 5 => Some(SettingsTab::Bluetooth),
                 6 => Some(SettingsTab::Startup),
-                7 => Some(SettingsTab::About),
+                7 => Some(SettingsTab::Terminal),
+                8 => Some(SettingsTab::About),
                 _ => None,
             };
             if let Some(tab) = tab {
@@ -3535,6 +3645,7 @@ impl Aurora {
             SettingsTab::Bluetooth if y >= 224 && y <= 300 => {
                 self.spawn_first_available(&["blueman-manager", "bluetoothctl"], &[]);
             }
+            SettingsTab::Terminal => self.handle_terminal_click(x, y)?,
             SettingsTab::Audio
             | SettingsTab::Network
             | SettingsTab::Bluetooth
@@ -3551,7 +3662,10 @@ impl Aurora {
         let max_scroll = match self.settings.tab {
             SettingsTab::Network | SettingsTab::Startup | SettingsTab::About => 180,
             SettingsTab::Audio | SettingsTab::Wallpaper => 80,
-            SettingsTab::Display | SettingsTab::Power | SettingsTab::Bluetooth => 40,
+            SettingsTab::Display
+            | SettingsTab::Power
+            | SettingsTab::Bluetooth
+            | SettingsTab::Terminal => 40,
         };
         let old_scroll = self.settings.scroll;
         if button == 4 {
@@ -3634,6 +3748,88 @@ impl Aurora {
                 return Ok(());
             }
         }
+        Ok(())
+    }
+
+    fn handle_terminal_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        let sx = SIDEBAR_WIDTH + 24;
+        let right = i32::from(self.settings_geometry().2) - 24;
+        if x < sx + 14 || x > right {
+            return Ok(());
+        }
+        let options = [
+            "",
+            "xfce4-terminal",
+            "lxterminal",
+            "gnome-terminal",
+            "konsole",
+            "xterm",
+        ];
+        for (idx, command) in options.iter().enumerate() {
+            let row_y = 134 + idx as i32 * 28;
+            if y >= row_y - 5 && y <= row_y + 19 {
+                self.settings.terminal_command = (*command).to_string();
+                self.settings.terminal_editing = false;
+                save_terminal_command(command)?;
+                self.redraw_settings()?;
+                return Ok(());
+            }
+        }
+        if (382..=416).contains(&y) {
+            if self.settings.terminal_command.is_empty()
+                || TERMINAL_FALLBACKS.contains(&self.settings.terminal_command.as_str())
+            {
+                self.settings.terminal_command.clear();
+            }
+            self.settings.terminal_editing = true;
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.ui.settings, CURRENT_TIME)?;
+            self.redraw_settings()?;
+        }
+        Ok(())
+    }
+
+    fn handle_key_press(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
+        if ev.event != self.ui.settings
+            || self.settings.tab != SettingsTab::Terminal
+            || !self.settings.terminal_editing
+        {
+            return Ok(());
+        }
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        let shifted = u16::from(ev.state) & u16::from(KeyButMask::SHIFT) != 0;
+        let column = if shifted && mapping.keysyms_per_keycode > 1 {
+            1
+        } else {
+            0
+        };
+        let Some(&keysym) = mapping.keysyms.get(column) else {
+            return Ok(());
+        };
+        match keysym {
+            0xff08 => {
+                self.settings.terminal_command.pop();
+            }
+            0xff0d => {
+                save_terminal_command(&self.settings.terminal_command)?;
+                self.settings.terminal_editing = false;
+                self.conn
+                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+            }
+            0xff1b => {
+                self.settings.terminal_command = read_terminal_command();
+                self.settings.terminal_editing = false;
+                self.conn
+                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+            }
+            0x20..=0x7e if self.settings.terminal_command.len() < 200 => {
+                self.settings
+                    .terminal_command
+                    .push(char::from_u32(keysym).unwrap());
+            }
+            _ => return Ok(()),
+        }
+        self.redraw_settings()?;
         Ok(())
     }
 
@@ -4124,9 +4320,7 @@ impl Aurora {
             return Ok(());
         };
         match item.action {
-            AppAction::Terminal => {
-                self.spawn_first_available(&["alacritty", "xterm", "kitty", "gnome-terminal"], &[])
-            }
+            AppAction::Terminal => self.launch_terminal(),
             AppAction::Browser => {
                 self.spawn_first_available(&["chromium", "firefox", "google-chrome"], &[])
             }
@@ -4189,6 +4383,28 @@ impl Aurora {
     fn apply_power_mode(&self, mode: PowerMode) {
         let mut cmd = Command::new("powerprofilesctl");
         cmd.args(["set", mode.command_value()]);
+        spawn_detached(cmd);
+    }
+
+    fn launch_terminal(&self) {
+        let selected = self.settings.terminal_command.trim();
+        if selected.is_empty() {
+            self.spawn_first_available(&TERMINAL_FALLBACKS, &[]);
+            return;
+        }
+        if TERMINAL_FALLBACKS.contains(&selected) {
+            if command_exists(selected) {
+                let mut cmd = Command::new(selected);
+                cmd.env("DISPLAY", &self.display);
+                spawn_detached(cmd);
+            } else {
+                self.spawn_first_available(&TERMINAL_FALLBACKS, &[]);
+            }
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.env("DISPLAY", &self.display)
+            .args(["-c", &format!("exec {selected}")]);
         spawn_detached(cmd);
     }
 
@@ -4834,6 +5050,19 @@ fn draw_sidebar_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32, color: Color)
             c.draw_circle(cx - 4, cy - 2, 2, color);
             c.draw_line(cx - 7, cy + 5, cx - 1, cy, 2, color);
             c.draw_line(cx - 1, cy, cx + 8, cy + 6, 2, color);
+        }
+        7 => {
+            c.draw_round_rect(
+                cx - 10,
+                cy - 8,
+                20,
+                16,
+                3,
+                Color::rgba(color.r, color.g, color.b, 38),
+            );
+            c.draw_line(cx - 6, cy - 3, cx - 2, cy, 2, color);
+            c.draw_line(cx - 2, cy, cx - 6, cy + 3, 2, color);
+            c.draw_line(cx, cy + 3, cx + 6, cy + 3, 2, color);
         }
         _ => {
             c.draw_circle(cx, cy, 9, Color::rgba(color.r, color.g, color.b, 38));
@@ -5659,6 +5888,30 @@ fn read_autostart_apps() -> Vec<String> {
     apps.sort();
     apps.dedup();
     apps
+}
+
+fn terminal_settings_path() -> PathBuf {
+    home_dir().join(".config/aurora-wm/settings.conf")
+}
+
+fn read_terminal_command() -> String {
+    fs::read_to_string(terminal_settings_path())
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("terminal=").map(str::to_string))
+        })
+        .unwrap_or_default()
+}
+
+fn save_terminal_command(command: &str) -> AnyResult<()> {
+    let path = terminal_settings_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let command = command.replace(['\n', '\r'], "");
+    fs::write(path, format!("terminal={command}\n"))?;
+    Ok(())
 }
 
 fn read_desktop_entries() -> Vec<DesktopEntry> {
