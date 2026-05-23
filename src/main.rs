@@ -372,8 +372,36 @@ enum SettingsTab {
     Network,
     Bluetooth,
     Startup,
-    Terminal,
+    Apps,
     About,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefaultAppKind {
+    Terminal,
+    Browser,
+    Photo,
+    Video,
+}
+
+impl DefaultAppKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::Browser => "Browser",
+            Self::Photo => "Photos",
+            Self::Video => "Videos",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Browser => "browser",
+            Self::Photo => "photo",
+            Self::Video => "video",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -407,8 +435,13 @@ struct SettingsState {
     power_mode: PowerMode,
     selected_mode: usize,
     scroll: i32,
+    app_kind: DefaultAppKind,
     terminal_command: String,
+    browser_command: String,
+    photo_command: String,
+    video_command: String,
     terminal_editing: bool,
+    app_status: Option<String>,
 }
 
 impl Default for SettingsState {
@@ -419,8 +452,13 @@ impl Default for SettingsState {
             power_mode: PowerMode::Balanced,
             selected_mode: 0,
             scroll: 0,
-            terminal_command: read_terminal_command(),
+            app_kind: DefaultAppKind::Terminal,
+            terminal_command: read_app_command(DefaultAppKind::Terminal),
+            browser_command: read_app_command(DefaultAppKind::Browser),
+            photo_command: read_app_command(DefaultAppKind::Photo),
+            video_command: read_app_command(DefaultAppKind::Video),
             terminal_editing: false,
+            app_status: None,
         }
     }
 }
@@ -672,6 +710,15 @@ struct AppMenuItem {
 struct DesktopEntry {
     name: String,
     category: String,
+    command: String,
+    categories: String,
+    mime_types: String,
+}
+
+#[derive(Clone)]
+struct InstalledApp {
+    name: String,
+    command: String,
 }
 
 struct Aurora {
@@ -695,6 +742,10 @@ struct Aurora {
     regular: Font<'static>,
     bold: Font<'static>,
     settings: SettingsState,
+    terminal_apps: Vec<InstalledApp>,
+    browser_apps: Vec<InstalledApp>,
+    photo_apps: Vec<InstalledApp>,
+    video_apps: Vec<InstalledApp>,
     display_modes: Vec<DisplayMode>,
     sampler: SystemSampler,
     metrics: Metrics,
@@ -852,6 +903,7 @@ impl Aurora {
         };
         let mut sampler = SystemSampler::new();
         let metrics = sampler.sample();
+        let (terminal_apps, browser_apps, photo_apps, video_apps) = discover_installed_apps();
         let display_modes =
             read_display_modes(&display, screen.width_in_pixels, screen.height_in_pixels);
         let mut app = Self {
@@ -875,6 +927,10 @@ impl Aurora {
             regular,
             bold,
             settings: SettingsState::default(),
+            terminal_apps,
+            browser_apps,
+            photo_apps,
+            video_apps,
             display_modes,
             sampler,
             metrics,
@@ -1167,15 +1223,20 @@ impl Aurora {
     fn scan_existing_windows(&mut self) -> AnyResult<()> {
         let reply = self.conn.query_tree(self.root)?.reply()?;
         for window in reply.children {
-            if self.is_ui_window(window) {
-                continue;
+            if let Err(err) = self.adopt_mapped_root_window(window) {
+                eprintln!("aurora-wm: failed to adopt existing window {window}: {err}");
             }
-            let Ok(attr) = self.conn.get_window_attributes(window)?.reply() else {
-                continue;
-            };
-            if !attr.override_redirect && attr.map_state != MapState::UNMAPPED {
-                let _ = self.manage_window(window);
-            }
+        }
+        Ok(())
+    }
+
+    fn adopt_mapped_root_window(&mut self, window: Window) -> AnyResult<()> {
+        if self.is_ui_window(window) || self.client_key_for(window).is_some() {
+            return Ok(());
+        }
+        let attr = self.conn.get_window_attributes(window)?.reply()?;
+        if !attr.override_redirect && attr.map_state != MapState::UNMAPPED {
+            self.manage_window(window)?;
         }
         Ok(())
     }
@@ -1199,6 +1260,12 @@ impl Aurora {
             Event::SelectionRequest(ev) => self.handle_selection_request(ev)?,
             Event::SelectionNotify(ev) => self.handle_selection_notify(ev)?,
             Event::MapRequest(ev) => self.manage_window(ev.window)?,
+            Event::MapNotify(ev) => {
+                if ev.event == self.root && !ev.override_redirect {
+                    // Save-set restoration can map a surviving client after startup scanning.
+                    let _ = self.adopt_mapped_root_window(ev.window);
+                }
+            }
             Event::ConfigureRequest(ev) => self.handle_configure_request(ev)?,
             Event::DestroyNotify(ev) => self.remove_client(ev.window)?,
             Event::UnmapNotify(ev) => {
@@ -1900,6 +1967,7 @@ impl Aurora {
             self.conn.map_window(window)?;
             return Ok(());
         }
+        let was_mapped = attr.map_state != MapState::UNMAPPED;
         let geom = self.conn.get_geometry(window)?.reply()?;
         let titlebar =
             !client_uses_own_chrome(&self.window_class(window), &self.window_title(window));
@@ -1958,7 +2026,10 @@ impl Aurora {
                 .height(u32::from(height))
                 .border_width(0),
         )?;
-        self.ignored_unmaps.push(window);
+        if was_mapped {
+            // A mapped reparent reports both structure and substructure unmaps.
+            self.ignored_unmaps.extend([window, window]);
+        }
         self.conn
             .reparent_window(window, frame, 0, title_h as i16)?;
         self.conn.map_window(window)?;
@@ -2504,7 +2575,7 @@ impl Aurora {
             SettingsTab::Network => self.draw_network_tab(&mut c),
             SettingsTab::Bluetooth => self.draw_bluetooth_tab(&mut c),
             SettingsTab::Startup => self.draw_startup_tab(&mut c),
-            SettingsTab::Terminal => self.draw_terminal_tab(&mut c),
+            SettingsTab::Apps => self.draw_apps_tab(&mut c),
             SettingsTab::About => self.draw_about_tab(&mut c),
         }
         self.upload_canvas(self.ui.settings, &c)
@@ -3046,7 +3117,7 @@ impl Aurora {
             SettingsTab::Network,
             SettingsTab::Bluetooth,
             SettingsTab::Startup,
-            SettingsTab::Terminal,
+            SettingsTab::Apps,
             SettingsTab::About,
         ];
         for (idx, tab) in items.iter().enumerate() {
@@ -3424,32 +3495,79 @@ impl Aurora {
         }
     }
 
-    fn draw_terminal_tab(&self, c: &mut Canvas) {
+    fn draw_apps_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
         let card_w = i32::from(c.width) - sx - 24;
-        c.draw_text(&self.bold, "Terminal", sx, 22, 24.0, INK);
+        c.draw_text(&self.bold, "Apps", sx, 22, 24.0, INK);
         c.draw_text(
             &self.regular,
-            "Choose the terminal opened from the application menu.",
+            "Choose default applications for this desktop.",
             sx,
             54,
             12.0,
             MUTED,
         );
 
-        draw_card(c, sx, 84, card_w, 230);
-        c.draw_text(&self.bold, "Default terminal", sx + 16, 104, 15.0, INK);
-        let options = [
-            ("", "Automatic (fallback order)"),
-            ("xfce4-terminal", "xfce4-terminal"),
-            ("lxterminal", "lxterminal"),
-            ("gnome-terminal", "gnome-terminal"),
-            ("konsole", "konsole"),
-            ("xterm", "xterm"),
+        let kinds = [
+            DefaultAppKind::Terminal,
+            DefaultAppKind::Browser,
+            DefaultAppKind::Photo,
+            DefaultAppKind::Video,
         ];
-        for (idx, (value, label)) in options.iter().enumerate() {
-            let y = 134 + idx as i32 * 28;
-            let active = self.settings.terminal_command == *value;
+        for (idx, kind) in kinds.iter().enumerate() {
+            let x = sx + idx as i32 * ((card_w - 6) / 4);
+            let w = (card_w - 12) / 4;
+            c.draw_round_rect(
+                x,
+                84,
+                w,
+                34,
+                8,
+                if *kind == self.settings.app_kind {
+                    Color::rgba(116, 213, 198, 95)
+                } else {
+                    Color::rgba(255, 255, 255, 118)
+                },
+            );
+            c.draw_text_center(
+                &self.bold,
+                kind.label(),
+                x + w / 2,
+                94,
+                11.0,
+                if *kind == self.settings.app_kind {
+                    MINT_DARK
+                } else {
+                    INK
+                },
+            );
+        }
+
+        draw_card(c, sx, 132, card_w, 234);
+        c.draw_text(
+            &self.bold,
+            &format!("Installed {} apps", self.settings.app_kind.label()),
+            sx + 16,
+            151,
+            14.0,
+            INK,
+        );
+        let selected = self.selected_app_command(self.settings.app_kind);
+        let apps = self.available_apps(self.settings.app_kind);
+        let start = (self.settings.scroll / 29).max(0) as usize;
+        if apps.is_empty() {
+            c.draw_text(
+                &self.regular,
+                "No installed applications found.",
+                sx + 16,
+                185,
+                12.0,
+                MUTED,
+            );
+        }
+        for (idx, app) in apps.iter().skip(start).take(6).enumerate() {
+            let y = 180 + idx as i32 * 29;
+            let active = selected == app.command;
             c.draw_round_rect(
                 sx + 14,
                 y - 5,
@@ -3464,53 +3582,63 @@ impl Aurora {
             );
             c.draw_text(
                 &self.regular,
-                label,
+                &compact(&app.name, 46),
                 sx + 25,
                 y,
                 12.0,
                 if active { MINT_DARK } else { INK },
             );
         }
+        if apps.len() > 6 {
+            c.draw_text(
+                &self.regular,
+                "Scroll to see more installed apps",
+                sx + card_w - 192,
+                151,
+                10.0,
+                MUTED,
+            );
+        }
 
-        draw_card(c, sx, 332, card_w, 128);
-        c.draw_text(&self.bold, "Custom command", sx + 16, 352, 15.0, INK);
-        c.draw_round_rect(
-            sx + 14,
-            382,
-            card_w - 28,
-            34,
-            9,
-            if self.settings.terminal_editing {
-                Color::rgba(116, 213, 198, 95)
+        if self.settings.app_kind == DefaultAppKind::Terminal {
+            draw_card(c, sx, 382, card_w, 104);
+            c.draw_text(
+                &self.bold,
+                "Custom terminal command",
+                sx + 16,
+                399,
+                14.0,
+                INK,
+            );
+            c.draw_round_rect(
+                sx + 14,
+                426,
+                card_w - 28,
+                32,
+                9,
+                if self.settings.terminal_editing {
+                    Color::rgba(116, 213, 198, 95)
+                } else {
+                    Color::rgba(224, 236, 242, 170)
+                },
+            );
+            let shown = if self.settings.terminal_command.is_empty() {
+                "Click and type a command; Enter saves and launches"
             } else {
-                Color::rgba(224, 236, 242, 170)
-            },
-        );
-        let shown = if self.settings.terminal_command.is_empty() {
-            "Click here and type a command"
-        } else {
-            self.settings.terminal_command.as_str()
-        };
-        c.draw_text(
-            &self.regular,
-            &compact(shown, 50),
-            sx + 25,
-            392,
-            12.0,
-            if self.settings.terminal_command.is_empty() {
-                MUTED
-            } else {
-                INK
-            },
-        );
-        c.draw_text(
-            &self.regular,
-            "Press Enter to save. Empty command uses automatic fallback.",
-            sx + 16,
-            430,
-            11.0,
-            MUTED,
-        );
+                self.settings.terminal_command.as_str()
+            };
+            c.draw_text(&self.regular, &compact(shown, 52), sx + 25, 435, 12.0, INK);
+        }
+        if let Some(status) = self.settings.app_status.as_ref() {
+            c.draw_text(
+                &self.regular,
+                &compact(status, 64),
+                sx + 16,
+                506,
+                12.0,
+                MINT_DARK,
+            );
+        }
     }
 
     fn draw_about_tab(&self, c: &mut Canvas) {
@@ -3626,7 +3754,7 @@ impl Aurora {
                 4 => Some(SettingsTab::Network),
                 5 => Some(SettingsTab::Bluetooth),
                 6 => Some(SettingsTab::Startup),
-                7 => Some(SettingsTab::Terminal),
+                7 => Some(SettingsTab::Apps),
                 8 => Some(SettingsTab::About),
                 _ => None,
             };
@@ -3645,7 +3773,7 @@ impl Aurora {
             SettingsTab::Bluetooth if y >= 224 && y <= 300 => {
                 self.spawn_first_available(&["blueman-manager", "bluetoothctl"], &[]);
             }
-            SettingsTab::Terminal => self.handle_terminal_click(x, y)?,
+            SettingsTab::Apps => self.handle_apps_click(x, y)?,
             SettingsTab::Audio
             | SettingsTab::Network
             | SettingsTab::Bluetooth
@@ -3662,16 +3790,23 @@ impl Aurora {
         let max_scroll = match self.settings.tab {
             SettingsTab::Network | SettingsTab::Startup | SettingsTab::About => 180,
             SettingsTab::Audio | SettingsTab::Wallpaper => 80,
-            SettingsTab::Display
-            | SettingsTab::Power
-            | SettingsTab::Bluetooth
-            | SettingsTab::Terminal => 40,
+            SettingsTab::Apps => self
+                .available_apps(self.settings.app_kind)
+                .len()
+                .saturating_sub(6)
+                .saturating_mul(29) as i32,
+            SettingsTab::Display | SettingsTab::Power | SettingsTab::Bluetooth => 40,
         };
         let old_scroll = self.settings.scroll;
-        if button == 4 {
-            self.settings.scroll = self.settings.scroll.saturating_sub(36);
+        let step = if self.settings.tab == SettingsTab::Apps {
+            29
         } else {
-            self.settings.scroll = (self.settings.scroll + 36).min(max_scroll);
+            36
+        };
+        if button == 4 {
+            self.settings.scroll = self.settings.scroll.saturating_sub(step);
+        } else {
+            self.settings.scroll = (self.settings.scroll + step).min(max_scroll);
         }
         if self.settings.scroll == old_scroll {
             return Ok(());
@@ -3751,37 +3886,51 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_terminal_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+    fn handle_apps_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let sx = SIDEBAR_WIDTH + 24;
-        let right = i32::from(self.settings_geometry().2) - 24;
-        if x < sx + 14 || x > right {
+        let card_w = i32::from(self.settings_geometry().2) - sx - 24;
+        if x < sx || x > sx + card_w {
             return Ok(());
         }
-        let options = [
-            "",
-            "xfce4-terminal",
-            "lxterminal",
-            "gnome-terminal",
-            "konsole",
-            "xterm",
+        let kinds = [
+            DefaultAppKind::Terminal,
+            DefaultAppKind::Browser,
+            DefaultAppKind::Photo,
+            DefaultAppKind::Video,
         ];
-        for (idx, command) in options.iter().enumerate() {
-            let row_y = 134 + idx as i32 * 28;
-            if y >= row_y - 5 && y <= row_y + 19 {
-                self.settings.terminal_command = (*command).to_string();
+        if (84..=118).contains(&y) {
+            let item_w = (card_w - 6) / 4;
+            let idx = ((x - sx) / item_w).clamp(0, 3) as usize;
+            if let Some(kind) = kinds.get(idx) {
+                self.settings.app_kind = *kind;
+                self.settings.scroll = 0;
                 self.settings.terminal_editing = false;
-                save_terminal_command(command)?;
+                self.settings.app_status = None;
+                self.redraw_settings()?;
+            }
+            return Ok(());
+        }
+        let apps = self.available_apps(self.settings.app_kind).to_vec();
+        let start = (self.settings.scroll / 29).max(0) as usize;
+        for (idx, app) in apps.iter().skip(start).take(6).enumerate() {
+            let row_y = 180 + idx as i32 * 29;
+            if y >= row_y - 5 && y <= row_y + 19 {
+                self.set_selected_app_command(self.settings.app_kind, app.command.clone());
+                save_app_commands(&self.settings)?;
+                if self.settings.app_kind == DefaultAppKind::Terminal {
+                    self.test_terminal_launch(&app.command, &app.name);
+                } else {
+                    self.settings.app_status = Some(format!("{} set as default.", app.name));
+                }
+                self.settings.terminal_editing = false;
                 self.redraw_settings()?;
                 return Ok(());
             }
         }
-        if (382..=416).contains(&y) {
-            if self.settings.terminal_command.is_empty()
-                || TERMINAL_FALLBACKS.contains(&self.settings.terminal_command.as_str())
-            {
-                self.settings.terminal_command.clear();
-            }
+        if self.settings.app_kind == DefaultAppKind::Terminal && (426..=458).contains(&y) {
+            self.settings.terminal_command.clear();
             self.settings.terminal_editing = true;
+            self.settings.app_status = None;
             self.conn
                 .set_input_focus(InputFocus::POINTER_ROOT, self.ui.settings, CURRENT_TIME)?;
             self.redraw_settings()?;
@@ -3791,7 +3940,8 @@ impl Aurora {
 
     fn handle_key_press(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
         if ev.event != self.ui.settings
-            || self.settings.tab != SettingsTab::Terminal
+            || self.settings.tab != SettingsTab::Apps
+            || self.settings.app_kind != DefaultAppKind::Terminal
             || !self.settings.terminal_editing
         {
             return Ok(());
@@ -3811,13 +3961,15 @@ impl Aurora {
                 self.settings.terminal_command.pop();
             }
             0xff0d => {
-                save_terminal_command(&self.settings.terminal_command)?;
+                save_app_commands(&self.settings)?;
                 self.settings.terminal_editing = false;
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+                let command = self.settings.terminal_command.clone();
+                self.test_terminal_launch(&command, &command);
             }
             0xff1b => {
-                self.settings.terminal_command = read_terminal_command();
+                self.settings.terminal_command = read_app_command(DefaultAppKind::Terminal);
                 self.settings.terminal_editing = false;
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
@@ -4223,6 +4375,25 @@ impl Aurora {
     }
 
     fn open_media(&mut self, entry: FolderEntry) -> AnyResult<()> {
+        let default_kind = match entry.kind {
+            FileKind::Image => Some(DefaultAppKind::Photo),
+            FileKind::Video => Some(DefaultAppKind::Video),
+            _ => None,
+        };
+        if let Some(kind) = default_kind {
+            let command = self.selected_app_command(kind).to_string();
+            if !command.is_empty() {
+                if self.spawn_configured_app(&command, Some(&entry.path)) {
+                    return Ok(());
+                }
+                self.folder_info = Some(format!(
+                    "Could not launch default {}; choose another app.",
+                    kind.label()
+                ));
+                self.redraw_folder()?;
+                return Ok(());
+            }
+        }
         let slot = self.media_next_slot % MEDIA_SLOT_COUNT;
         self.media_next_slot = (slot + 1) % MEDIA_SLOT_COUNT;
         let state = MediaState {
@@ -4321,9 +4492,7 @@ impl Aurora {
         };
         match item.action {
             AppAction::Terminal => self.launch_terminal(),
-            AppAction::Browser => {
-                self.spawn_first_available(&["chromium", "firefox", "google-chrome"], &[])
-            }
+            AppAction::Browser => self.launch_browser(),
             AppAction::Pictures => self.show_folder(FolderMode::Pictures, true)?,
             AppAction::Music => self.show_folder(FolderMode::Music, true)?,
             AppAction::Videos => self.show_folder(FolderMode::Videos, true)?,
@@ -4386,26 +4555,106 @@ impl Aurora {
         spawn_detached(cmd);
     }
 
-    fn launch_terminal(&self) {
-        let selected = self.settings.terminal_command.trim();
-        if selected.is_empty() {
-            self.spawn_first_available(&TERMINAL_FALLBACKS, &[]);
-            return;
+    fn selected_app_command(&self, kind: DefaultAppKind) -> &str {
+        match kind {
+            DefaultAppKind::Terminal => &self.settings.terminal_command,
+            DefaultAppKind::Browser => &self.settings.browser_command,
+            DefaultAppKind::Photo => &self.settings.photo_command,
+            DefaultAppKind::Video => &self.settings.video_command,
         }
-        if TERMINAL_FALLBACKS.contains(&selected) {
-            if command_exists(selected) {
-                let mut cmd = Command::new(selected);
-                cmd.env("DISPLAY", &self.display);
-                spawn_detached(cmd);
+    }
+
+    fn available_apps(&self, kind: DefaultAppKind) -> &[InstalledApp] {
+        match kind {
+            DefaultAppKind::Terminal => &self.terminal_apps,
+            DefaultAppKind::Browser => &self.browser_apps,
+            DefaultAppKind::Photo => &self.photo_apps,
+            DefaultAppKind::Video => &self.video_apps,
+        }
+    }
+
+    fn set_selected_app_command(&mut self, kind: DefaultAppKind, command: String) {
+        match kind {
+            DefaultAppKind::Terminal => self.settings.terminal_command = command,
+            DefaultAppKind::Browser => self.settings.browser_command = command,
+            DefaultAppKind::Photo => self.settings.photo_command = command,
+            DefaultAppKind::Video => self.settings.video_command = command,
+        }
+    }
+
+    fn test_terminal_launch(&mut self, command: &str, label: &str) {
+        self.settings.app_status = Some(
+            if !command.trim().is_empty() && self.spawn_configured_app(command, None) {
+                format!("Launched {label}.")
             } else {
-                self.spawn_first_available(&TERMINAL_FALLBACKS, &[]);
-            }
-            return;
+                format!("Could not launch {label}; try another terminal.")
+            },
+        );
+    }
+
+    fn launch_terminal(&mut self) {
+        let selected = if self.settings.terminal_command.trim().is_empty() {
+            self.available_apps(DefaultAppKind::Terminal)
+                .first()
+                .map(|app| app.command.clone())
+                .unwrap_or_default()
+        } else {
+            self.settings.terminal_command.clone()
+        };
+        if !self.spawn_configured_app(&selected, None) {
+            self.settings.app_status =
+                Some("Could not launch terminal; select another one in Apps settings.".to_string());
+        }
+    }
+
+    fn launch_browser(&mut self) {
+        let selected = if self.settings.browser_command.trim().is_empty() {
+            self.available_apps(DefaultAppKind::Browser)
+                .first()
+                .map(|app| app.command.clone())
+                .unwrap_or_default()
+        } else {
+            self.settings.browser_command.clone()
+        };
+        if !self.spawn_configured_app(&selected, None) {
+            self.settings.app_status =
+                Some("Could not launch browser; select another one in Apps settings.".to_string());
+        }
+    }
+
+    fn spawn_configured_app(&self, command: &str, path: Option<&Path>) -> bool {
+        if command.trim().is_empty() {
+            return false;
         }
         let mut cmd = Command::new("sh");
         cmd.env("DISPLAY", &self.display)
-            .args(["-c", &format!("exec {selected}")]);
-        spawn_detached(cmd);
+            .arg("-c")
+            .arg(if path.is_some() {
+                format!("exec {command} \"$1\"")
+            } else {
+                format!("exec {command}")
+            })
+            .arg("aurora-launch");
+        if let Some(path) = path {
+            cmd.arg(path);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let Ok(mut child) = cmd.spawn() else {
+            return false;
+        };
+        thread::sleep(Duration::from_millis(120));
+        match child.try_wait() {
+            Ok(Some(status)) => status.success(),
+            Ok(None) => {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn spawn_first_available(&self, names: &[&str], args: &[&str]) {
@@ -5894,23 +6143,34 @@ fn terminal_settings_path() -> PathBuf {
     home_dir().join(".config/aurora-wm/settings.conf")
 }
 
-fn read_terminal_command() -> String {
+fn read_app_command(kind: DefaultAppKind) -> String {
     fs::read_to_string(terminal_settings_path())
         .ok()
         .and_then(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("terminal=").map(str::to_string))
+            text.lines().find_map(|line| {
+                line.strip_prefix(&format!("{}=", kind.key()))
+                    .map(str::to_string)
+            })
         })
         .unwrap_or_default()
 }
 
-fn save_terminal_command(command: &str) -> AnyResult<()> {
+fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
     let path = terminal_settings_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let command = command.replace(['\n', '\r'], "");
-    fs::write(path, format!("terminal={command}\n"))?;
+    let clean = |command: &str| command.replace(['\n', '\r'], "");
+    fs::write(
+        path,
+        format!(
+            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\n",
+            clean(&settings.terminal_command),
+            clean(&settings.browser_command),
+            clean(&settings.photo_command),
+            clean(&settings.video_command),
+        ),
+    )?;
     Ok(())
 }
 
@@ -5942,6 +6202,14 @@ fn read_desktop_entries() -> Vec<DesktopEntry> {
                 .lines()
                 .find_map(|line| line.strip_prefix("Categories=").map(str::to_string))
                 .unwrap_or_default();
+            let mime_types = text
+                .lines()
+                .find_map(|line| line.strip_prefix("MimeType=").map(str::to_string))
+                .unwrap_or_default();
+            let command = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Exec=").map(clean_desktop_command))
+                .unwrap_or_default();
             let category = if cats.contains("Network") {
                 "Internet"
             } else if cats.contains("System") || cats.contains("Settings") {
@@ -5955,11 +6223,112 @@ fn read_desktop_entries() -> Vec<DesktopEntry> {
                 "Other"
             }
             .to_string();
-            entries.push(DesktopEntry { name, category });
+            entries.push(DesktopEntry {
+                name,
+                category,
+                command,
+                categories: cats,
+                mime_types,
+            });
         }
     }
     entries.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
     entries
+}
+
+fn clean_desktop_command(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|arg| {
+            ["%f", "%F", "%u", "%U", "%i", "%c", "%k"]
+                .iter()
+                .fold(arg.to_string(), |clean, field| clean.replace(field, ""))
+        })
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn discover_installed_apps() -> (
+    Vec<InstalledApp>,
+    Vec<InstalledApp>,
+    Vec<InstalledApp>,
+    Vec<InstalledApp>,
+) {
+    let entries = read_desktop_entries();
+    (
+        installed_apps(DefaultAppKind::Terminal, &entries),
+        installed_apps(DefaultAppKind::Browser, &entries),
+        installed_apps(DefaultAppKind::Photo, &entries),
+        installed_apps(DefaultAppKind::Video, &entries),
+    )
+}
+
+fn installed_apps(kind: DefaultAppKind, entries: &[DesktopEntry]) -> Vec<InstalledApp> {
+    let mut apps = Vec::new();
+    if kind == DefaultAppKind::Terminal {
+        for command in TERMINAL_FALLBACKS {
+            if command_exists(command) {
+                push_installed_app(&mut apps, command.to_string(), command.to_string());
+            }
+        }
+    }
+    for entry in entries {
+        if entry.command.is_empty() || !command_can_launch(&entry.command) {
+            continue;
+        }
+        let command_lower = entry.command.to_ascii_lowercase();
+        let name_lower = entry.name.to_ascii_lowercase();
+        let matches = match kind {
+            DefaultAppKind::Terminal => {
+                entry.categories.contains("TerminalEmulator")
+                    || [
+                        "terminal",
+                        "konsole",
+                        "xterm",
+                        "kitty",
+                        "alacritty",
+                        "wezterm",
+                    ]
+                    .iter()
+                    .any(|term| name_lower.contains(term) || command_lower.contains(term))
+            }
+            DefaultAppKind::Browser => {
+                entry.categories.contains("WebBrowser")
+                    || entry.mime_types.contains("x-scheme-handler/http")
+            }
+            DefaultAppKind::Photo => entry.mime_types.contains("image/"),
+            DefaultAppKind::Video => entry.mime_types.contains("video/"),
+        };
+        if matches {
+            push_installed_app(&mut apps, entry.name.clone(), entry.command.clone());
+        }
+    }
+    if kind != DefaultAppKind::Terminal {
+        apps.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    apps
+}
+
+fn push_installed_app(apps: &mut Vec<InstalledApp>, name: String, command: String) {
+    if apps.iter().any(|app| app.command == command) {
+        return;
+    }
+    apps.push(InstalledApp { name, command });
+}
+
+fn command_can_launch(command: &str) -> bool {
+    let executable = command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['\'', '"']);
+    let path = Path::new(executable);
+    if path.is_absolute() {
+        path.exists()
+    } else {
+        command_exists(executable)
+    }
 }
 
 fn read_net_totals() -> Option<NetTotals> {
