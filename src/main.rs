@@ -1681,9 +1681,11 @@ impl Aurora {
             return Ok(());
         };
         if let Some(edges) = resize_edges_for_client(&info, ev.event_x, ev.event_y) {
+            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.start_resize(client, ev.root_x, ev.root_y, edges)?;
         } else {
             self.focus_window(client)?;
+            self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
         }
         Ok(())
     }
@@ -1692,7 +1694,16 @@ impl Aurora {
         let lock = u16::from(ModMask::LOCK);
         let num_lock = u16::from(ModMask::M2);
         let alt = u16::from(ModMask::M1);
-        let modifiers = [alt, alt | lock, alt | num_lock, alt | lock | num_lock];
+        let modifiers = [
+            0,
+            lock,
+            num_lock,
+            lock | num_lock,
+            alt,
+            alt | lock,
+            alt | num_lock,
+            alt | lock | num_lock,
+        ];
         let buttons = [
             ButtonIndex::M1,
             ButtonIndex::M2,
@@ -1709,7 +1720,7 @@ impl Aurora {
                         false,
                         window,
                         EventMask::BUTTON_PRESS,
-                        GrabMode::ASYNC,
+                        GrabMode::SYNC,
                         GrabMode::ASYNC,
                         x11rb::NONE,
                         x11rb::NONE,
@@ -1916,11 +1927,7 @@ impl Aurora {
         self.conn.change_window_attributes(
             window,
             &ChangeWindowAttributesAux::new()
-                .event_mask(
-                    EventMask::PROPERTY_CHANGE
-                        | EventMask::STRUCTURE_NOTIFY
-                        | EventMask::BUTTON_PRESS,
-                ),
+                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
         )?;
         self.grab_client_buttons(window)?;
         self.conn.change_save_set(SetMode::INSERT, window)?;
