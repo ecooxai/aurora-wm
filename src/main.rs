@@ -95,6 +95,11 @@ const MINT_LIGHT: Color = Color::rgb(160, 238, 220);
 const BLUE: Color = Color::rgb(73, 156, 231);
 const CARD_LINE: Color = Color::rgba(198, 214, 224, 130);
 const TOPBAR_ICON_SPACING: i32 = 33;
+const DEFAULT_WORKSPACE_COUNT: usize = 2;
+const MAX_WORKSPACE_COUNT: usize = 8;
+const WORKSPACE_START_X: i32 = 16;
+const WORKSPACE_STRIDE: i32 = 27;
+const WORKSPACE_SIZE: i32 = 18;
 
 #[derive(Clone)]
 struct Canvas {
@@ -581,6 +586,7 @@ struct TopbarControls {
 struct ClientInfo {
     window: Window,
     frame: Window,
+    workspace: usize,
     mapped: bool,
     x: i16,
     y: i16,
@@ -750,6 +756,8 @@ struct Aurora {
     sampler: SystemSampler,
     metrics: Metrics,
     clients: HashMap<Window, ClientInfo>,
+    workspace_count: usize,
+    active_workspace: usize,
     drag: Option<DragState>,
     title_hover: Option<(Window, TitleButton)>,
     ignored_unmaps: Vec<Window>,
@@ -934,6 +942,8 @@ impl Aurora {
             sampler,
             metrics,
             clients: HashMap::new(),
+            workspace_count: DEFAULT_WORKSPACE_COUNT,
+            active_workspace: 0,
             drag: None,
             title_hover: None,
             ignored_unmaps: Vec::new(),
@@ -1366,7 +1376,16 @@ impl Aurora {
         } else if ev.event == self.ui.topbar {
             let x = i32::from(ev.event_x);
             let controls = self.topbar_controls();
-            if (controls.display_x - 15..=controls.display_x + 15).contains(&x) {
+            let workspace = (0..self.workspace_count).find(|&index| {
+                (Self::workspace_x(index)..=Self::workspace_x(index) + WORKSPACE_SIZE).contains(&x)
+            });
+            if let Some(workspace) = workspace {
+                self.switch_workspace(workspace)?;
+            } else if (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE)
+                .contains(&x)
+            {
+                self.add_workspace()?;
+            } else if (controls.display_x - 15..=controls.display_x + 15).contains(&x) {
                 self.open_settings_tab(SettingsTab::Display)?;
             } else if (controls.audio_x - 15..=controls.audio_x + 15).contains(&x) {
                 self.open_settings_tab(SettingsTab::Audio)?;
@@ -2020,6 +2039,7 @@ impl Aurora {
         let info = ClientInfo {
             window,
             frame,
+            workspace: self.active_workspace,
             mapped: true,
             x,
             y,
@@ -2057,6 +2077,7 @@ impl Aurora {
     fn minimize_client(&mut self, client: Window) -> AnyResult<()> {
         if let Some(info) = self.clients.get_mut(&client) {
             info.mapped = false;
+            self.ignored_unmaps.push(info.frame);
             self.conn.unmap_window(info.frame)?;
             self.redraw_dock()?;
         }
@@ -2115,6 +2136,9 @@ impl Aurora {
         let Some(info) = self.clients.get(&client).copied() else {
             return Ok(());
         };
+        if info.workspace != self.active_workspace {
+            return Ok(());
+        }
         if !info.mapped {
             let mut mapped = info;
             mapped.mapped = true;
@@ -2403,6 +2427,14 @@ impl Aurora {
         }
     }
 
+    fn workspace_x(index: usize) -> i32 {
+        WORKSPACE_START_X + index as i32 * WORKSPACE_STRIDE
+    }
+
+    fn add_workspace_x(&self) -> i32 {
+        Self::workspace_x(self.workspace_count)
+    }
+
     fn redraw_topbar(&self) -> AnyResult<()> {
         let mut c = Canvas::from_wallpaper_crop(
             &self.wallpaper_pixels,
@@ -2419,13 +2451,24 @@ impl Aurora {
             i32::from(c.height),
             Color::rgba(23, 34, 42, 178),
         );
-        c.draw_circle(25, 20, 10, Color::rgba(160, 238, 220, 38));
-        c.draw_circle(25, 20, 7, MINT_LIGHT);
-        c.draw_circle(23, 18, 2, Color::rgb(248, 255, 254));
+        for index in 0..self.workspace_count {
+            draw_workspace_icon(
+                &mut c,
+                Self::workspace_x(index),
+                11,
+                index == self.active_workspace,
+            );
+        }
+        let add_x = self.add_workspace_x();
+        draw_add_workspace_icon(&mut c, add_x, 20);
+        let brand_x = add_x + 44;
+        c.draw_circle(brand_x, 20, 10, Color::rgba(160, 238, 220, 38));
+        c.draw_circle(brand_x, 20, 7, MINT_LIGHT);
+        c.draw_circle(brand_x - 2, 18, 2, Color::rgb(248, 255, 254));
         c.draw_text(
             &self.bold,
             "Aurora",
-            48,
+            brand_x + 23,
             11,
             16.0,
             Color::rgb(239, 252, 250),
@@ -3745,6 +3788,49 @@ impl Aurora {
         );
     }
 
+    fn add_workspace(&mut self) -> AnyResult<()> {
+        if self.workspace_count >= MAX_WORKSPACE_COUNT {
+            return Ok(());
+        }
+        let workspace = self.workspace_count;
+        self.workspace_count += 1;
+        self.switch_workspace(workspace)
+    }
+
+    fn switch_workspace(&mut self, workspace: usize) -> AnyResult<()> {
+        if workspace >= self.workspace_count || workspace == self.active_workspace {
+            return Ok(());
+        }
+        self.end_drag()?;
+        let previous = self.active_workspace;
+        let hidden_frames = self
+            .clients
+            .values()
+            .filter(|info| info.workspace == previous && info.mapped)
+            .map(|info| info.frame)
+            .collect::<Vec<_>>();
+        let shown_frames = self
+            .clients
+            .values()
+            .filter(|info| info.workspace == workspace && info.mapped)
+            .map(|info| info.frame)
+            .collect::<Vec<_>>();
+        for frame in hidden_frames {
+            self.ignored_unmaps.push(frame);
+            self.conn.unmap_window(frame)?;
+        }
+        self.active_workspace = workspace;
+        for frame in shown_frames {
+            self.conn.map_window(frame)?;
+        }
+        self.dock_last_click = None;
+        self.conn
+            .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+        self.redraw_topbar()?;
+        self.redraw_dock()?;
+        self.raise_ui()
+    }
+
     fn open_settings_tab(&mut self, tab: SettingsTab) -> AnyResult<()> {
         self.settings.tab = tab;
         self.settings.scroll = 0;
@@ -4995,11 +5081,22 @@ impl Aurora {
     }
 
     fn dock_button_count(&self) -> usize {
-        5 + self.clients.len().min(5)
+        5 + self
+            .clients
+            .values()
+            .filter(|info| info.workspace == self.active_workspace)
+            .count()
+            .min(5)
     }
 
     fn task_client_windows(&self) -> Vec<Window> {
-        let mut windows = self.clients.keys().copied().collect::<Vec<_>>();
+        let mut windows = self
+            .clients
+            .iter()
+            .filter_map(|(window, info)| {
+                (info.workspace == self.active_workspace).then_some(*window)
+            })
+            .collect::<Vec<_>>();
         windows.sort_unstable();
         windows.truncate(5);
         windows
@@ -5261,6 +5358,49 @@ fn create_pixmap_pointer_cursor(conn: &RustConnection, root: Window) -> AnyResul
     conn.free_pixmap(source)?;
     conn.free_pixmap(mask)?;
     Ok(cursor)
+}
+
+fn draw_workspace_icon(c: &mut Canvas, x: i32, y: i32, active: bool) {
+    let fill = if active {
+        Color::rgb(51, 116, 198)
+    } else {
+        Color::rgba(222, 242, 246, 62)
+    };
+    let stroke = if active {
+        Color::rgba(200, 232, 255, 160)
+    } else {
+        Color::rgba(188, 230, 226, 156)
+    };
+    c.draw_round_rect(x, y, WORKSPACE_SIZE, WORKSPACE_SIZE, 5, stroke);
+    c.draw_round_rect(
+        x + 2,
+        y + 2,
+        WORKSPACE_SIZE - 4,
+        WORKSPACE_SIZE - 4,
+        4,
+        fill,
+    );
+}
+
+fn draw_add_workspace_icon(c: &mut Canvas, x: i32, cy: i32) {
+    c.draw_round_rect(
+        x,
+        cy - WORKSPACE_SIZE / 2,
+        WORKSPACE_SIZE,
+        WORKSPACE_SIZE,
+        6,
+        Color::rgba(160, 238, 220, 38),
+    );
+    draw_round_line(c, x + 5, cy, x + WORKSPACE_SIZE - 5, cy, 2, MINT_LIGHT);
+    draw_round_line(
+        c,
+        x + WORKSPACE_SIZE / 2,
+        cy - 4,
+        x + WORKSPACE_SIZE / 2,
+        cy + 4,
+        2,
+        MINT_LIGHT,
+    );
 }
 
 fn draw_sparkline(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, value: f64, color: Color) {
