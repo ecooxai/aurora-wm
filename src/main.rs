@@ -1440,13 +1440,7 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_enter_notify(&mut self, ev: EnterNotifyEvent) -> AnyResult<()> {
-        if ev.mode != NotifyMode::NORMAL {
-            return Ok(());
-        }
-        if let Some(client) = self.client_key_for(ev.event) {
-            self.focus_window(client)?;
-        }
+    fn handle_enter_notify(&mut self, _ev: EnterNotifyEvent) -> AnyResult<()> {
         Ok(())
     }
 
@@ -1690,8 +1684,6 @@ impl Aurora {
             self.start_resize(client, ev.root_x, ev.root_y, edges)?;
         } else {
             self.focus_window(client)?;
-            self.conn
-                .allow_events(Allow::REPLAY_POINTER, CURRENT_TIME)?;
         }
         Ok(())
     }
@@ -1904,7 +1896,6 @@ impl Aurora {
                     | EventMask::BUTTON_RELEASE
                     | EventMask::POINTER_MOTION
                     | EventMask::LEAVE_WINDOW
-                    | EventMask::ENTER_WINDOW
                     | EventMask::SUBSTRUCTURE_NOTIFY,
             )
             .cursor(self.cursor)
@@ -1928,7 +1919,7 @@ impl Aurora {
                 .event_mask(
                     EventMask::PROPERTY_CHANGE
                         | EventMask::STRUCTURE_NOTIFY
-                        | EventMask::ENTER_WINDOW,
+                        | EventMask::BUTTON_PRESS,
                 ),
         )?;
         self.grab_client_buttons(window)?;
