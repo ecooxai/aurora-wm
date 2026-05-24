@@ -19,6 +19,7 @@ name = "aurora-wm"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "rusttype",
  "time",
  "x11rb",

@@ -1,8 +1,10 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -30,6 +32,7 @@ const TOPBAR_HEIGHT: u16 = 40;
 const DOCK_HEIGHT: u16 = 76;
 const TITLEBAR_HEIGHT: u16 = 34;
 const FRAME_CORNER_RADIUS: i32 = 8;
+const TERMINAL_HISTORY_LIMIT: usize = 1000;
 const SETTINGS_MIN_WIDTH: u16 = 420;
 const SETTINGS_TARGET_WIDTH: u16 = 600;
 const SETTINGS_MARGIN: u16 = 24;
@@ -38,6 +41,11 @@ const SETTINGS_SIDEBAR_TOP: i32 = 26;
 const MEDIA_SLOT_COUNT: usize = 5;
 const MEDIA_WIDTH: u16 = 600;
 const RESIZE_EDGE: i16 = 10;
+const FOLDER_HEADER_ICON: i32 = 30;
+const FOLDER_TERMINAL_COLS: usize = 58;
+const FOLDER_TERMINAL_ROWS: usize = 10;
+const FOLDER_TERMINAL_CELL_W: i32 = 8;
+const FOLDER_TERMINAL_CELL_H: i32 = 18;
 const TERMINAL_FALLBACKS: [&str; 5] = [
     "xfce4-terminal",
     "lxterminal",
@@ -47,6 +55,7 @@ const TERMINAL_FALLBACKS: [&str; 5] = [
 ];
 const FONT_REGULAR: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Bold.ttf");
+const FONT_MONO: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSansMono-Regular.ttf");
 
 static WALLPAPERS: &[WallpaperAsset] = &[
     WallpaperAsset {
@@ -615,6 +624,7 @@ struct UiWindows {
     dock: Window,
     settings: Window,
     folder: Window,
+    folder_terminal: Window,
     app_menu: Window,
     media: [Window; MEDIA_SLOT_COUNT],
 }
@@ -719,6 +729,59 @@ struct FolderEntry {
     kind: FileKind,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FolderSort {
+    Name,
+    Date,
+    Size,
+}
+
+impl FolderSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Date => "Date",
+            Self::Size => "Size",
+        }
+    }
+}
+
+struct FolderTerminal {
+    visible: bool,
+    cwd: PathBuf,
+    focused: bool,
+    master_fd: Option<RawFd>,
+    child_pid: Option<libc::pid_t>,
+    history: Vec<String>,
+    scrollback: usize,
+    screen: Vec<Vec<char>>,
+    cursor_x: usize,
+    cursor_y: usize,
+    esc: String,
+    mouse_enabled: bool,
+    dirty: bool,
+}
+
+impl FolderTerminal {
+    fn new(cwd: PathBuf) -> Self {
+        Self {
+            visible: false,
+            cwd,
+            focused: false,
+            master_fd: None,
+            child_pid: None,
+            history: Vec::new(),
+            scrollback: 0,
+            screen: vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS],
+            cursor_x: 0,
+            cursor_y: 0,
+            esc: String::new(),
+            mouse_enabled: false,
+            dirty: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MediaState {
     entry: FolderEntry,
@@ -802,6 +865,7 @@ struct Aurora {
     ui: UiWindows,
     regular: Font<'static>,
     bold: Font<'static>,
+    mono: Font<'static>,
     settings: SettingsState,
     terminal_apps: Vec<InstalledApp>,
     browser_apps: Vec<InstalledApp>,
@@ -813,6 +877,7 @@ struct Aurora {
     clients: HashMap<Window, ClientInfo>,
     workspace_count: usize,
     active_workspace: usize,
+    active_client: Option<Window>,
     drag: Option<DragState>,
     pending_resize: Option<PendingResize>,
     title_hover: Option<(Window, TitleButton)>,
@@ -827,6 +892,9 @@ struct Aurora {
     folder_scroll: usize,
     folder_front: bool,
     folder_more_open: bool,
+    folder_sort_open: bool,
+    folder_sort: FolderSort,
+    folder_terminal: FolderTerminal,
     media: Option<MediaState>,
     media_slots: Vec<Option<MediaState>>,
     media_next_slot: usize,
@@ -936,6 +1004,7 @@ impl Aurora {
 
         let regular = Font::try_from_bytes(FONT_REGULAR).ok_or("failed to load regular font")?;
         let bold = Font::try_from_bytes(FONT_BOLD).ok_or("failed to load bold font")?;
+        let mono = Font::try_from_bytes(FONT_MONO).ok_or("failed to load mono font")?;
         let wallpaper_pixels = render_wallpaper_pixels(
             WALLPAPERS[0].bytes,
             screen.width_in_pixels,
@@ -956,6 +1025,7 @@ impl Aurora {
             dock: conn.generate_id()?,
             settings: conn.generate_id()?,
             folder: conn.generate_id()?,
+            folder_terminal: conn.generate_id()?,
             app_menu: conn.generate_id()?,
             media: [
                 conn.generate_id()?,
@@ -989,6 +1059,7 @@ impl Aurora {
             ui,
             regular,
             bold,
+            mono,
             settings: SettingsState::default(),
             terminal_apps,
             browser_apps,
@@ -1000,6 +1071,7 @@ impl Aurora {
             clients: HashMap::new(),
             workspace_count: DEFAULT_WORKSPACE_COUNT,
             active_workspace: 0,
+            active_client: None,
             drag: None,
             pending_resize: None,
             title_hover: None,
@@ -1007,13 +1079,16 @@ impl Aurora {
             settings_visible: true,
             settings_front: false,
             folder_mode: FolderMode::Home,
-            folder_entries: folder_entries_for(FolderMode::Home),
+            folder_entries: folder_entries_for(FolderMode::Home, FolderSort::Name),
             folder_places: place_entries(),
             folder_path: folder_path_for(FolderMode::Home),
             folder_selected: None,
             folder_scroll: 0,
             folder_front: false,
             folder_more_open: false,
+            folder_sort_open: false,
+            folder_sort: FolderSort::Name,
+            folder_terminal: FolderTerminal::new(folder_path_for(FolderMode::Home)),
             media: None,
             media_slots: vec![None; MEDIA_SLOT_COUNT],
             media_next_slot: 0,
@@ -1061,6 +1136,10 @@ impl Aurora {
             }
             if let Some(ev) = pending_motion.take() {
                 self.handle_motion_notify(ev)?;
+            }
+
+            if self.folder_terminal.visible && self.poll_folder_terminal()? {
+                handled_event = true;
             }
 
             if let Some(pending) = self.pending_resize {
@@ -1200,6 +1279,26 @@ impl Aurora {
         )?;
         self.init_folder_dnd()?;
 
+        let terminal = self.folder_terminal_geometry();
+        let terminal_aux = CreateWindowAux::new()
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::KEY_PRESS)
+            .cursor(self.cursor)
+            .background_pixel(0);
+        self.conn.create_window(
+            self.depth,
+            self.ui.folder_terminal,
+            self.root,
+            terminal.0,
+            terminal.1,
+            terminal.2,
+            terminal.3,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual,
+            &terminal_aux,
+        )?;
+
         let menu = self.app_menu_geometry();
         let menu_aux = CreateWindowAux::new()
             .override_redirect(1)
@@ -1284,6 +1383,7 @@ impl Aurora {
             self.ui.dock,
             self.ui.settings,
             self.ui.folder,
+            self.ui.folder_terminal,
             self.ui.app_menu,
         ];
         windows.extend(self.ui.media);
@@ -1401,6 +1501,8 @@ impl Aurora {
             self.redraw_settings()?;
         } else if ev.window == self.ui.folder {
             self.redraw_folder()?;
+        } else if ev.window == self.ui.folder_terminal && self.folder_terminal.visible {
+            self.redraw_folder_terminal()?;
         } else if ev.window == self.ui.app_menu && self.app_menu_visible {
             self.redraw_app_menu()?;
         } else if let Some(slot) = self.media_slot_for_window(ev.window) {
@@ -1454,6 +1556,21 @@ impl Aurora {
             } else {
                 self.handle_folder_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
             }
+        } else if ev.event == self.ui.folder_terminal {
+            if ev.detail == 4 || ev.detail == 5 {
+                self.handle_folder_terminal_scroll(ev.detail)?;
+                self.conn.flush()?;
+                return Ok(());
+            }
+            self.folder_front = true;
+            self.settings_front = false;
+            self.media_front = false;
+            self.folder_terminal.focused = true;
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.ui.folder_terminal, CURRENT_TIME)?;
+            self.raise_ui()?;
+            self.handle_folder_terminal_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
+            self.redraw_folder_terminal()?;
         } else if ev.event == self.ui.app_menu {
             self.handle_app_menu_click(ev.detail, i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if let Some(slot) = self.media_slot_for_window(ev.event) {
@@ -1483,7 +1600,7 @@ impl Aurora {
             } else if (controls.battery_left..=controls.battery_right).contains(&x) {
                 self.open_settings_tab(SettingsTab::Power)?;
             }
-        } else if let Some(client) = self.client_key_for(ev.event) {
+        } else if let Some(client) = self.client_or_ancestor_key_for(ev.event) {
             if self
                 .clients
                 .get(&client)
@@ -1592,9 +1709,7 @@ impl Aurora {
                         .height(u32::from(info.height)),
                 )?;
                 self.apply_frame_shape(&info)?;
-                if title_h > 0 {
-                    self.redraw_frame_titlebar(drag.client)?;
-                }
+                self.redraw_frame_titlebar(drag.client)?;
             }
         }
         self.clients.insert(drag.client, info);
@@ -1805,7 +1920,7 @@ impl Aurora {
             }
         }
         if copied > 0 {
-            self.folder_entries = folder_entries_in(self.folder_path.clone());
+            self.refresh_folder_entries();
             self.folder_info = Some(format!("Dropped {copied} file(s)"));
             self.redraw_folder()?;
         }
@@ -1828,10 +1943,11 @@ impl Aurora {
         let Some(info) = self.clients.get(&client).copied() else {
             return Ok(());
         };
-        self.focus_window(client)?;
+        self.focus_window_at(client, ev.time)?;
         if let Some(edges) =
             resize_edges_for_frame(&info, self.titlebar_height(&info), ev.event_x, ev.event_y)
         {
+            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.pending_resize = Some(PendingResize {
                 client,
                 root_x: ev.root_x,
@@ -1843,16 +1959,21 @@ impl Aurora {
         }
         let title_h = self.titlebar_height(&info);
         if title_h == 0 || ev.event_y >= i16::try_from(title_h).unwrap_or(i16::MAX) {
+            self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
             return Ok(());
         }
         let x = ev.event_x;
         if (12..=26).contains(&x) {
+            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.close_client(client)?;
         } else if (34..=50).contains(&x) {
+            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.minimize_client(client)?;
         } else if (57..=73).contains(&x) {
+            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.toggle_maximize_client(client)?;
         } else {
+            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.start_drag(client, ev.root_x, ev.root_y)?;
         }
         Ok(())
@@ -1862,7 +1983,13 @@ impl Aurora {
         let Some(info) = self.clients.get(&client).copied() else {
             return Ok(());
         };
-        if let Some(edges) = resize_edges_for_client(&info, ev.event_x, ev.event_y) {
+        let title_h = self.titlebar_height(&info) as i16;
+        let client_x = ev.root_x.saturating_sub(info.x);
+        let client_y = ev
+            .root_y
+            .saturating_sub(info.y)
+            .saturating_sub(title_h);
+        if let Some(edges) = resize_edges_for_client(&info, client_x, client_y) {
             self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.pending_resize = Some(PendingResize {
                 client,
@@ -1872,7 +1999,8 @@ impl Aurora {
                 pressed_at: Instant::now(),
             });
         } else {
-            self.focus_window(client)?;
+            self.focus_window_at(client, ev.time)?;
+            self.conn.flush()?;
             self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
         }
         Ok(())
@@ -2052,9 +2180,7 @@ impl Aurora {
             )?;
             self.apply_frame_shape(&info)?;
             self.clients.insert(client, info);
-            if title_h > 0 {
-                self.redraw_frame_titlebar(client)?;
-            }
+            self.redraw_frame_titlebar(client)?;
             return Ok(());
         }
         let aux = ConfigureWindowAux::from_configure_request(&ev);
@@ -2134,8 +2260,7 @@ impl Aurora {
             // A mapped reparent reports both structure and substructure unmaps.
             self.ignored_unmaps.extend([window, window]);
         }
-        self.conn
-            .reparent_window(window, frame, 0, title_h as i16)?;
+        self.conn.reparent_window(window, frame, 0, title_h as i16)?;
         self.conn.map_window(window)?;
         self.conn.map_window(frame)?;
         // Set EWMH _NET_WM_DESKTOP on the client window and its frame
@@ -2172,9 +2297,7 @@ impl Aurora {
         };
         self.apply_frame_shape(&info)?;
         self.clients.insert(window, info);
-        if titlebar {
-            self.redraw_frame_titlebar(window)?;
-        }
+        self.redraw_frame_titlebar(window)?;
         self.focus_window(window)?;
         self.redraw_dock()?;
         Ok(())
@@ -2192,6 +2315,9 @@ impl Aurora {
             .conn
             .reparent_window(info.window, self.root, info.x, info.y);
         let _ = self.conn.destroy_window(info.frame);
+        if self.active_client == Some(client) {
+            self.active_client = None;
+        }
         self.redraw_dock()?;
         Ok(())
     }
@@ -2201,6 +2327,9 @@ impl Aurora {
             info.mapped = false;
             self.ignored_unmaps.push(info.frame);
             self.conn.unmap_window(info.frame)?;
+            if self.active_client == Some(client) {
+                self.active_client = None;
+            }
             self.redraw_dock()?;
         }
         Ok(())
@@ -2244,14 +2373,16 @@ impl Aurora {
         )?;
         self.apply_frame_shape(&info)?;
         self.clients.insert(client, info);
-        if title_h > 0 {
-            self.redraw_frame_titlebar(client)?;
-        }
+        self.redraw_frame_titlebar(client)?;
         self.focus_window(client)?;
         Ok(())
     }
 
     fn focus_window(&mut self, window: Window) -> AnyResult<()> {
+        self.focus_window_at(window, CURRENT_TIME)
+    }
+
+    fn focus_window_at(&mut self, window: Window, time: Timestamp) -> AnyResult<()> {
         let Some(client) = self.client_key_for(window) else {
             return Ok(());
         };
@@ -2261,6 +2392,8 @@ impl Aurora {
         if info.workspace != self.active_workspace {
             return Ok(());
         }
+        let previous_active = self.active_client;
+        self.active_client = Some(client);
         if !info.mapped {
             let mut mapped = info;
             mapped.mapped = true;
@@ -2269,7 +2402,8 @@ impl Aurora {
             self.redraw_dock()?;
         }
         self.conn
-            .set_input_focus(InputFocus::POINTER_ROOT, info.window, CURRENT_TIME)?;
+            .set_input_focus(InputFocus::POINTER_ROOT, info.window, time)?;
+        self.send_take_focus(&info, time)?;
         self.settings_front = false;
         self.folder_front = false;
         self.media_front = false;
@@ -2302,6 +2436,12 @@ impl Aurora {
             info.frame,
             &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
         )?;
+        if previous_active.is_some_and(|old| old != client) {
+            if let Some(old) = previous_active {
+                let _ = self.redraw_frame_titlebar(old);
+            }
+        }
+        self.redraw_frame_titlebar(client)?;
         self.conn.configure_window(
             self.ui.dock,
             &ConfigureWindowAux::new()
@@ -2309,6 +2449,28 @@ impl Aurora {
                 .stack_mode(StackMode::BELOW),
         )?;
         self.raise_chrome()?;
+        Ok(())
+    }
+
+    fn send_take_focus(&self, info: &ClientInfo, time: Timestamp) -> AnyResult<()> {
+        let wm_protocols = self.atom(b"WM_PROTOCOLS")?;
+        let wm_take_focus = self.atom(b"WM_TAKE_FOCUS")?;
+        let Ok(reply) = self
+            .conn
+            .get_property(false, info.window, wm_protocols, AtomEnum::ATOM, 0, 32)?
+            .reply()
+        else {
+            return Ok(());
+        };
+        let supports_take_focus = reply
+            .value32()
+            .is_some_and(|mut atoms| atoms.any(|atom| atom == wm_take_focus));
+        if supports_take_focus {
+            let event =
+                ClientMessageEvent::new(32, info.window, wm_protocols, [wm_take_focus, time, 0, 0, 0]);
+            self.conn
+                .send_event(false, info.window, EventMask::NO_EVENT, event)?;
+        }
         Ok(())
     }
 
@@ -2342,6 +2504,7 @@ impl Aurora {
         )?;
         self.apply_frame_shape(&info)?;
         self.clients.insert(client, info);
+        self.redraw_frame_titlebar(client)?;
         Ok(())
     }
 
@@ -2377,6 +2540,9 @@ impl Aurora {
             info.width,
             TITLEBAR_HEIGHT,
         );
+        if self.titlebar_height(info) == 0 {
+            return Ok(());
+        }
         c.draw_round_rect(
             0,
             0,
@@ -2384,13 +2550,6 @@ impl Aurora {
             i32::from(TITLEBAR_HEIGHT) + 16,
             FRAME_CORNER_RADIUS,
             Color::rgba(250, 254, 255, 225),
-        );
-        c.draw_rect(
-            0,
-            i32::from(TITLEBAR_HEIGHT) - 1,
-            i32::from(info.width),
-            1,
-            Color::rgba(178, 202, 214, 105),
         );
         c.draw_circle(19, 17, 8, Color::rgba(241, 96, 105, 235));
         c.draw_circle(42, 17, 8, Color::rgba(246, 190, 82, 235));
@@ -2475,6 +2634,9 @@ impl Aurora {
     fn redraw_everything(&mut self) -> AnyResult<()> {
         self.redraw_wallpaper()?;
         self.redraw_folder()?;
+        if self.folder_terminal.visible {
+            self.redraw_folder_terminal()?;
+        }
         self.redraw_topbar()?;
         self.redraw_dock()?;
         self.redraw_settings()?;
@@ -2777,11 +2939,24 @@ impl Aurora {
         );
         c.draw_round_rect(18, 18, 30, 30, 10, Color::rgba(255, 255, 255, 155));
         draw_home_icon(&mut c, 33, 33, MINT_DARK);
+        c.draw_round_rect(56, 18, FOLDER_HEADER_ICON, FOLDER_HEADER_ICON, 10, Color::rgba(255, 255, 255, 155));
+        draw_terminal_icon(
+            &mut c,
+            71,
+            33,
+            if self.folder_terminal.visible {
+                MINT_DARK
+            } else {
+                SOFT_INK
+            },
+        );
+        c.draw_round_rect(94, 18, FOLDER_HEADER_ICON, FOLDER_HEADER_ICON, 10, Color::rgba(255, 255, 255, 155));
+        draw_sort_icon(&mut c, 109, 33, MINT_DARK);
         c.draw_text(
             &self.bold,
-            &compact_path(&self.folder_path, 32),
-            60,
-            27,
+            &compact_path(&self.folder_path, 28),
+            18,
+            54,
             14.0,
             MINT_DARK,
         );
@@ -2878,6 +3053,36 @@ impl Aurora {
                     11.0,
                     INK,
                 );
+            }
+        }
+        if self.folder_sort_open {
+            let menu_x = 94;
+            let menu_y = 54;
+            c.draw_round_rect(
+                menu_x,
+                menu_y,
+                122,
+                96,
+                12,
+                Color::rgba(250, 254, 255, 242),
+            );
+            for (idx, sort) in [FolderSort::Name, FolderSort::Date, FolderSort::Size]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                let y = menu_y + 16 + idx as i32 * 28;
+                if sort == self.folder_sort {
+                    c.draw_round_rect(
+                        menu_x + 8,
+                        y - 5,
+                        106,
+                        23,
+                        7,
+                        Color::rgba(116, 213, 198, 92),
+                    );
+                }
+                c.draw_text(&self.regular, sort.label(), menu_x + 18, y, 12.0, INK);
             }
         }
         if self.folder_context_open {
@@ -4190,6 +4395,10 @@ impl Aurora {
     }
 
     fn handle_key_press(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
+        if ev.event == self.ui.folder_terminal && self.folder_terminal.visible {
+            self.handle_folder_terminal_key(ev)?;
+            return Ok(());
+        }
         if ev.event != self.ui.settings
             || self.settings.tab != SettingsTab::Apps
             || self.settings.app_kind != DefaultAppKind::Terminal
@@ -4351,16 +4560,19 @@ impl Aurora {
     fn show_folder(&mut self, mode: FolderMode, front: bool) -> AnyResult<()> {
         self.folder_mode = mode;
         self.folder_path = folder_path_for(mode);
-        self.folder_entries = folder_entries_for(mode);
+        self.folder_entries = folder_entries_for(mode, self.folder_sort);
         self.folder_selected = None;
         self.folder_scroll = 0;
         self.folder_front = front;
         self.folder_more_open = false;
+        self.folder_sort_open = false;
+        self.sync_folder_terminal_cwd();
         if front {
             self.settings_front = false;
             self.media_front = false;
         }
         let folder = self.folder_geometry();
+        let terminal = self.folder_terminal_geometry();
         self.conn.configure_window(
             self.ui.folder,
             &ConfigureWindowAux::new()
@@ -4374,14 +4586,36 @@ impl Aurora {
                     StackMode::BELOW
                 }),
         )?;
+        self.conn.configure_window(
+            self.ui.folder_terminal,
+            &ConfigureWindowAux::new()
+                .x(i32::from(terminal.0))
+                .y(i32::from(terminal.1))
+                .width(u32::from(terminal.2))
+                .height(u32::from(terminal.3)),
+        )?;
         self.conn.map_window(self.ui.folder)?;
         self.redraw_folder()?;
+        if self.folder_terminal.visible {
+            self.redraw_folder_terminal()?;
+        }
         self.raise_ui()?;
         Ok(())
     }
 
     fn handle_folder_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let (_, _, w, _) = self.folder_geometry();
+        if self.folder_sort_open {
+            if let Some(sort) = self.folder_sort_at(x, y) {
+                self.folder_sort = sort;
+                self.folder_sort_open = false;
+                self.refresh_folder_entries();
+                self.folder_info = Some(format!("Sorted by {}", sort.label().to_lowercase()));
+                self.redraw_folder()?;
+                return Ok(());
+            }
+            self.folder_sort_open = false;
+        }
         if self.folder_context_open {
             if let Some(action) = self.folder_context_action_at(x, y) {
                 self.run_folder_context_action(action)?;
@@ -4394,15 +4628,30 @@ impl Aurora {
         if (18..=48).contains(&x) && (18..=48).contains(&y) {
             self.folder_mode = FolderMode::Home;
             self.folder_path = folder_path_for(FolderMode::Home);
-            self.folder_entries = folder_entries_for(FolderMode::Home);
+            self.folder_entries = folder_entries_for(FolderMode::Home, self.folder_sort);
             self.folder_selected = None;
             self.folder_scroll = 0;
             self.folder_more_open = false;
+            self.folder_sort_open = false;
             self.folder_info = None;
+            self.sync_folder_terminal_cwd();
+            self.redraw_folder()?;
+            if self.folder_terminal.visible {
+                self.redraw_folder_terminal()?;
+            }
+            return Ok(());
+        }
+        if (56..=86).contains(&x) && (18..=48).contains(&y) {
+            self.toggle_folder_terminal()?;
+            return Ok(());
+        }
+        if (94..=124).contains(&x) && (18..=48).contains(&y) {
+            self.folder_sort_open = !self.folder_sort_open;
+            self.folder_more_open = false;
             self.redraw_folder()?;
             return Ok(());
         }
-        if x >= 58 && x <= i32::from(w) - 58 && (22..=52).contains(&y) {
+        if x >= 58 && x <= i32::from(w) - 58 && (36..=60).contains(&y) {
             copy_text_to_clipboard(&self.folder_path.to_string_lossy());
             self.folder_info = Some("Path copied to clipboard".to_string());
             self.redraw_folder()?;
@@ -4420,11 +4669,15 @@ impl Aurora {
                 if x >= menu_x + 8 && x <= menu_x + 186 && y >= row_y - 5 && y <= row_y + 18 {
                     self.folder_mode = FolderMode::Home;
                     self.folder_path = place.path.clone();
-                    self.folder_entries = folder_entries_in(place.path.clone());
+                    self.folder_entries = folder_entries_in(place.path.clone(), self.folder_sort);
                     self.folder_selected = None;
                     self.folder_scroll = 0;
                     self.folder_more_open = false;
+                    self.sync_folder_terminal_cwd();
                     self.redraw_folder()?;
+                    if self.folder_terminal.visible {
+                        self.redraw_folder_terminal()?;
+                    }
                     return Ok(());
                 }
             }
@@ -4452,10 +4705,14 @@ impl Aurora {
         match entry.kind {
             FileKind::Directory => {
                 self.folder_path = entry.path.clone();
-                self.folder_entries = folder_entries_in(entry.path);
+                self.folder_entries = folder_entries_in(entry.path, self.folder_sort);
                 self.folder_selected = None;
                 self.folder_scroll = 0;
+                self.sync_folder_terminal_cwd();
                 self.redraw_folder()?;
+                if self.folder_terminal.visible {
+                    self.redraw_folder_terminal()?;
+                }
             }
             FileKind::Text
             | FileKind::Image
@@ -4541,6 +4798,7 @@ impl Aurora {
         self.folder_context_open = true;
         self.folder_context_pos = (x, y);
         self.folder_more_open = false;
+        self.folder_sort_open = false;
         self.redraw_folder()?;
         Ok(())
     }
@@ -4558,6 +4816,417 @@ impl Aurora {
         }
         self.redraw_folder()?;
         Ok(())
+    }
+
+    fn folder_sort_at(&self, x: i32, y: i32) -> Option<FolderSort> {
+        let menu_x = 94;
+        let menu_y = 54;
+        if x < menu_x || x > menu_x + 122 || y < menu_y || y > menu_y + 96 {
+            return None;
+        }
+        let idx = (y - menu_y - 8) / 28;
+        match idx {
+            0 => Some(FolderSort::Name),
+            1 => Some(FolderSort::Date),
+            2 => Some(FolderSort::Size),
+            _ => None,
+        }
+    }
+
+    fn refresh_folder_entries(&mut self) {
+        self.folder_entries = folder_entries_in(self.folder_path.clone(), self.folder_sort);
+        self.folder_scroll = self
+            .folder_scroll
+            .min(self.folder_entries.len().saturating_sub(9));
+        self.folder_selected = self
+            .folder_selected
+            .take()
+            .filter(|path| self.folder_entries.iter().any(|entry| &entry.path == path));
+    }
+
+    fn sync_folder_terminal_cwd(&mut self) {
+        self.folder_terminal.cwd = self.folder_path.clone();
+        if self.folder_terminal.master_fd.is_some() {
+            let command = format!("cd {}\n", shell_quote(&self.folder_path));
+            self.write_folder_terminal(command.as_bytes());
+        }
+    }
+
+    fn toggle_folder_terminal(&mut self) -> AnyResult<()> {
+        self.folder_terminal.visible = !self.folder_terminal.visible;
+        self.folder_terminal.focused = self.folder_terminal.visible;
+        if self.folder_terminal.visible {
+            self.ensure_folder_terminal_pty();
+            self.sync_folder_terminal_cwd();
+            let terminal = self.folder_terminal_geometry();
+            self.conn.configure_window(
+                self.ui.folder_terminal,
+                &ConfigureWindowAux::new()
+                    .x(i32::from(terminal.0))
+                    .y(i32::from(terminal.1))
+                    .width(u32::from(terminal.2))
+                    .height(u32::from(terminal.3))
+                    .stack_mode(StackMode::ABOVE),
+            )?;
+            self.conn.map_window(self.ui.folder_terminal)?;
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.ui.folder_terminal, CURRENT_TIME)?;
+            self.redraw_folder_terminal()?;
+        } else {
+            self.conn.unmap_window(self.ui.folder_terminal)?;
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+        }
+        self.redraw_folder()?;
+        self.raise_ui()?;
+        Ok(())
+    }
+
+    fn redraw_folder_terminal(&self) -> AnyResult<()> {
+        let (x, y, w, h) = self.folder_terminal_geometry();
+        let mut c = Canvas::from_wallpaper_crop(
+            &self.wallpaper_pixels,
+            self.screen_width,
+            i32::from(x),
+            i32::from(y),
+            w,
+            h,
+        );
+        c.draw_round_rect(
+            0,
+            0,
+            i32::from(w),
+            i32::from(h),
+            16,
+            Color::rgba(247, 252, 255, 212),
+        );
+        c.draw_round_rect(
+            0,
+            0,
+            i32::from(w),
+            i32::from(h),
+            16,
+            Color::rgba(214, 229, 237, 70),
+        );
+        c.draw_text(&self.bold, "Terminal", 18, 14, 14.0, MINT_DARK);
+        c.draw_text(
+            &self.regular,
+            &compact_path(&self.folder_terminal.cwd, 30),
+            98,
+            14,
+            14.0,
+            MUTED,
+        );
+        c.draw_rect(
+            16,
+            42,
+            i32::from(w) - 32,
+            1,
+            Color::rgba(178, 202, 214, 100),
+        );
+        let visible_rows = ((i32::from(h) - 56) / FOLDER_TERMINAL_CELL_H)
+            .max(1)
+            .min(FOLDER_TERMINAL_ROWS as i32) as usize;
+        let rows = self.folder_terminal_display_rows(visible_rows);
+        for (idx, row) in rows.iter().enumerate() {
+            let y = 52 + idx as i32 * FOLDER_TERMINAL_CELL_H;
+            for (col, ch) in row.chars().take(FOLDER_TERMINAL_COLS).enumerate() {
+                if ch != ' ' {
+                    c.draw_text(
+                        &self.mono,
+                        &ch.to_string(),
+                        18 + col as i32 * FOLDER_TERMINAL_CELL_W,
+                        y,
+                        13.5,
+                        INK,
+                    );
+                }
+            }
+        }
+        if self.folder_terminal.focused {
+            let cursor_x = 18
+                + self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1) as i32
+                    * FOLDER_TERMINAL_CELL_W;
+            let cursor_y = 53
+                + self.folder_terminal.cursor_y.min(FOLDER_TERMINAL_ROWS - 1) as i32
+                    * FOLDER_TERMINAL_CELL_H;
+            c.draw_rect(cursor_x, cursor_y, 2, 14, MINT_DARK);
+        }
+        self.upload_canvas(self.ui.folder_terminal, &c)
+    }
+
+    fn folder_terminal_display_rows(&self, visible_rows: usize) -> Vec<String> {
+        if self.folder_terminal.scrollback == 0 {
+            return self
+                .folder_terminal
+                .screen
+                .iter()
+                .take(visible_rows)
+                .map(|row| row.iter().collect::<String>())
+                .collect();
+        }
+        let history_len = self.folder_terminal.history.len();
+        let start = history_len.saturating_sub(self.folder_terminal.scrollback + visible_rows);
+        let end = (start + visible_rows).min(history_len);
+        let mut rows = self.folder_terminal.history[start..end].to_vec();
+        while rows.len() < visible_rows {
+            rows.push(String::new());
+        }
+        rows
+    }
+
+    fn handle_folder_terminal_key(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        let shifted = u16::from(ev.state) & u16::from(KeyButMask::SHIFT) != 0;
+        let controlled = u16::from(ev.state) & u16::from(KeyButMask::CONTROL) != 0;
+        let alted = u16::from(ev.state) & u16::from(KeyButMask::MOD1) != 0;
+        let column = if shifted && mapping.keysyms_per_keycode > 1 {
+            1
+        } else {
+            0
+        };
+        let Some(&keysym) = mapping.keysyms.get(column) else {
+            return Ok(());
+        };
+        let mut bytes = match keysym {
+            0xff08 => b"\x7f".to_vec(),
+            0xff09 => b"\t".to_vec(),
+            0xff0d => b"\r".to_vec(),
+            0xff1b => b"\x1b".to_vec(),
+            0xff51 => b"\x1b[D".to_vec(),
+            0xff52 => b"\x1b[A".to_vec(),
+            0xff53 => b"\x1b[C".to_vec(),
+            0xff54 => b"\x1b[B".to_vec(),
+            0x40..=0x5f if controlled => vec![(keysym as u8) & 0x1f],
+            0x61..=0x7a if controlled => vec![((keysym as u8) - b'a' + 1)],
+            0x20..=0x7e => vec![keysym as u8],
+            _ => return Ok(()),
+        };
+        if alted {
+            bytes.insert(0, 0x1b);
+        }
+        self.folder_terminal.scrollback = 0;
+        self.write_folder_terminal(&bytes);
+        Ok(())
+    }
+
+    fn handle_folder_terminal_scroll(&mut self, button: u8) -> AnyResult<()> {
+        let max_scroll = self.folder_terminal.history.len();
+        let old = self.folder_terminal.scrollback;
+        if button == 4 {
+            self.folder_terminal.scrollback = (self.folder_terminal.scrollback + 3).min(max_scroll);
+        } else {
+            self.folder_terminal.scrollback = self.folder_terminal.scrollback.saturating_sub(3);
+        }
+        if self.folder_terminal.scrollback != old {
+            self.redraw_folder_terminal()?;
+        }
+        Ok(())
+    }
+
+    fn handle_folder_terminal_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        if y < 44 || !self.folder_terminal.mouse_enabled {
+            return Ok(());
+        }
+        let col = ((x - 18).max(0) / FOLDER_TERMINAL_CELL_W + 1)
+            .clamp(1, FOLDER_TERMINAL_COLS as i32);
+        let row = ((y - 52).max(0) / FOLDER_TERMINAL_CELL_H + 1)
+            .clamp(1, FOLDER_TERMINAL_ROWS as i32);
+        let press = format!("\x1b[<0;{col};{row}M");
+        let release = format!("\x1b[<0;{col};{row}m");
+        self.write_folder_terminal(press.as_bytes());
+        self.write_folder_terminal(release.as_bytes());
+        Ok(())
+    }
+
+    fn ensure_folder_terminal_pty(&mut self) {
+        if self.folder_terminal.master_fd.is_some() {
+            return;
+        }
+        match spawn_terminal_pty(&self.folder_terminal.cwd, FOLDER_TERMINAL_COLS, FOLDER_TERMINAL_ROWS) {
+            Ok((fd, pid)) => {
+                self.folder_terminal.master_fd = Some(fd);
+                self.folder_terminal.child_pid = Some(pid);
+                self.folder_terminal.history.clear();
+                self.folder_terminal.scrollback = 0;
+                self.folder_terminal.screen = vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+                self.folder_terminal.cursor_x = 0;
+                self.folder_terminal.cursor_y = 0;
+                self.folder_terminal.mouse_enabled = false;
+                self.folder_terminal.dirty = true;
+            }
+            Err(err) => {
+                self.draw_terminal_message(&format!("terminal error: {err}"));
+            }
+        }
+    }
+
+    fn write_folder_terminal(&mut self, bytes: &[u8]) {
+        if let Some(fd) = self.folder_terminal.master_fd {
+            unsafe {
+                let _ = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+            }
+        }
+    }
+
+    fn poll_folder_terminal(&mut self) -> AnyResult<bool> {
+        let Some(fd) = self.folder_terminal.master_fd else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                changed = true;
+                self.folder_terminal.scrollback = 0;
+                let text = String::from_utf8_lossy(&buf[..n as usize]).to_string();
+                self.feed_folder_terminal(&text);
+            } else {
+                break;
+            }
+        }
+        if changed || self.folder_terminal.dirty {
+            self.folder_terminal.dirty = false;
+            self.redraw_folder_terminal()?;
+        }
+        Ok(changed)
+    }
+
+    fn draw_terminal_message(&mut self, message: &str) {
+        self.folder_terminal.history.clear();
+        self.folder_terminal.scrollback = 0;
+        self.folder_terminal.screen = vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+        for (idx, ch) in message.chars().take(FOLDER_TERMINAL_COLS).enumerate() {
+            self.folder_terminal.screen[0][idx] = ch;
+        }
+        self.folder_terminal.dirty = true;
+    }
+
+    fn feed_folder_terminal(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.feed_terminal_char(ch);
+        }
+    }
+
+    fn feed_terminal_char(&mut self, ch: char) {
+        if !self.folder_terminal.esc.is_empty() || ch == '\x1b' {
+            self.feed_terminal_escape(ch);
+            return;
+        }
+        match ch {
+            '\r' => self.folder_terminal.cursor_x = 0,
+            '\n' => self.terminal_newline(),
+            '\x08' => {
+                self.folder_terminal.cursor_x = self.folder_terminal.cursor_x.saturating_sub(1);
+            }
+            '\t' => {
+                let next = ((self.folder_terminal.cursor_x / 4) + 1) * 4;
+                self.folder_terminal.cursor_x = next.min(FOLDER_TERMINAL_COLS - 1);
+            }
+            c if !c.is_control() => self.terminal_put_char(c),
+            _ => {}
+        }
+    }
+
+    fn feed_terminal_escape(&mut self, ch: char) {
+        if self.folder_terminal.esc.is_empty() {
+            self.folder_terminal.esc.push(ch);
+            return;
+        }
+        self.folder_terminal.esc.push(ch);
+        if self.folder_terminal.esc.starts_with("\x1b]") {
+            if ch == '\x07' || self.folder_terminal.esc.ends_with("\x1b\\") {
+                self.folder_terminal.esc.clear();
+            }
+            return;
+        }
+        if self.folder_terminal.esc.starts_with("\x1b(")
+            || self.folder_terminal.esc.starts_with("\x1b)")
+        {
+            if self.folder_terminal.esc.len() >= 3 {
+                self.folder_terminal.esc.clear();
+            }
+            return;
+        }
+        if !ch.is_ascii_alphabetic() && ch != '~' {
+            return;
+        }
+        let esc = std::mem::take(&mut self.folder_terminal.esc);
+        if let Some(body) = esc.strip_prefix("\x1b[") {
+            self.apply_terminal_csi(body);
+        }
+    }
+
+    fn apply_terminal_csi(&mut self, body: &str) {
+        let command = body.chars().last().unwrap_or('m');
+        let params = &body[..body.len().saturating_sub(1)];
+        let private = params.starts_with('?');
+        let clean = params.trim_start_matches('?');
+        let values = clean
+            .split(';')
+            .filter_map(|part| part.parse::<usize>().ok())
+            .collect::<Vec<_>>();
+        if private && matches!(command, 'h' | 'l') {
+            if values
+                .iter()
+                .any(|value| matches!(*value, 1000 | 1002 | 1003 | 1006))
+            {
+                self.folder_terminal.mouse_enabled = command == 'h';
+            }
+            return;
+        }
+        match command {
+            'H' | 'f' => {
+                let row = values.first().copied().unwrap_or(1).saturating_sub(1);
+                let col = values.get(1).copied().unwrap_or(1).saturating_sub(1);
+                self.folder_terminal.cursor_y = row.min(FOLDER_TERMINAL_ROWS - 1);
+                self.folder_terminal.cursor_x = col.min(FOLDER_TERMINAL_COLS - 1);
+            }
+            'A' => self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.saturating_sub(values.first().copied().unwrap_or(1)),
+            'B' => self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y + values.first().copied().unwrap_or(1)).min(FOLDER_TERMINAL_ROWS - 1),
+            'C' => self.folder_terminal.cursor_x = (self.folder_terminal.cursor_x + values.first().copied().unwrap_or(1)).min(FOLDER_TERMINAL_COLS - 1),
+            'D' => self.folder_terminal.cursor_x = self.folder_terminal.cursor_x.saturating_sub(values.first().copied().unwrap_or(1)),
+            'J' => {
+                self.folder_terminal.screen = vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+                self.folder_terminal.cursor_x = 0;
+                self.folder_terminal.cursor_y = 0;
+            }
+            'K' => {
+                let y = self.folder_terminal.cursor_y;
+                for x in self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS {
+                    self.folder_terminal.screen[y][x] = ' ';
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn terminal_put_char(&mut self, ch: char) {
+        if self.folder_terminal.cursor_x >= FOLDER_TERMINAL_COLS {
+            self.terminal_newline();
+        }
+        let x = self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1);
+        let y = self.folder_terminal.cursor_y.min(FOLDER_TERMINAL_ROWS - 1);
+        self.folder_terminal.screen[y][x] = ch;
+        self.folder_terminal.cursor_x += 1;
+    }
+
+    fn terminal_newline(&mut self) {
+        self.folder_terminal.cursor_x = 0;
+        if self.folder_terminal.cursor_y + 1 >= FOLDER_TERMINAL_ROWS {
+            let removed = self.folder_terminal.screen.remove(0);
+            self.folder_terminal
+                .history
+                .push(removed.iter().collect::<String>());
+            if self.folder_terminal.history.len() > TERMINAL_HISTORY_LIMIT {
+                let extra = self.folder_terminal.history.len() - TERMINAL_HISTORY_LIMIT;
+                self.folder_terminal.history.drain(0..extra);
+            }
+            self.folder_terminal.screen.push(vec![' '; FOLDER_TERMINAL_COLS]);
+        } else {
+            self.folder_terminal.cursor_y += 1;
+        }
     }
 
     fn folder_context_action_at(&self, x: i32, y: i32) -> Option<FolderContextAction> {
@@ -4600,7 +5269,7 @@ impl Aurora {
                     } else if src.is_file() {
                         let _ = fs::copy(&src, &dst);
                     }
-                    self.folder_entries = folder_entries_in(self.folder_path.clone());
+                    self.refresh_folder_entries();
                     self.folder_info = Some("Pasted".to_string());
                 }
             }
@@ -4959,6 +5628,7 @@ impl Aurora {
         let dock = self.dock_geometry();
         let settings = self.settings_geometry();
         let folder = self.folder_geometry();
+        let terminal = self.folder_terminal_geometry();
         let menu = self.app_menu_geometry();
         self.conn.configure_window(
             self.ui.topbar,
@@ -4991,6 +5661,14 @@ impl Aurora {
                 .y(i32::from(folder.1))
                 .width(u32::from(folder.2))
                 .height(u32::from(folder.3)),
+        )?;
+        self.conn.configure_window(
+            self.ui.folder_terminal,
+            &ConfigureWindowAux::new()
+                .x(i32::from(terminal.0))
+                .y(i32::from(terminal.1))
+                .width(u32::from(terminal.2))
+                .height(u32::from(terminal.3)),
         )?;
         self.conn.configure_window(
             self.ui.app_menu,
@@ -5034,6 +5712,16 @@ impl Aurora {
                 StackMode::BELOW
             }),
         )?;
+        if self.folder_terminal.visible {
+            self.conn.configure_window(
+                self.ui.folder_terminal,
+                &ConfigureWindowAux::new().stack_mode(if self.folder_front {
+                    StackMode::ABOVE
+                } else {
+                    StackMode::BELOW
+                }),
+            )?;
+        }
         for (idx, window) in self.ui.media.iter().copied().enumerate() {
             if self.media_slots.get(idx).and_then(|m| m.as_ref()).is_some() {
                 self.conn.configure_window(
@@ -5227,6 +5915,15 @@ impl Aurora {
         (24, (TOPBAR_HEIGHT + 26) as i16, width, height)
     }
 
+    fn folder_terminal_geometry(&self) -> (i16, i16, u16, u16) {
+        let folder = self.folder_geometry();
+        let y = i32::from(folder.1) + i32::from(folder.3) + 8;
+        let dock = self.dock_geometry();
+        let available = i32::from(dock.1).saturating_sub(y + 10);
+        let height = available.clamp(120, 260) as u16;
+        (folder.0, y as i16, folder.2, height)
+    }
+
     fn app_menu_geometry(&self) -> (i16, i16, u16, u16) {
         let width = if self.app_menu_more { 590u16 } else { 260u16 };
         let height = if self.app_menu_more { 500u16 } else { 360u16 };
@@ -5283,11 +5980,35 @@ impl Aurora {
             .find_map(|(client, info)| (info.frame == window).then_some(*client))
     }
 
+    fn client_or_ancestor_key_for(&self, window: Window) -> Option<Window> {
+        if let Some(client) = self.client_key_for(window) {
+            return Some(client);
+        }
+        let mut current = window;
+        for _ in 0..8 {
+            let Ok(cookie) = self.conn.query_tree(current) else {
+                return None;
+            };
+            let Ok(reply) = cookie.reply() else {
+                return None;
+            };
+            if reply.parent == self.root || reply.parent == x11rb::NONE {
+                return self.client_key_for(reply.parent);
+            }
+            if let Some(client) = self.client_key_for(reply.parent) {
+                return Some(client);
+            }
+            current = reply.parent;
+        }
+        None
+    }
+
     fn is_ui_window(&self, window: Window) -> bool {
         window == self.ui.topbar
             || window == self.ui.dock
             || window == self.ui.settings
             || window == self.ui.folder
+            || window == self.ui.folder_terminal
             || window == self.ui.app_menu
             || self.ui.media.contains(&window)
     }
@@ -5967,6 +6688,18 @@ fn draw_more_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     c.draw_circle(cx - 7, cy, 2, color);
     c.draw_circle(cx, cy, 2, color);
     c.draw_circle(cx + 7, cy, 2, color);
+}
+
+fn draw_sort_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_line(cx - 8, cy - 6, cx + 7, cy - 6, 2, color);
+    c.draw_line(cx - 8, cy, cx + 3, cy, 2, color);
+    c.draw_line(cx - 8, cy + 6, cx - 1, cy + 6, 2, color);
+}
+
+fn draw_terminal_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_round_line(c, cx - 8, cy - 5, cx - 3, cy, 2, color);
+    draw_round_line(c, cx - 8, cy + 5, cx - 3, cy, 2, color);
+    c.draw_line(cx + 1, cy + 5, cx + 8, cy + 5, 2, color);
 }
 
 fn draw_picture_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -7067,10 +7800,10 @@ fn app_menu_items() -> Vec<AppMenuItem> {
     ]
 }
 
-fn folder_entries_for(mode: FolderMode) -> Vec<FolderEntry> {
+fn folder_entries_for(mode: FolderMode, sort: FolderSort) -> Vec<FolderEntry> {
     let home = home_dir();
     let path = folder_path_for(mode);
-    let mut entries = folder_entries_in(path);
+    let mut entries = folder_entries_in(path, sort);
     if entries.is_empty() && mode == FolderMode::Home {
         for (name, mode) in [
             ("Pictures", FolderMode::Pictures),
@@ -7083,6 +7816,7 @@ fn folder_entries_for(mode: FolderMode) -> Vec<FolderEntry> {
                 kind: FileKind::Directory,
             });
         }
+        sort_folder_entries(&mut entries, sort);
     }
     entries
 }
@@ -7097,7 +7831,7 @@ fn folder_path_for(mode: FolderMode) -> PathBuf {
     }
 }
 
-fn folder_entries_in(path: PathBuf) -> Vec<FolderEntry> {
+fn folder_entries_in(path: PathBuf, sort: FolderSort) -> Vec<FolderEntry> {
     let mut entries = Vec::new();
     let Ok(read_dir) = fs::read_dir(&path) else {
         return entries;
@@ -7125,15 +7859,122 @@ fn folder_entries_in(path: PathBuf) -> Vec<FolderEntry> {
             break;
         }
     }
-    entries.sort_by_key(|entry| {
-        (
-            entry.kind != FileKind::Directory,
-            entry.kind == FileKind::Other,
-            entry.name.to_lowercase(),
-        )
-    });
+    sort_folder_entries(&mut entries, sort);
     entries.truncate(18);
     entries
+}
+
+fn sort_folder_entries(entries: &mut [FolderEntry], sort: FolderSort) {
+    entries.sort_by(|a, b| {
+        let base = (a.kind != FileKind::Directory)
+            .cmp(&(b.kind != FileKind::Directory))
+            .then((a.kind == FileKind::Other).cmp(&(b.kind == FileKind::Other)));
+        if base != std::cmp::Ordering::Equal {
+            return base;
+        }
+        match sort {
+            FolderSort::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            FolderSort::Date => entry_modified_secs(b).cmp(&entry_modified_secs(a)).then(
+                a.name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase()),
+            ),
+            FolderSort::Size => entry_size(b)
+                .cmp(&entry_size(a))
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        }
+    });
+}
+
+fn entry_modified_secs(entry: &FolderEntry) -> u64 {
+    fs::metadata(&entry.path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn entry_size(entry: &FolderEntry) -> u64 {
+    fs::metadata(&entry.path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn spawn_terminal_pty(cwd: &Path, cols: usize, rows: usize) -> AnyResult<(RawFd, libc::pid_t)> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut winsize = libc::winsize {
+        ws_row: rows as u16,
+        ws_col: cols as u16,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &mut winsize,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(master);
+            libc::setsid();
+            libc::ioctl(slave, libc::TIOCSCTTY, 0);
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            if slave > libc::STDERR_FILENO {
+                libc::close(slave);
+            }
+        }
+        let _ = env::set_current_dir(cwd);
+        unsafe {
+            env::set_var("TERM", "xterm-256color");
+            env::set_var("COLORTERM", "truecolor");
+            env::set_var("LINES", rows.to_string());
+            env::set_var("COLUMNS", cols.to_string());
+            env::set_var("PS1", "$ ");
+            env::set_var("ENV", "/dev/null");
+            env::set_var("BASH_ENV", "/dev/null");
+        }
+        let shell_c = CString::new("/bin/sh").unwrap();
+        let interactive = CString::new("-i").unwrap();
+        unsafe {
+            libc::execlp(
+                shell_c.as_ptr(),
+                shell_c.as_ptr(),
+                interactive.as_ptr(),
+                std::ptr::null::<libc::c_char>(),
+            );
+            libc::_exit(127);
+        }
+    }
+    unsafe {
+        libc::close(slave);
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    Ok((master, pid))
+}
+
+fn shell_quote(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 fn file_kind_for(path: &std::path::Path) -> FileKind {
