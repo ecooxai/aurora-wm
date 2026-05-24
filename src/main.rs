@@ -69,7 +69,7 @@ struct WallpaperAsset {
     bytes: &'static [u8],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Color {
     r: u8,
     g: u8,
@@ -97,7 +97,6 @@ const CARD_LINE: Color = Color::rgba(198, 214, 224, 130);
 const TOPBAR_ICON_SPACING: i32 = 33;
 const DEFAULT_WORKSPACE_COUNT: usize = 2;
 const MAX_WORKSPACE_COUNT: usize = 8;
-const WORKSPACE_START_X: i32 = 16;
 const WORKSPACE_STRIDE: i32 = 27;
 const WORKSPACE_SIZE: i32 = 18;
 
@@ -209,10 +208,12 @@ impl Canvas {
         let y0 = y.max(0);
         let x1 = (x + w).min(i32::from(self.width));
         let y1 = (y + h).min(i32::from(self.height));
+        let rf = r as f32;
+
         for yy in y0..y1 {
             for xx in x0..x1 {
-                let inside = if r == 0 {
-                    true
+                let coverage = if r == 0 {
+                    1.0
                 } else {
                     let cx = if xx < x + r {
                         x + r
@@ -230,23 +231,49 @@ impl Canvas {
                     };
                     let dx = xx - cx;
                     let dy = yy - cy;
-                    dx * dx + dy * dy <= r * r
+                    let d = ((dx * dx + dy * dy) as f32).sqrt();
+                    if d <= rf - 0.5 {
+                        1.0
+                    } else if d >= rf + 0.5 {
+                        0.0
+                    } else {
+                        rf + 0.5 - d
+                    }
                 };
-                if inside {
-                    self.blend_pixel(xx, yy, color);
+                if coverage > 0.0 {
+                    let mut blended = color;
+                    blended.a = (color.a as f32 * coverage).round() as u8;
+                    self.blend_pixel(xx, yy, blended);
                 }
             }
         }
     }
 
     fn draw_circle(&mut self, cx: i32, cy: i32, radius: i32, color: Color) {
-        let r2 = radius * radius;
-        for y in (cy - radius)..=(cy + radius) {
-            for x in (cx - radius)..=(cx + radius) {
+        let r = radius as f32;
+        let x_start = (cx - radius - 1).max(0);
+        let x_end = (cx + radius + 1).min(i32::from(self.width));
+        let y_start = (cy - radius - 1).max(0);
+        let y_end = (cy + radius + 1).min(i32::from(self.height));
+
+        for y in y_start..=y_end {
+            for x in x_start..=x_end {
                 let dx = x - cx;
                 let dy = y - cy;
-                if dx * dx + dy * dy <= r2 {
-                    self.blend_pixel(x, y, color);
+                let d = ((dx * dx + dy * dy) as f32).sqrt();
+
+                let coverage = if d <= r - 0.5 {
+                    1.0
+                } else if d >= r + 0.5 {
+                    0.0
+                } else {
+                    r + 0.5 - d
+                };
+
+                if coverage > 0.0 {
+                    let mut blended = color;
+                    blended.a = (color.a as f32 * coverage).round() as u8;
+                    self.blend_pixel(x, y, blended);
                 }
             }
         }
@@ -254,36 +281,55 @@ impl Canvas {
 
     fn draw_line(
         &mut self,
-        mut x0: i32,
-        mut y0: i32,
+        x0: i32,
+        y0: i32,
         x1: i32,
         y1: i32,
         thickness: i32,
         color: Color,
     ) {
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        loop {
-            let r = (thickness.max(1) - 1) / 2;
-            for yy in (y0 - r)..=(y0 + r) {
-                for xx in (x0 - r)..=(x0 + r) {
-                    self.blend_pixel(xx, yy, color);
+        let x_min = x0.min(x1) - (thickness + 2);
+        let x_max = x0.max(x1) + (thickness + 2);
+        let y_min = y0.min(y1) - (thickness + 2);
+        let y_max = y0.max(y1) + (thickness + 2);
+
+        let x_start = x_min.max(0);
+        let x_end = x_max.min(i32::from(self.width));
+        let y_start = y_min.max(0);
+        let y_end = y_max.min(i32::from(self.height));
+
+        let dx = (x1 - x0) as f32;
+        let dy = (y1 - y0) as f32;
+        let len2 = dx * dx + dy * dy;
+
+        let r = thickness as f32 / 2.0;
+
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                let t = if len2 == 0.0 {
+                    0.0
+                } else {
+                    (((x - x0) as f32 * dx + (y - y0) as f32 * dy) / len2).clamp(0.0, 1.0)
+                };
+                let proj_x = x0 as f32 + t * dx;
+                let proj_y = y0 as f32 + t * dy;
+                let dist_x = x as f32 - proj_x;
+                let dist_y = y as f32 - proj_y;
+                let d = (dist_x * dist_x + dist_y * dist_y).sqrt();
+
+                let coverage = if d <= r - 0.5 {
+                    1.0
+                } else if d >= r + 0.5 {
+                    0.0
+                } else {
+                    r + 0.5 - d
+                };
+
+                if coverage > 0.0 {
+                    let mut blended = color;
+                    blended.a = (color.a as f32 * coverage).round() as u8;
+                    self.blend_pixel(x, y, blended);
                 }
-            }
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
             }
         }
     }
@@ -633,6 +679,15 @@ struct DragState {
 }
 
 #[derive(Clone, Copy)]
+struct PendingResize {
+    client: Window,
+    root_x: i16,
+    root_y: i16,
+    edges: ResizeEdges,
+    pressed_at: Instant,
+}
+
+#[derive(Clone, Copy)]
 struct DockClickState {
     client: Window,
     at: Instant,
@@ -759,6 +814,7 @@ struct Aurora {
     workspace_count: usize,
     active_workspace: usize,
     drag: Option<DragState>,
+    pending_resize: Option<PendingResize>,
     title_hover: Option<(Window, TitleButton)>,
     ignored_unmaps: Vec<Window>,
     settings_visible: bool,
@@ -945,6 +1001,7 @@ impl Aurora {
             workspace_count: DEFAULT_WORKSPACE_COUNT,
             active_workspace: 0,
             drag: None,
+            pending_resize: None,
             title_hover: None,
             ignored_unmaps: Vec::new(),
             settings_visible: true,
@@ -1004,6 +1061,13 @@ impl Aurora {
             }
             if let Some(ev) = pending_motion.take() {
                 self.handle_motion_notify(ev)?;
+            }
+
+            if let Some(pending) = self.pending_resize {
+                if pending.pressed_at.elapsed() >= Duration::from_secs(2) {
+                    self.pending_resize = None;
+                    self.start_resize(pending.client, pending.root_x, pending.root_y, pending.edges)?;
+                }
             }
 
             if handled_event {
@@ -1182,6 +1246,31 @@ impl Aurora {
         self.conn.map_window(self.ui.topbar)?;
         self.conn.map_window(self.ui.dock)?;
         self.conn.map_window(self.ui.settings)?;
+        
+        // Initialize EWMH desktops on the root window
+        if let Ok(num_atom) = self.atom(b"_NET_NUMBER_OF_DESKTOPS") {
+            if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.root,
+                    num_atom,
+                    cardinal_atom,
+                    &[self.workspace_count as u32],
+                );
+            }
+        }
+        if let Ok(cur_atom) = self.atom(b"_NET_CURRENT_DESKTOP") {
+            if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.root,
+                    cur_atom,
+                    cardinal_atom,
+                    &[self.active_workspace as u32],
+                );
+            }
+        }
+
         self.install_pointer_cursor()?;
         self.raise_ui()?;
         self.conn.flush()?;
@@ -1377,7 +1466,7 @@ impl Aurora {
             let x = i32::from(ev.event_x);
             let controls = self.topbar_controls();
             let workspace = (0..self.workspace_count).find(|&index| {
-                (Self::workspace_x(index)..=Self::workspace_x(index) + WORKSPACE_SIZE).contains(&x)
+                (self.workspace_x(index)..=self.workspace_x(index) + WORKSPACE_SIZE).contains(&x)
             });
             if let Some(workspace) = workspace {
                 self.switch_workspace(workspace)?;
@@ -1411,6 +1500,10 @@ impl Aurora {
 
     fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<()> {
         let Some(drag) = self.drag else {
+            if let Some(ref mut pending) = self.pending_resize {
+                pending.root_x = ev.root_x;
+                pending.root_y = ev.root_y;
+            }
             if let Some(client) = self.client_key_for(ev.event) {
                 let next = self
                     .clients
@@ -1739,7 +1832,13 @@ impl Aurora {
         if let Some(edges) =
             resize_edges_for_frame(&info, self.titlebar_height(&info), ev.event_x, ev.event_y)
         {
-            self.start_resize(client, ev.root_x, ev.root_y, edges)?;
+            self.pending_resize = Some(PendingResize {
+                client,
+                root_x: ev.root_x,
+                root_y: ev.root_y,
+                edges,
+                pressed_at: Instant::now(),
+            });
             return Ok(());
         }
         let title_h = self.titlebar_height(&info);
@@ -1765,7 +1864,13 @@ impl Aurora {
         };
         if let Some(edges) = resize_edges_for_client(&info, ev.event_x, ev.event_y) {
             self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
-            self.start_resize(client, ev.root_x, ev.root_y, edges)?;
+            self.pending_resize = Some(PendingResize {
+                client,
+                root_x: ev.root_x,
+                root_y: ev.root_y,
+                edges,
+                pressed_at: Instant::now(),
+            });
         } else {
             self.focus_window(client)?;
             self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
@@ -1900,6 +2005,7 @@ impl Aurora {
     }
 
     fn end_drag(&mut self) -> AnyResult<()> {
+        self.pending_resize = None;
         if self.drag.take().is_some() {
             self.conn.ungrab_pointer(CURRENT_TIME)?;
         }
@@ -2032,10 +2138,26 @@ impl Aurora {
             .reparent_window(window, frame, 0, title_h as i16)?;
         self.conn.map_window(window)?;
         self.conn.map_window(frame)?;
-        self.conn.change_window_attributes(
-            frame,
-            &ChangeWindowAttributesAux::new().cursor(self.cursor),
-        )?;
+        // Set EWMH _NET_WM_DESKTOP on the client window and its frame
+        if let Ok(desktop_atom) = self.atom(b"_NET_WM_DESKTOP") {
+            if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    window,
+                    desktop_atom,
+                    cardinal_atom,
+                    &[self.active_workspace as u32],
+                );
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    frame,
+                    desktop_atom,
+                    cardinal_atom,
+                    &[self.active_workspace as u32],
+                );
+            }
+        }
+
         let info = ClientInfo {
             window,
             frame,
@@ -2427,12 +2549,15 @@ impl Aurora {
         }
     }
 
-    fn workspace_x(index: usize) -> i32 {
-        WORKSPACE_START_X + index as i32 * WORKSPACE_STRIDE
+    fn workspace_x(&self, index: usize) -> i32 {
+        let brand_x = 24;
+        let aurora_width = measure_text(&self.bold, "Aurora", 16.0);
+        let start_x = brand_x + 23 + aurora_width + 24;
+        start_x + index as i32 * WORKSPACE_STRIDE
     }
 
     fn add_workspace_x(&self) -> i32 {
-        Self::workspace_x(self.workspace_count)
+        self.workspace_x(self.workspace_count)
     }
 
     fn redraw_topbar(&self) -> AnyResult<()> {
@@ -2451,17 +2576,9 @@ impl Aurora {
             i32::from(c.height),
             Color::rgba(23, 34, 42, 178),
         );
-        for index in 0..self.workspace_count {
-            draw_workspace_icon(
-                &mut c,
-                Self::workspace_x(index),
-                11,
-                index == self.active_workspace,
-            );
-        }
-        let add_x = self.add_workspace_x();
-        draw_add_workspace_icon(&mut c, add_x, 20);
-        let brand_x = add_x + 44;
+        
+        // Draw Brand on the far left
+        let brand_x = 24;
         c.draw_circle(brand_x, 20, 10, Color::rgba(160, 238, 220, 38));
         c.draw_circle(brand_x, 20, 7, MINT_LIGHT);
         c.draw_circle(brand_x - 2, 18, 2, Color::rgb(248, 255, 254));
@@ -2473,6 +2590,18 @@ impl Aurora {
             16.0,
             Color::rgb(239, 252, 250),
         );
+
+        // Draw Workspace icons to the right of the Brand
+        for index in 0..self.workspace_count {
+            draw_workspace_icon(
+                &mut c,
+                self.workspace_x(index),
+                11,
+                index == self.active_workspace,
+            );
+        }
+        let add_x = self.add_workspace_x();
+        draw_add_workspace_icon(&mut c, add_x, 20);
 
         let clock = format_clock();
         c.draw_text_center(
@@ -2489,14 +2618,6 @@ impl Aurora {
         draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
         draw_sidebar_network_icon(&mut c, controls.network_x, 20, MINT_LIGHT);
         let battery = self.metrics.battery.as_deref().unwrap_or("100%");
-        c.draw_round_rect(
-            controls.battery_left,
-            6,
-            controls.battery_right - controls.battery_left,
-            28,
-            14,
-            Color::rgba(160, 238, 220, 38),
-        );
         c.draw_text(
             &self.bold,
             battery,
@@ -3794,6 +3915,20 @@ impl Aurora {
         }
         let workspace = self.workspace_count;
         self.workspace_count += 1;
+        
+        // Update EWMH _NET_NUMBER_OF_DESKTOPS
+        if let Ok(num_atom) = self.atom(b"_NET_NUMBER_OF_DESKTOPS") {
+            if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.root,
+                    num_atom,
+                    cardinal_atom,
+                    &[self.workspace_count as u32],
+                );
+            }
+        }
+
         self.switch_workspace(workspace)
     }
 
@@ -3820,6 +3955,20 @@ impl Aurora {
             self.conn.unmap_window(frame)?;
         }
         self.active_workspace = workspace;
+        
+        // Update EWMH _NET_CURRENT_DESKTOP
+        if let Ok(cur_atom) = self.atom(b"_NET_CURRENT_DESKTOP") {
+            if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.root,
+                    cur_atom,
+                    cardinal_atom,
+                    &[self.active_workspace as u32],
+                );
+            }
+        }
+
         for frame in shown_frames {
             self.conn.map_window(frame)?;
         }
@@ -4584,6 +4733,29 @@ impl Aurora {
             self.redraw_app_menu()?;
             return Ok(());
         }
+        if self.app_menu_more && x >= 270 && button == 1 {
+            let entries = read_desktop_entries();
+            let visible = 15usize;
+            let start = self.app_menu_scroll.min(entries.len().saturating_sub(1));
+            let mut cy_draw = 56;
+            let mut current = String::new();
+            for entry in entries.iter().skip(start).take(visible) {
+                if entry.category != current {
+                    current = entry.category.clone();
+                    cy_draw += 22;
+                }
+                if (cy_draw - 14..=cy_draw + 8).contains(&y) {
+                    self.spawn_configured_app(&entry.command, None);
+                    self.app_menu_visible = false;
+                    self.app_menu_more = false;
+                    self.app_menu_scroll = 0;
+                    self.conn.unmap_window(self.ui.app_menu)?;
+                    return Ok(());
+                }
+                cy_draw += 24;
+            }
+            return Ok(());
+        }
         let idx = (y - 53) / 42;
         if idx < 0 {
             return Ok(());
@@ -5188,10 +5360,10 @@ fn resize_edges_for_frame(info: &ClientInfo, title_h: u16, x: i16, y: i16) -> Op
     let edges = ResizeEdges {
         left: x <= RESIZE_EDGE,
         right: x >= width - RESIZE_EDGE,
-        top: y <= RESIZE_EDGE,
+        top: false,
         bottom: y >= frame_h - RESIZE_EDGE,
     };
-    (edges.left || edges.right || edges.top || edges.bottom).then_some(edges)
+    (edges.left || edges.right || edges.bottom).then_some(edges)
 }
 
 fn resize_edges_for_client(info: &ClientInfo, x: i16, y: i16) -> Option<ResizeEdges> {
@@ -5200,10 +5372,10 @@ fn resize_edges_for_client(info: &ClientInfo, x: i16, y: i16) -> Option<ResizeEd
     let edges = ResizeEdges {
         left: x <= RESIZE_EDGE,
         right: x >= width - RESIZE_EDGE,
-        top: y <= RESIZE_EDGE,
+        top: false,
         bottom: y >= height - RESIZE_EDGE,
     };
-    (edges.left || edges.right || edges.top || edges.bottom).then_some(edges)
+    (edges.left || edges.right || edges.bottom).then_some(edges)
 }
 
 fn client_uses_own_chrome(class: &str, title: &str) -> bool {
@@ -5460,61 +5632,122 @@ fn draw_arc(
     radius: i32,
     start_degrees: f32,
     end_degrees: f32,
-    steps: i32,
+    _steps: i32,
     thickness: i32,
     color: Color,
 ) {
-    let point = |degrees: f32| {
-        let radians = degrees.to_radians();
+    let r = radius as f32;
+    let t = thickness as f32;
+    let half_t = t / 2.0;
+
+    let margin = thickness + 3;
+    let x_min = (cx - radius - margin).max(0);
+    let x_max = (cx + radius + margin).min(i32::from(c.width));
+    let y_min = (cy - radius - margin).max(0);
+    let y_max = (cy + radius + margin).min(i32::from(c.height));
+
+    let get_end_point = |deg: f32| {
+        let rad = deg.to_radians();
         (
-            cx + (radians.cos() * radius as f32).round() as i32,
-            cy + (radians.sin() * radius as f32).round() as i32,
+            cx as f32 + rad.cos() * r,
+            cy as f32 + rad.sin() * r,
         )
     };
-    let mut previous = point(start_degrees);
-    for step in 1..=steps {
-        let degrees = start_degrees + (end_degrees - start_degrees) * step as f32 / steps as f32;
-        let current = point(degrees);
-        draw_round_line(
-            c, previous.0, previous.1, current.0, current.1, thickness, color,
-        );
-        previous = current;
+    let ep0 = get_end_point(start_degrees);
+    let ep1 = get_end_point(end_degrees);
+
+    for y in y_min..y_max {
+        for x in x_min..x_max {
+            let dx = x as f32 - cx as f32;
+            let dy = y as f32 - cy as f32;
+            let d_center = (dx * dx + dy * dy).sqrt();
+
+            let mut angle = dy.atan2(dx).to_degrees();
+            if angle < 0.0 {
+                angle += 360.0;
+            }
+
+            let in_angle_range = if start_degrees <= end_degrees {
+                angle >= start_degrees && angle <= end_degrees
+            } else {
+                angle >= start_degrees || angle <= end_degrees
+            };
+
+            let d = if in_angle_range {
+                (d_center - r).abs()
+            } else {
+                let d0 = ((x as f32 - ep0.0).powi(2) + (y as f32 - ep0.1).powi(2)).sqrt();
+                let d1 = ((x as f32 - ep1.0).powi(2) + (y as f32 - ep1.1).powi(2)).sqrt();
+                d0.min(d1)
+            };
+
+            let coverage = if d <= half_t - 0.5 {
+                1.0
+            } else if d >= half_t + 0.5 {
+                0.0
+            } else {
+                half_t + 0.5 - d
+            };
+
+            if coverage > 0.0 {
+                let mut blended = color;
+                blended.a = (color.a as f32 * coverage).round() as u8;
+                c.blend_pixel(x, y, blended);
+            }
+        }
     }
 }
 
 fn draw_sidebar_tile(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    if color == MINT_LIGHT {
+        return; // Transparent background in the topbar!
+    }
     c.draw_round_rect(
         cx - 13,
         cy - 13,
         26,
         26,
-        10,
-        Color::rgba(color.r, color.g, color.b, 30),
+        7,
+        Color::rgba(255, 255, 255, 180), // Sleek translucent white glass
     );
-    c.draw_circle(cx - 6, cy - 7, 3, Color::rgba(255, 255, 255, 34));
+    c.draw_round_rect(
+        cx - 14,
+        cy - 14,
+        28,
+        28,
+        8,
+        Color::rgba(220, 235, 245, 60), // Soft glass outer shadow/border
+    );
 }
 
 fn draw_sidebar_display_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    c.draw_round_rect(cx - 9, cy - 7, 18, 12, 4, color);
-    c.draw_round_rect(cx - 7, cy - 5, 14, 8, 3, Color::rgba(249, 255, 254, 205));
-    draw_round_line(c, cx, cy + 5, cx, cy + 8, 2, color);
-    draw_round_line(c, cx - 5, cy + 9, cx + 5, cy + 9, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+
+    // Monitor casing
+    c.draw_round_rect(cx - 9, cy - 7, 18, 14, 3, base_color);
+    // Inner bezel / screen
+    c.draw_round_rect(cx - 7, cy - 5, 14, 10, 2, accent_color);
 }
 
 fn draw_sidebar_wallpaper_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    c.draw_round_rect(
-        cx - 9,
-        cy - 8,
-        18,
-        16,
-        4,
-        Color::rgba(color.r, color.g, color.b, 62),
-    );
-    c.draw_circle(cx - 4, cy - 3, 2, Color::rgba(255, 255, 255, 205));
-    draw_round_line(c, cx - 7, cy + 5, cx - 2, cy, 2, color);
-    draw_round_line(c, cx - 2, cy, cx + 7, cy + 6, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+
+    // Frame
+    c.draw_round_rect(cx - 9, cy - 8, 18, 16, 3, base_color);
+    // Moon/Sun
+    c.draw_circle(cx + 4, cy - 4, 2, accent_color);
+    // Left mountain peak
+    draw_round_line(c, cx - 7, cy + 6, cx - 3, cy + 1, 2, if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(110, 125, 145) });
+    draw_round_line(c, cx - 3, cy + 1, cx + 1, cy + 6, 2, if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(110, 125, 145) });
+    // Right mountain peak
+    draw_round_line(c, cx - 2, cy + 6, cx + 3, cy - 1, 2, if is_topbar { Color::rgb(195, 228, 250) } else { Color::rgb(130, 145, 165) });
+    draw_round_line(c, cx + 3, cy - 1, cx + 7, cy + 6, 2, if is_topbar { Color::rgb(195, 228, 250) } else { Color::rgb(130, 145, 165) });
 }
 
 fn draw_sidebar_audio_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -5529,37 +5762,67 @@ fn draw_sidebar_network_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 
 fn draw_sidebar_bluetooth_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    draw_round_line(c, cx, cy - 9, cx, cy + 9, 2, color);
-    draw_round_line(c, cx, cy - 9, cx + 6, cy - 4, 2, color);
-    draw_round_line(c, cx + 6, cy - 4, cx - 5, cy + 5, 2, color);
-    draw_round_line(c, cx - 5, cy - 5, cx + 6, cy + 4, 2, color);
-    draw_round_line(c, cx + 6, cy + 4, cx, cy + 9, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+
+    // Spine
+    draw_round_line(c, cx - 4, cy - 8, cx - 4, cy + 8, 3, accent_color);
+    // Top filled triangle
+    for dx in 0..=8 {
+        let x = cx - 3 + dx;
+        let y0 = cy - 8 + dx / 2;
+        let y1 = cy - dx / 2;
+        draw_round_line(c, x, y0, x, y1, 2, base_color);
+    }
+    // Bottom filled triangle
+    for dx in 0..=8 {
+        let x = cx - 3 + dx;
+        let y0 = cy + dx / 2;
+        let y1 = cy + 8 - dx / 2;
+        draw_round_line(c, x, y0, x, y1, 2, base_color);
+    }
 }
 
 fn draw_sidebar_startup_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    c.draw_circle(cx, cy, 9, Color::rgba(color.r, color.g, color.b, 38));
-    draw_round_line(c, cx - 3, cy - 6, cx - 3, cy + 6, 2, color);
-    draw_round_line(c, cx - 3, cy - 6, cx + 6, cy, 2, color);
-    draw_round_line(c, cx + 6, cy, cx - 3, cy + 6, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+
+    // Filled right-pointing triangle using vertical slices
+    for dx in 0..=12 {
+        let x = cx - 6 + dx;
+        let half_h = (12 - dx) / 2;
+        draw_round_line(c, x, cy - half_h, x, cy + half_h, 2, base_color);
+    }
+    // Accent dot
+    c.draw_circle(cx + 5, cy + 7, 2, accent_color);
 }
 
 fn draw_sidebar_apps_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    for (x, y) in [
-        (cx - 8, cy - 8),
-        (cx + 2, cy - 8),
-        (cx - 8, cy + 2),
-        (cx + 2, cy + 2),
-    ] {
-        c.draw_round_rect(x, y, 6, 6, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+
+    // 2x2 grid of rounded squares
+    for row in 0..2 {
+        for col in 0..2 {
+            c.draw_round_rect(cx - 7 + col * 8, cy - 7 + row * 8, 6, 6, 2, base_color);
+        }
     }
 }
 
 fn draw_sidebar_about_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    c.draw_circle(cx, cy - 6, 2, color);
-    c.draw_round_rect(cx - 2, cy - 1, 4, 10, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+
+    // Vertical capsule
+    draw_round_line(c, cx, cy - 1, cx, cy + 7, 4, base_color);
+    // Floating teal dot
+    c.draw_circle(cx, cy - 7, 3, accent_color);
 }
 
 fn draw_dock_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32) {
@@ -5675,25 +5938,15 @@ fn draw_launcher_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32) {
     }
 }
 
-fn draw_folder_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_round_rect(
-        cx - 14,
-        cy - 7,
-        28,
-        18,
-        6,
-        Color::rgba(color.r, color.g, color.b, 44),
-    );
+fn draw_folder_icon(c: &mut Canvas, cx: i32, cy: i32, _color: Color) {
     c.draw_round_rect(
         cx - 12,
-        cy - 11,
-        12,
+        cy - 12,
+        24,
+        24,
         6,
-        4,
-        Color::rgba(color.r, color.g, color.b, 70),
+        Color::rgb(175, 218, 245), // Simple beautiful light blue square
     );
-    c.draw_round_rect(cx - 12, cy - 5, 24, 14, 5, Color::rgba(255, 255, 255, 104));
-    draw_round_line(c, cx - 9, cy + 8, cx + 9, cy + 8, 2, color);
 }
 
 fn draw_home_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -5792,22 +6045,68 @@ fn draw_gear_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 
 fn draw_power_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
-    draw_arc(c, cx, cy + 1, 8, -45.0, 225.0, 16, 2, color);
-    draw_round_line(c, cx, cy - 9, cx, cy, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+
+    // Horizontal battery outline
+    c.draw_round_rect(cx - 9, cy - 6, 16, 12, 3, base_color);
+    // Small tip on right
+    c.draw_round_rect(cx + 7, cy - 3, 2, 6, 1, base_color);
+    // Green charge bar on left
+    c.draw_round_rect(cx - 7, cy - 4, 4, 8, 1, accent_color);
 }
 
 fn draw_wifi_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    draw_arc(c, cx, cy + 4, 10, 218.0, 322.0, 10, 2, color);
-    draw_arc(c, cx, cy + 5, 6, 218.0, 322.0, 8, 2, color);
-    c.draw_circle(cx, cy + 6, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+
+    // Two concentric arcs centered at bottom dot (radii: 12 and 7, thickness: 3)
+    draw_arc(c, cx, cy + 6, 12, 220.0, 320.0, 10, 3, base_color);
+    draw_arc(c, cx, cy + 6, 7, 220.0, 320.0, 8, 3, base_color);
+    
+    // Bottom center dot
+    c.draw_circle(cx, cy + 6, 3, accent_color);
 }
 
 fn draw_speaker_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_round_rect(cx - 9, cy - 4, 5, 8, 2, color);
-    draw_round_line(c, cx - 4, cy - 4, cx + 1, cy - 8, 2, color);
-    draw_round_line(c, cx + 1, cy - 8, cx + 1, cy + 8, 2, color);
-    draw_round_line(c, cx + 1, cy + 8, cx - 4, cy + 4, 2, color);
-    draw_arc(c, cx + 1, cy, 7, -48.0, 48.0, 6, 2, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+
+    // Speaker flat base
+    c.draw_round_rect(cx - 10, cy - 3, 5, 6, 2, base_color);
+
+    // Flared cone in float distance space
+    let x_start = cx - 5;
+    let x_end = cx + 5;
+    let y_start = cy - 7;
+    let y_end = cy + 7;
+
+    for y in y_start..=y_end {
+        for x in x_start..=x_end {
+            let x_f = x as f32;
+            let y_f = y as f32;
+
+            // Top slope line: passes through (cx-5, cy-3) and (cx+5, cy-7)
+            let top_y = (cy - 3) as f32 - (x_f - (cx - 5) as f32) * (4.0 / 10.0);
+            // Bottom slope line: passes through (cx-5, cy+3) and (cx+5, cy+7)
+            let bottom_y = (cy + 3) as f32 + (x_f - (cx - 5) as f32) * (4.0 / 10.0);
+
+            let coverage_top = (y_f - top_y + 0.5).clamp(0.0, 1.0);
+            let coverage_bottom = (bottom_y - y_f + 0.5).clamp(0.0, 1.0);
+            let coverage_left = (x_f - (cx - 5) as f32 + 0.5).clamp(0.0, 1.0);
+            let coverage_right = ((cx + 5) as f32 - x_f + 0.5).clamp(0.0, 1.0);
+
+            let coverage = coverage_top * coverage_bottom * coverage_left * coverage_right;
+
+            if coverage > 0.0 {
+                let mut blended = base_color;
+                blended.a = (base_color.a as f32 * coverage).round() as u8;
+                c.blend_pixel(x, y, blended);
+            }
+        }
+    }
 }
 
 fn render_wallpaper_pixels(
