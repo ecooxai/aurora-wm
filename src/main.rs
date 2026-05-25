@@ -41,9 +41,10 @@ const SETTINGS_SIDEBAR_TOP: i32 = 26;
 const MEDIA_SLOT_COUNT: usize = 5;
 const MEDIA_WIDTH: u16 = 600;
 const RESIZE_EDGE: i16 = 10;
+const RESIZE_CORNER: i16 = 28;
 const FOLDER_HEADER_ICON: i32 = 30;
-const FOLDER_TERMINAL_COLS: usize = 58;
-const FOLDER_TERMINAL_ROWS: usize = 10;
+const FOLDER_TERMINAL_DEFAULT_COLS: usize = 90;
+const FOLDER_TERMINAL_DEFAULT_ROWS: usize = 18;
 const FOLDER_TERMINAL_CELL_W: i32 = 8;
 const FOLDER_TERMINAL_CELL_H: i32 = 18;
 const CSD_DRAG_TOP_HEIGHT: i16 = 44;
@@ -108,6 +109,13 @@ const DEFAULT_WORKSPACE_COUNT: usize = 2;
 const MAX_WORKSPACE_COUNT: usize = 8;
 const WORKSPACE_STRIDE: i32 = 27;
 const WORKSPACE_SIZE: i32 = 18;
+const FOLDER_DEFAULT_WIDTH: u16 = 330;
+const FOLDER_DEFAULT_HEIGHT: u16 = 420;
+const FOLDER_MIN_WIDTH: u16 = 260;
+const FOLDER_MIN_HEIGHT: u16 = 320;
+const TERMINAL_MIN_WIDTH: u16 = 260;
+const TERMINAL_MIN_HEIGHT: u16 = 120;
+const TERMINAL_DEFAULT_WIDTH: u16 = 760;
 
 #[derive(Clone)]
 struct Canvas {
@@ -617,6 +625,7 @@ struct UiWindows {
     settings: Window,
     folder: Window,
     folder_terminal: Window,
+    screenshot_overlay: Window,
     app_menu: Window,
     media: [Window; MEDIA_SLOT_COUNT],
 }
@@ -691,6 +700,29 @@ struct PendingResize {
 }
 
 #[derive(Clone, Copy)]
+enum UiResizeTarget {
+    Folder,
+    FolderTerminal,
+}
+
+#[derive(Clone, Copy)]
+struct PendingUiResize {
+    target: UiResizeTarget,
+    root_x: i16,
+    root_y: i16,
+    pressed_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct UiResizeState {
+    target: UiResizeTarget,
+    start_root_x: i16,
+    start_root_y: i16,
+    start_w: u16,
+    start_h: u16,
+}
+
+#[derive(Clone, Copy)]
 struct PendingClientDrag {
     client: Window,
     root_x: i16,
@@ -756,12 +788,102 @@ struct FolderTerminal {
     history: Vec<String>,
     scrollback: usize,
     screen: Vec<Vec<char>>,
+    cols: usize,
+    rows: usize,
     cursor_x: usize,
     cursor_y: usize,
     esc: String,
     line_drawing: bool,
     mouse_enabled: bool,
+    zoom: i8,
     dirty: bool,
+}
+
+struct WorkspaceUiState {
+    folder_mode: FolderMode,
+    folder_entries: Vec<FolderEntry>,
+    folder_path: PathBuf,
+    folder_selected: Option<PathBuf>,
+    folder_scroll: usize,
+    folder_front: bool,
+    folder_more_open: bool,
+    folder_sort_open: bool,
+    folder_sort: FolderSort,
+    folder_width: u16,
+    folder_height: u16,
+    folder_terminal_width: u16,
+    folder_terminal_height: u16,
+    folder_terminal: FolderTerminal,
+    media: Option<MediaState>,
+    media_slots: Vec<Option<MediaState>>,
+    media_front: bool,
+    media_front_slot: Option<usize>,
+    media_text_selection: Option<MediaTextSelection>,
+    media_text_selecting: bool,
+    media_text_selection_redraw_at: Option<Instant>,
+    media_text_live_rects: Vec<Rectangle>,
+    media_context_open: Option<(usize, i32, i32)>,
+    media_trash_prompt: Option<usize>,
+    folder_context_open: bool,
+    folder_context_pos: (i32, i32),
+    folder_clipboard: Option<(PathBuf, bool)>,
+    folder_info: Option<String>,
+    folder_terminal_selection: Option<TerminalSelection>,
+    folder_terminal_selecting: bool,
+    folder_terminal_live_rects: Vec<Rectangle>,
+    folder_drag: Option<PathBuf>,
+    folder_press: Option<FolderPress>,
+}
+
+impl WorkspaceUiState {
+    fn new() -> Self {
+        let folder_mode = FolderMode::Home;
+        let folder_sort = FolderSort::Name;
+        let folder_path = folder_path_for(folder_mode);
+        Self {
+            folder_mode,
+            folder_entries: folder_entries_in(folder_path.clone(), folder_sort),
+            folder_path: folder_path.clone(),
+            folder_selected: None,
+            folder_scroll: 0,
+            folder_front: false,
+            folder_more_open: false,
+            folder_sort_open: false,
+            folder_sort,
+            folder_width: FOLDER_DEFAULT_WIDTH,
+            folder_height: FOLDER_DEFAULT_HEIGHT,
+            folder_terminal_width: TERMINAL_DEFAULT_WIDTH,
+            folder_terminal_height: terminal_default_height_for(FOLDER_DEFAULT_HEIGHT, 900),
+            folder_terminal: FolderTerminal::new(folder_path),
+            media: None,
+            media_slots: vec![None; MEDIA_SLOT_COUNT],
+            media_front: false,
+            media_front_slot: None,
+            media_text_selection: None,
+            media_text_selecting: false,
+            media_text_selection_redraw_at: None,
+            media_text_live_rects: Vec::new(),
+            media_context_open: None,
+            media_trash_prompt: None,
+            folder_context_open: false,
+            folder_context_pos: (0, 0),
+            folder_clipboard: None,
+            folder_info: None,
+            folder_terminal_selection: None,
+            folder_terminal_selecting: false,
+            folder_terminal_live_rects: Vec::new(),
+            folder_drag: None,
+            folder_press: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalSelection {
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
 }
 
 impl FolderTerminal {
@@ -774,12 +896,15 @@ impl FolderTerminal {
             child_pid: None,
             history: Vec::new(),
             scrollback: 0,
-            screen: vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS],
+            screen: vec![vec![' '; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
+            cols: FOLDER_TERMINAL_DEFAULT_COLS,
+            rows: FOLDER_TERMINAL_DEFAULT_ROWS,
             cursor_x: 0,
             cursor_y: 0,
             esc: String::new(),
             line_drawing: false,
             mouse_enabled: false,
+            zoom: 0,
             dirty: true,
         }
     }
@@ -802,6 +927,7 @@ struct MediaState {
     text_scroll: usize,
     text_cursor_line: usize,
     text_cursor_col: usize,
+    text_undo: Vec<Vec<String>>,
     editing: bool,
     file_info: Option<String>,
     image_preview: Option<ImagePreview>,
@@ -812,6 +938,13 @@ struct MediaState {
 struct ScreenshotSelection {
     start_x: i16,
     start_y: i16,
+    current_x: i16,
+    current_y: i16,
+}
+
+#[derive(Clone, Copy)]
+struct PendingScreenshotButton {
+    pressed_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -926,9 +1059,12 @@ struct Aurora {
     clients: HashMap<Window, ClientInfo>,
     workspace_count: usize,
     active_workspace: usize,
+    workspace_ui: Vec<WorkspaceUiState>,
     active_client: Option<Window>,
     drag: Option<DragState>,
     pending_resize: Option<PendingResize>,
+    pending_ui_resize: Option<PendingUiResize>,
+    ui_resize: Option<UiResizeState>,
     pending_client_drag: Option<PendingClientDrag>,
     title_hover: Option<(Window, TitleButton)>,
     ignored_unmaps: Vec<Window>,
@@ -944,12 +1080,19 @@ struct Aurora {
     folder_more_open: bool,
     folder_sort_open: bool,
     folder_sort: FolderSort,
+    folder_width: u16,
+    folder_height: u16,
+    folder_terminal_width: u16,
+    folder_terminal_height: u16,
     folder_terminal: FolderTerminal,
     media: Option<MediaState>,
     media_slots: Vec<Option<MediaState>>,
     media_front: bool,
     media_front_slot: Option<usize>,
     media_text_selection: Option<MediaTextSelection>,
+    media_text_selecting: bool,
+    media_text_selection_redraw_at: Option<Instant>,
+    media_text_live_rects: Vec<Rectangle>,
     media_context_open: Option<(usize, i32, i32)>,
     media_trash_prompt: Option<usize>,
     app_menu_visible: bool,
@@ -959,6 +1102,9 @@ struct Aurora {
     folder_context_pos: (i32, i32),
     folder_clipboard: Option<(PathBuf, bool)>,
     folder_info: Option<String>,
+    folder_terminal_selection: Option<TerminalSelection>,
+    folder_terminal_selecting: bool,
+    folder_terminal_live_rects: Vec<Rectangle>,
     folder_drag: Option<PathBuf>,
     folder_press: Option<FolderPress>,
     xdnd_source: Option<Window>,
@@ -969,6 +1115,10 @@ struct Aurora {
     last_media_tick: Instant,
     screenshot_mode: bool,
     screenshot_selection: Option<ScreenshotSelection>,
+    screenshot_base: Option<ImagePreview>,
+    screenshot_live_rect: Option<(i16, i16, u16, u16)>,
+    pending_screenshot_button: Option<PendingScreenshotButton>,
+    topbar_notice: Option<(String, Instant)>,
 }
 
 fn main() {
@@ -1080,6 +1230,7 @@ impl Aurora {
             settings: conn.generate_id()?,
             folder: conn.generate_id()?,
             folder_terminal: conn.generate_id()?,
+            screenshot_overlay: conn.generate_id()?,
             app_menu: conn.generate_id()?,
             media: [
                 conn.generate_id()?,
@@ -1094,6 +1245,9 @@ impl Aurora {
         let (terminal_apps, browser_apps, photo_apps, video_apps) = discover_installed_apps();
         let display_modes =
             read_display_modes(&display, screen.width_in_pixels, screen.height_in_pixels);
+        let workspace_ui = (0..DEFAULT_WORKSPACE_COUNT)
+            .map(|_| WorkspaceUiState::new())
+            .collect();
         let mut app = Self {
             conn,
             display,
@@ -1124,9 +1278,12 @@ impl Aurora {
             clients: HashMap::new(),
             workspace_count: DEFAULT_WORKSPACE_COUNT,
             active_workspace: 0,
+            workspace_ui,
             active_client: None,
             drag: None,
             pending_resize: None,
+            pending_ui_resize: None,
+            ui_resize: None,
             pending_client_drag: None,
             title_hover: None,
             ignored_unmaps: Vec::new(),
@@ -1142,12 +1299,22 @@ impl Aurora {
             folder_more_open: false,
             folder_sort_open: false,
             folder_sort: FolderSort::Name,
+            folder_width: FOLDER_DEFAULT_WIDTH,
+            folder_height: FOLDER_DEFAULT_HEIGHT,
+            folder_terminal_width: TERMINAL_DEFAULT_WIDTH,
+            folder_terminal_height: terminal_default_height_for(
+                FOLDER_DEFAULT_HEIGHT,
+                screen.height_in_pixels,
+            ),
             folder_terminal: FolderTerminal::new(folder_path_for(FolderMode::Home)),
             media: None,
             media_slots: vec![None; MEDIA_SLOT_COUNT],
             media_front: false,
             media_front_slot: None,
             media_text_selection: None,
+            media_text_selecting: false,
+            media_text_selection_redraw_at: None,
+            media_text_live_rects: Vec::new(),
             media_context_open: None,
             media_trash_prompt: None,
             app_menu_visible: false,
@@ -1157,6 +1324,9 @@ impl Aurora {
             folder_context_pos: (0, 0),
             folder_clipboard: None,
             folder_info: None,
+            folder_terminal_selection: None,
+            folder_terminal_selecting: false,
+            folder_terminal_live_rects: Vec::new(),
             folder_drag: None,
             folder_press: None,
             xdnd_source: None,
@@ -1167,6 +1337,10 @@ impl Aurora {
             last_media_tick: Instant::now(),
             screenshot_mode: false,
             screenshot_selection: None,
+            screenshot_base: None,
+            screenshot_live_rect: None,
+            pending_screenshot_button: None,
+            topbar_notice: None,
         };
         app.create_ui_windows()?;
         Ok(app)
@@ -1200,9 +1374,12 @@ impl Aurora {
             if self.folder_terminal.visible && self.poll_folder_terminal()? {
                 handled_event = true;
             }
+            if self.folder_terminal.visible && self.sync_folder_to_terminal_cwd()? {
+                handled_event = true;
+            }
 
             if let Some(pending) = self.pending_resize {
-                if pending.pressed_at.elapsed() >= Duration::from_secs(2) {
+                if pending.pressed_at.elapsed() >= Duration::from_secs(1) {
                     self.pending_resize = None;
                     self.start_resize(
                         pending.client,
@@ -1210,6 +1387,13 @@ impl Aurora {
                         pending.root_y,
                         pending.edges,
                     )?;
+                }
+            }
+
+            if let Some(pending) = self.pending_ui_resize {
+                if pending.pressed_at.elapsed() >= Duration::from_secs(1) {
+                    self.pending_ui_resize = None;
+                    self.start_ui_resize(pending)?;
                 }
             }
 
@@ -1226,6 +1410,49 @@ impl Aurora {
                         self.start_drag(pending.client, pointer.root_x, pointer.root_y)?;
                     }
                 }
+            }
+            if self.drag.is_some() {
+                let pointer = self.conn.query_pointer(self.root)?.reply()?;
+                let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
+                if button_down {
+                    self.update_drag_position(pointer.root_x, pointer.root_y)?;
+                    handled_event = true;
+                } else {
+                    self.drag = None;
+                    let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+                }
+            }
+            if self.ui_resize.is_some() {
+                let pointer = self.conn.query_pointer(self.root)?.reply()?;
+                let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
+                if button_down {
+                    self.update_ui_resize(pointer.root_x, pointer.root_y)?;
+                    handled_event = true;
+                } else {
+                    self.end_drag()?;
+                }
+            }
+
+            if let Some(pending) = self.pending_screenshot_button {
+                let pointer = self.conn.query_pointer(self.root)?.reply()?;
+                let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
+                if button_down && pending.pressed_at.elapsed() >= Duration::from_secs(2) {
+                    self.pending_screenshot_button = None;
+                    self.capture_screenshot(None)?;
+                    handled_event = true;
+                } else if !button_down {
+                    self.pending_screenshot_button = None;
+                }
+            }
+
+            if self
+                .topbar_notice
+                .as_ref()
+                .is_some_and(|(_, until)| Instant::now() >= *until)
+            {
+                self.topbar_notice = None;
+                self.redraw_topbar()?;
+                handled_event = true;
             }
 
             if handled_event {
@@ -1271,7 +1498,7 @@ impl Aurora {
         self.grab_root_button1()?;
         let top_aux = CreateWindowAux::new()
             .override_redirect(1)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
+            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE)
             .cursor(self.cursor)
             .background_pixel(0);
         self.conn.create_window(
@@ -1362,7 +1589,13 @@ impl Aurora {
         let terminal = self.folder_terminal_geometry();
         let terminal_aux = CreateWindowAux::new()
             .override_redirect(1)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::KEY_PRESS)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::POINTER_MOTION
+                    | EventMask::KEY_PRESS,
+            )
             .cursor(self.cursor)
             .background_pixel(0);
         self.conn.create_window(
@@ -1377,6 +1610,30 @@ impl Aurora {
             WindowClass::INPUT_OUTPUT,
             self.visual,
             &terminal_aux,
+        )?;
+
+        let overlay_aux = CreateWindowAux::new()
+            .override_redirect(1)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::POINTER_MOTION,
+            )
+            .cursor(self.cursor)
+            .background_pixel(0);
+        self.conn.create_window(
+            self.depth,
+            self.ui.screenshot_overlay,
+            self.root,
+            0,
+            0,
+            self.screen_width,
+            self.screen_height,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual,
+            &overlay_aux,
         )?;
 
         let menu = self.app_menu_geometry();
@@ -1531,8 +1788,14 @@ impl Aurora {
             Event::KeyPress(ev) => self.handle_key_press(ev)?,
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
             Event::ButtonRelease(ev) => {
-                if self.screenshot_selection.is_some() {
+                if self.pending_screenshot_button.is_some() {
+                    self.handle_topbar_release(ev)?;
+                } else if self.screenshot_selection.is_some() {
                     self.finish_screenshot_selection(ev.root_x, ev.root_y)?;
+                } else if self.pending_ui_resize.is_some() || self.ui_resize.is_some() {
+                    self.end_drag()?;
+                } else if ev.event == self.ui.folder_terminal {
+                    self.handle_folder_terminal_release()?;
                 } else if ev.event == self.ui.folder {
                     self.handle_folder_release(ev)?;
                 } else if let Some(slot) = self.media_slot_for_window(ev.event) {
@@ -1594,6 +1857,8 @@ impl Aurora {
             self.redraw_folder()?;
         } else if ev.window == self.ui.folder_terminal && self.folder_terminal.visible {
             self.redraw_folder_terminal()?;
+        } else if ev.window == self.ui.screenshot_overlay && self.screenshot_mode {
+            self.redraw_screenshot_overlay()?;
         } else if ev.window == self.ui.app_menu && self.app_menu_visible {
             self.redraw_app_menu()?;
         } else if let Some(slot) = self.media_slot_for_window(ev.window) {
@@ -1619,8 +1884,11 @@ impl Aurora {
     }
 
     fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
-        if self.screenshot_mode && ev.event != self.ui.topbar {
+        if self.screenshot_mode && ev.detail == 1 {
             self.start_screenshot_selection(ev.root_x, ev.root_y)?;
+            if ev.event == self.root {
+                self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+            }
         } else if ev.event == self.ui.settings {
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_settings_scroll(ev.detail, i32::from(ev.event_x))?;
@@ -1644,6 +1912,17 @@ impl Aurora {
             self.settings_front = false;
             self.media_front = false;
             self.raise_ui()?;
+            if ev.detail == 1
+                && self.ui_bottom_right_resize_hit(UiResizeTarget::Folder, ev.event_x, ev.event_y)
+            {
+                self.pending_ui_resize = Some(PendingUiResize {
+                    target: UiResizeTarget::Folder,
+                    root_x: ev.root_x,
+                    root_y: ev.root_y,
+                    pressed_at: Instant::now(),
+                });
+                return Ok(());
+            }
             if ev.detail == 3 {
                 self.handle_folder_context(i32::from(ev.event_x), i32::from(ev.event_y))?;
             } else {
@@ -1665,6 +1944,21 @@ impl Aurora {
                 CURRENT_TIME,
             )?;
             self.raise_ui()?;
+            if ev.detail == 1
+                && self.ui_bottom_right_resize_hit(
+                    UiResizeTarget::FolderTerminal,
+                    ev.event_x,
+                    ev.event_y,
+                )
+            {
+                self.pending_ui_resize = Some(PendingUiResize {
+                    target: UiResizeTarget::FolderTerminal,
+                    root_x: ev.root_x,
+                    root_y: ev.root_y,
+                    pressed_at: Instant::now(),
+                });
+                return Ok(());
+            }
             self.handle_folder_terminal_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
             self.redraw_folder_terminal()?;
         } else if ev.event == self.ui.app_menu {
@@ -1689,27 +1983,7 @@ impl Aurora {
             )?;
         } else if ev.event == self.ui.topbar {
             let x = i32::from(ev.event_x);
-            let controls = self.topbar_controls();
-            let workspace = (0..self.workspace_count).find(|&index| {
-                (self.workspace_x(index)..=self.workspace_x(index) + WORKSPACE_SIZE).contains(&x)
-            });
-            if let Some(workspace) = workspace {
-                self.switch_workspace(workspace)?;
-            } else if (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE)
-                .contains(&x)
-            {
-                self.add_workspace()?;
-            } else if (controls.screenshot_x - 15..=controls.screenshot_x + 15).contains(&x) {
-                self.toggle_screenshot_mode()?;
-            } else if (controls.display_x - 15..=controls.display_x + 15).contains(&x) {
-                self.open_settings_tab(SettingsTab::Display)?;
-            } else if (controls.audio_x - 15..=controls.audio_x + 15).contains(&x) {
-                self.open_settings_tab(SettingsTab::Audio)?;
-            } else if (controls.network_x - 15..=controls.network_x + 15).contains(&x) {
-                self.open_settings_tab(SettingsTab::Network)?;
-            } else if (controls.battery_left..=controls.battery_right).contains(&x) {
-                self.open_settings_tab(SettingsTab::Power)?;
-            }
+            let _ = self.handle_topbar_press_x(x)?;
         } else if ev.event == self.root {
             self.handle_root_button_press(ev)?;
         } else if let Some(client) = self.client_or_ancestor_key_for(ev.event) {
@@ -1728,7 +2002,15 @@ impl Aurora {
     }
 
     fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<()> {
-        let Some(drag) = self.drag else {
+        if self.drag.is_none() {
+            if self.screenshot_mode {
+                if let Some(selection) = self.screenshot_selection.as_mut() {
+                    selection.current_x = ev.root_x;
+                    selection.current_y = ev.root_y;
+                    self.update_screenshot_live_rect()?;
+                }
+                return Ok(());
+            }
             if let Some(pending) = self.pending_client_drag {
                 let moved = (i32::from(ev.root_x) - i32::from(pending.root_x)).abs() > 4
                     || (i32::from(ev.root_y) - i32::from(pending.root_y)).abs() > 4;
@@ -1739,9 +2021,27 @@ impl Aurora {
                 }
             }
             if let Some(slot) = self.media_slot_for_window(ev.event) {
-                self.handle_media_motion(slot, i32::from(ev.event_x), i32::from(ev.event_y))?;
+                let button_down = u16::from(ev.state) & u16::from(KeyButMask::BUTTON1) != 0;
+                self.handle_media_motion(
+                    slot,
+                    i32::from(ev.event_x),
+                    i32::from(ev.event_y),
+                    button_down,
+                )?;
+            }
+            if ev.event == self.ui.folder_terminal {
+                let button_down = u16::from(ev.state) & u16::from(KeyButMask::BUTTON1) != 0;
+                self.handle_folder_terminal_motion(
+                    i32::from(ev.event_x),
+                    i32::from(ev.event_y),
+                    button_down,
+                )?;
             }
             if let Some(ref mut pending) = self.pending_resize {
+                pending.root_x = ev.root_x;
+                pending.root_y = ev.root_y;
+            }
+            if let Some(ref mut pending) = self.pending_ui_resize {
                 pending.root_x = ev.root_x;
                 pending.root_y = ev.root_y;
             }
@@ -1765,6 +2065,16 @@ impl Aurora {
                 }
             }
             return Ok(());
+        }
+        if self.ui_resize.is_some() {
+            return self.update_ui_resize(ev.root_x, ev.root_y);
+        }
+        self.update_drag_position(ev.root_x, ev.root_y)
+    }
+
+    fn update_drag_position(&mut self, root_x: i16, root_y: i16) -> AnyResult<()> {
+        let Some(drag) = self.drag else {
+            return Ok(());
         };
         let Some(mut info) = self.clients.get(&drag.client).copied() else {
             self.drag = None;
@@ -1772,8 +2082,8 @@ impl Aurora {
         };
         match drag.kind {
             DragKind::Move => {
-                info.x = ev.root_x.saturating_sub(drag.offset_x);
-                info.y = ev.root_y.saturating_sub(drag.offset_y);
+                info.x = root_x.saturating_sub(drag.offset_x);
+                info.y = root_y.saturating_sub(drag.offset_y);
                 if self
                     .clients
                     .get(&drag.client)
@@ -1789,8 +2099,8 @@ impl Aurora {
                 )?;
             }
             DragKind::Resize => {
-                let dx = i32::from(ev.root_x) - i32::from(drag.start_root_x);
-                let dy = i32::from(ev.root_y) - i32::from(drag.start_root_y);
+                let dx = i32::from(root_x) - i32::from(drag.start_root_x);
+                let dy = i32::from(root_y) - i32::from(drag.start_root_y);
                 let min_w = 180;
                 let min_h = 120;
                 let mut new_x = i32::from(drag.start_x);
@@ -2068,9 +2378,12 @@ impl Aurora {
             return Ok(());
         };
         self.focus_window_at(client, ev.time)?;
-        if let Some(edges) =
-            resize_edges_for_frame(&info, self.titlebar_height(&info), ev.event_x, ev.event_y)
-        {
+        if let Some(edges) = resize_corner_edges_for_frame(
+            &info,
+            self.titlebar_height(&info),
+            ev.event_x,
+            ev.event_y,
+        ) {
             self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.pending_resize = Some(PendingResize {
                 client,
@@ -2080,6 +2393,12 @@ impl Aurora {
                 pressed_at: Instant::now(),
             });
             return Ok(());
+        }
+        if resize_side_hint_for_frame(&info, ev.event_x) {
+            self.set_topbar_notice(
+                "Resize from the bottom-left or bottom-right corner: hold 1s, then drag",
+                Duration::from_secs(3),
+            )?;
         }
         let title_h = self.titlebar_height(&info);
         if title_h == 0 || ev.event_y >= i16::try_from(title_h).unwrap_or(i16::MAX) {
@@ -2110,7 +2429,7 @@ impl Aurora {
         let title_h = self.titlebar_height(&info) as i16;
         let client_x = ev.root_x.saturating_sub(info.x);
         let client_y = ev.root_y.saturating_sub(info.y).saturating_sub(title_h);
-        if let Some(edges) = resize_edges_for_client(&info, client_x, client_y) {
+        if let Some(edges) = resize_corner_edges_for_client(&info, client_x, client_y) {
             self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.pending_resize = Some(PendingResize {
                 client,
@@ -2120,6 +2439,12 @@ impl Aurora {
                 pressed_at: Instant::now(),
             });
         } else {
+            if resize_side_hint_for_client(&info, client_x) {
+                self.set_topbar_notice(
+                    "Resize from the bottom-left or bottom-right corner: hold 1s, then drag",
+                    Duration::from_secs(3),
+                )?;
+            }
             if !info.titlebar && ev.detail == 1 && client_y >= 0 && client_y <= CSD_DRAG_TOP_HEIGHT
             {
                 self.pending_client_drag = Some(PendingClientDrag {
@@ -2142,10 +2467,39 @@ impl Aurora {
             return Ok(());
         }
         let pointer = self.conn.query_pointer(self.root)?.reply()?;
+        if pointer.root_y >= 0
+            && pointer.root_y < TOPBAR_HEIGHT as i16
+            && self.handle_topbar_press_x(i32::from(pointer.root_x))?
+        {
+            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+            return Ok(());
+        }
         let target = pointer.child;
         if let Some(client) = self.client_or_ancestor_key_for(target) {
+            self.focus_window_at(client, ev.time)?;
             if let Some(info) = self.clients.get(&client).copied() {
                 let title_h = self.titlebar_height(&info) as i16;
+                let frame_x = pointer.root_x.saturating_sub(info.x);
+                let frame_y = pointer.root_y.saturating_sub(info.y);
+                if let Some(edges) =
+                    resize_corner_edges_for_frame(&info, title_h as u16, frame_x, frame_y)
+                {
+                    self.pending_resize = Some(PendingResize {
+                        client,
+                        root_x: pointer.root_x,
+                        root_y: pointer.root_y,
+                        edges,
+                        pressed_at: Instant::now(),
+                    });
+                    self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+                    return Ok(());
+                }
+                if resize_side_hint_for_frame(&info, frame_x) {
+                    self.set_topbar_notice(
+                        "Resize from the bottom-left or bottom-right corner: hold 1s, then drag",
+                        Duration::from_secs(3),
+                    )?;
+                }
                 let client_y = pointer
                     .root_y
                     .saturating_sub(info.y)
@@ -2162,6 +2516,38 @@ impl Aurora {
         }
         self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
         Ok(())
+    }
+
+    fn handle_topbar_press_x(&mut self, x: i32) -> AnyResult<bool> {
+        let controls = self.topbar_controls();
+        let workspace = (0..self.workspace_count).find(|&index| {
+            (self.workspace_x(index)..=self.workspace_x(index) + WORKSPACE_SIZE).contains(&x)
+        });
+        if let Some(workspace) = workspace {
+            self.switch_workspace(workspace)?;
+        } else if (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE).contains(&x) {
+            self.add_workspace()?;
+        } else if (controls.screenshot_x - 16..=controls.screenshot_x + 16).contains(&x) {
+            if self.screenshot_mode {
+                self.capture_screenshot(None)?;
+            } else {
+                self.pending_screenshot_button = Some(PendingScreenshotButton {
+                    pressed_at: Instant::now(),
+                });
+                self.toggle_screenshot_mode()?;
+            }
+        } else if (controls.display_x - 16..=controls.display_x + 16).contains(&x) {
+            self.open_settings_tab(SettingsTab::Display)?;
+        } else if (controls.audio_x - 16..=controls.audio_x + 16).contains(&x) {
+            self.open_settings_tab(SettingsTab::Audio)?;
+        } else if (controls.network_x - 16..=controls.network_x + 16).contains(&x) {
+            self.open_settings_tab(SettingsTab::Network)?;
+        } else if (controls.battery_left..=controls.battery_right).contains(&x) {
+            self.open_settings_tab(SettingsTab::Power)?;
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn grab_root_button1(&self) -> AnyResult<()> {
@@ -2188,66 +2574,6 @@ impl Aurora {
         Ok(())
     }
 
-    fn grab_client_tree_buttons(&self, window: Window) -> AnyResult<()> {
-        self.grab_client_buttons(window)?;
-        let Ok(reply) = self.conn.query_tree(window)?.reply() else {
-            return Ok(());
-        };
-        for child in reply.children {
-            let _ = self.grab_client_tree_buttons(child);
-        }
-        Ok(())
-    }
-
-    fn grab_client_buttons(&self, window: Window) -> AnyResult<()> {
-        let lock = u16::from(ModMask::LOCK);
-        let num_lock = u16::from(ModMask::M2);
-        let alt = u16::from(ModMask::M1);
-        let modifiers = [
-            0,
-            lock,
-            num_lock,
-            lock | num_lock,
-            alt,
-            alt | lock,
-            alt | num_lock,
-            alt | lock | num_lock,
-        ];
-        let buttons = [
-            ButtonIndex::M1,
-            ButtonIndex::M2,
-            ButtonIndex::M3,
-            ButtonIndex::M4,
-            ButtonIndex::M5,
-        ];
-
-        for modifier in modifiers {
-            for button in buttons {
-                let res = self
-                    .conn
-                    .grab_button(
-                        false,
-                        window,
-                        EventMask::BUTTON_PRESS,
-                        GrabMode::SYNC,
-                        GrabMode::ASYNC,
-                        x11rb::NONE,
-                        x11rb::NONE,
-                        button,
-                        ModMask::from(modifier),
-                    )?
-                    .check();
-                if let Err(ReplyError::X11Error(ref err)) = res {
-                    if err.error_kind == ErrorKind::Access {
-                        continue;
-                    }
-                }
-                res?;
-            }
-        }
-        Ok(())
-    }
-
     fn start_drag(&mut self, client: Window, root_x: i16, root_y: i16) -> AnyResult<()> {
         let Some(info) = self.clients.get(&client).copied() else {
             return Ok(());
@@ -2269,19 +2595,18 @@ impl Aurora {
         self.folder_front = false;
         self.media_front = false;
         self.focus_window(client)?;
-        let _ = self
-            .conn
-            .grab_pointer(
-                false,
-                self.root,
-                EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-                x11rb::NONE,
-                self.cursor,
-                CURRENT_TIME,
-            )?
-            .reply();
+        if let Ok(cookie) = self.conn.grab_pointer(
+            false,
+            self.root,
+            EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            self.cursor,
+            CURRENT_TIME,
+        ) {
+            let _ = cookie.reply();
+        }
         Ok(())
     }
 
@@ -2325,10 +2650,104 @@ impl Aurora {
         Ok(())
     }
 
+    fn start_ui_resize(&mut self, pending: PendingUiResize) -> AnyResult<()> {
+        let (start_w, start_h) = match pending.target {
+            UiResizeTarget::Folder => (self.folder_width, self.folder_height),
+            UiResizeTarget::FolderTerminal => {
+                (self.folder_terminal_width, self.folder_terminal_height)
+            }
+        };
+        self.ui_resize = Some(UiResizeState {
+            target: pending.target,
+            start_root_x: pending.root_x,
+            start_root_y: pending.root_y,
+            start_w,
+            start_h,
+        });
+        let _ = self
+            .conn
+            .grab_pointer(
+                false,
+                self.root,
+                EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                self.cursor,
+                CURRENT_TIME,
+            )?
+            .reply();
+        Ok(())
+    }
+
+    fn update_ui_resize(&mut self, root_x: i16, root_y: i16) -> AnyResult<()> {
+        let Some(resize) = self.ui_resize else {
+            return Ok(());
+        };
+        let dx = i32::from(root_x) - i32::from(resize.start_root_x);
+        let dy = i32::from(root_y) - i32::from(resize.start_root_y);
+        match resize.target {
+            UiResizeTarget::Folder => {
+                let max_w = self.screen_width.saturating_sub(48).max(FOLDER_MIN_WIDTH);
+                let max_h = self
+                    .screen_height
+                    .saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + 48)
+                    .max(FOLDER_MIN_HEIGHT);
+                self.folder_width = (i32::from(resize.start_w) + dx)
+                    .clamp(FOLDER_MIN_WIDTH.into(), max_w.into())
+                    as u16;
+                self.folder_height = (i32::from(resize.start_h) + dy)
+                    .clamp(FOLDER_MIN_HEIGHT.into(), max_h.into())
+                    as u16;
+                self.folder_terminal_width = self.folder_terminal_width.min(self.folder_width);
+            }
+            UiResizeTarget::FolderTerminal => {
+                let folder = self.folder_geometry();
+                let y = i32::from(folder.1) + i32::from(folder.3) + 8;
+                let max_h = i32::from(self.screen_height)
+                    .saturating_sub(y + 50)
+                    .max(i32::from(TERMINAL_MIN_HEIGHT)) as u16;
+                let max_w = self.screen_width.saturating_sub(48).max(TERMINAL_MIN_WIDTH);
+                self.folder_terminal_width = (i32::from(resize.start_w) + dx)
+                    .clamp(TERMINAL_MIN_WIDTH.into(), max_w.into())
+                    as u16;
+                self.folder_terminal_height = (i32::from(resize.start_h) + dy)
+                    .clamp(TERMINAL_MIN_HEIGHT.into(), max_h.into())
+                    as u16;
+            }
+        }
+        let folder = self.folder_geometry();
+        let terminal = self.folder_terminal_geometry();
+        self.conn.configure_window(
+            self.ui.folder,
+            &ConfigureWindowAux::new()
+                .width(u32::from(folder.2))
+                .height(u32::from(folder.3)),
+        )?;
+        self.conn.configure_window(
+            self.ui.folder_terminal,
+            &ConfigureWindowAux::new()
+                .x(i32::from(terminal.0))
+                .y(i32::from(terminal.1))
+                .width(u32::from(terminal.2))
+                .height(u32::from(terminal.3)),
+        )?;
+        self.sync_folder_terminal_size();
+        self.redraw_folder()?;
+        if self.folder_terminal.visible {
+            self.redraw_folder_terminal()?;
+        }
+        Ok(())
+    }
+
     fn end_drag(&mut self) -> AnyResult<()> {
         self.pending_resize = None;
+        self.pending_ui_resize = None;
+        self.ui_resize = None;
         if self.drag.take().is_some() {
             self.conn.ungrab_pointer(CURRENT_TIME)?;
+        } else {
+            let _ = self.conn.ungrab_pointer(CURRENT_TIME);
         }
         Ok(())
     }
@@ -2443,7 +2862,6 @@ impl Aurora {
                     | EventMask::BUTTON_RELEASE,
             ),
         )?;
-        self.grab_client_tree_buttons(window)?;
         self.conn.change_save_set(SetMode::INSERT, window)?;
         self.conn.configure_window(
             window,
@@ -2606,31 +3024,6 @@ impl Aurora {
         self.settings_front = false;
         self.folder_front = false;
         self.media_front = false;
-        if self.settings_visible {
-            self.conn.configure_window(
-                self.ui.settings,
-                &ConfigureWindowAux::new()
-                    .sibling(info.frame)
-                    .stack_mode(StackMode::BELOW),
-            )?;
-        }
-        self.conn.configure_window(
-            self.ui.folder,
-            &ConfigureWindowAux::new()
-                .sibling(info.frame)
-                .stack_mode(StackMode::BELOW),
-        )?;
-        for (idx, media_window) in self.ui.media.iter().copied().enumerate() {
-            if self.media_slots.get(idx).and_then(|m| m.as_ref()).is_none() {
-                continue;
-            }
-            self.conn.configure_window(
-                media_window,
-                &ConfigureWindowAux::new()
-                    .sibling(info.frame)
-                    .stack_mode(StackMode::BELOW),
-            )?;
-        }
         self.conn.configure_window(
             info.frame,
             &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
@@ -2641,6 +3034,9 @@ impl Aurora {
             }
         }
         self.redraw_frame_titlebar(client)?;
+        if previous_active != Some(client) {
+            self.redraw_dock()?;
+        }
         self.conn.configure_window(
             self.ui.dock,
             &ConfigureWindowAux::new()
@@ -2969,7 +3365,11 @@ impl Aurora {
         let add_x = self.add_workspace_x();
         draw_add_workspace_icon(&mut c, add_x, 20);
 
-        let clock = format_clock();
+        let clock = self
+            .topbar_notice
+            .as_ref()
+            .map(|(message, _)| message.clone())
+            .unwrap_or_else(format_clock);
         c.draw_text_center(
             &self.regular,
             &clock,
@@ -3048,6 +3448,9 @@ impl Aurora {
                 .and_then(|window| self.clients.get(window))
                 .copied()
             {
+                if self.active_client == Some(client.window) {
+                    c.draw_round_rect(icon_x, icon_y, 44, 44, 12, Color::rgba(32, 58, 68, 168));
+                }
                 let title = self.window_title(client.window);
                 if !self.paint_window_icon(&mut c, client.window, icon_x + 8, icon_y + 8, 28)
                     && !self.paint_desktop_icon(&mut c, client.window, icon_x + 8, icon_y + 8, 28)
@@ -3315,21 +3718,13 @@ impl Aurora {
             }
         }
         if let Some(info) = self.folder_info.as_ref() {
-            c.draw_round_rect(
-                16,
-                i32::from(h) - 64,
-                i32::from(w) - 32,
-                44,
-                10,
-                Color::rgba(250, 254, 255, 230),
-            );
             c.draw_text(
                 &self.regular,
                 &compact(info, 46),
                 28,
-                i32::from(h) - 49,
+                i32::from(h) - 24,
                 12.0,
-                INK,
+                MUTED,
             );
         }
         if self.folder_entries.len() > 9 {
@@ -3448,30 +3843,15 @@ impl Aurora {
         let Some(media) = self.media_slots.get(slot).and_then(|m| m.as_ref()) else {
             return Ok(());
         };
-        let (x, y, w, h) = self.media_geometry(slot);
-        let mut c = Canvas::from_wallpaper_crop(
-            &self.wallpaper_pixels,
-            self.screen_width,
-            i32::from(x),
-            i32::from(y),
-            w,
-            h,
-        );
+        let (_, _, w, h) = self.media_geometry(slot);
+        let mut c = Canvas::new(w, h, Color::rgb(247, 252, 255));
         c.draw_round_rect(
             0,
             0,
             i32::from(w),
             i32::from(h),
             18,
-            Color::rgba(247, 252, 255, 226),
-        );
-        c.draw_round_rect(
-            0,
-            0,
-            i32::from(w),
-            i32::from(h),
-            18,
-            Color::rgba(214, 229, 237, 70),
+            Color::rgb(247, 252, 255),
         );
         c.draw_text(
             &self.bold,
@@ -3527,14 +3907,12 @@ impl Aurora {
         let preview_y = 58;
         let preview_w = i32::from(w) - 48;
         let preview_h = i32::from(h) - 130;
-        c.draw_round_rect(
-            preview_x,
-            preview_y,
-            preview_w,
-            preview_h,
-            15,
-            Color::rgba(23, 34, 42, 24),
-        );
+        let preview_bg = if media.entry.kind == FileKind::Text {
+            Color::rgb(255, 255, 255)
+        } else {
+            Color::rgb(238, 247, 252)
+        };
+        c.draw_round_rect(preview_x, preview_y, preview_w, preview_h, 15, preview_bg);
         match media.entry.kind {
             FileKind::Text => {
                 self.draw_text_viewer(
@@ -3542,6 +3920,7 @@ impl Aurora {
                 );
             }
             FileKind::Image => {
+                let image_area_h = (preview_h - 34).max(80);
                 if let Some(preview) = media.image_preview.as_ref() {
                     paint_cached_image_preview(
                         &mut c,
@@ -3549,7 +3928,7 @@ impl Aurora {
                         preview_x + 8,
                         preview_y + 8,
                         preview_w - 16,
-                        preview_h - 16,
+                        image_area_h - 10,
                     );
                 } else {
                     paint_file_preview(
@@ -3558,20 +3937,22 @@ impl Aurora {
                         preview_x + 8,
                         preview_y + 8,
                         preview_w - 16,
-                        preview_h - 16,
+                        image_area_h - 10,
                     );
                 }
-                draw_image_info_overlay(
-                    &mut c,
+                c.draw_text(
                     &self.regular,
-                    &media.entry.path,
-                    preview_x + preview_w - 186,
-                    preview_y + 12,
-                    172,
-                    media
-                        .image_preview
-                        .as_ref()
-                        .and_then(|preview| preview.resolution),
+                    &image_info_line(
+                        &media.entry.path,
+                        media
+                            .image_preview
+                            .as_ref()
+                            .and_then(|preview| preview.resolution),
+                    ),
+                    preview_x + 12,
+                    preview_y + preview_h - 24,
+                    11.0,
+                    MUTED,
                 );
                 c.draw_round_rect(
                     preview_x,
@@ -3848,14 +4229,11 @@ impl Aurora {
                         line_len
                     };
                     if end_col > start_col {
-                        let before = line.chars().take(start_col).collect::<String>();
-                        let selected = line
-                            .chars()
-                            .skip(start_col)
-                            .take(end_col - start_col)
-                            .collect::<String>();
-                        let sx = text_x + measure_text(&self.regular, &before, 13.0);
-                        let sw = measure_text(&self.regular, &selected, 13.0).max(3);
+                        let sx =
+                            text_x + fast_text_width_cols(&self.regular, line, 0, start_col, 13.0);
+                        let sw =
+                            fast_text_width_cols(&self.regular, line, start_col, end_col, 13.0)
+                                .max(3);
                         c.draw_round_rect(sx, yy + 1, sw, 16, 4, Color::rgba(73, 156, 231, 70));
                     }
                 }
@@ -3873,14 +4251,29 @@ impl Aurora {
                     .get(cursor_line)
                     .map(String::as_str)
                     .unwrap_or("");
-                let prefix = line
-                    .chars()
-                    .take(media.text_cursor_col.min(line.chars().count()))
-                    .collect::<String>();
-                let cursor_x = text_x + measure_text(&self.regular, &prefix, 13.0);
+                let cursor_x = text_x
+                    + fast_text_width_cols(
+                        &self.regular,
+                        line,
+                        0,
+                        media.text_cursor_col.min(line.chars().count()),
+                        13.0,
+                    );
                 let cursor_y = y + 13 + visible_idx as i32 * line_h;
                 c.draw_rect(cursor_x, cursor_y, 2, 15, MINT_DARK);
             }
+        }
+        if self
+            .media_text_selection
+            .as_ref()
+            .filter(|selection| selection.slot == slot)
+            .is_some_and(|selection| {
+                !selected_text_from_lines(&media.text_lines, selection).is_empty()
+            })
+        {
+            let (bx, by, bw, bh) = media_text_copy_button_rect(x, y, w, h);
+            c.draw_round_rect(bx, by, bw, bh, 9, Color::rgba(116, 213, 198, 150));
+            draw_copy_icon(c, bx + bw / 2, by + bh / 2, MINT_DARK);
         }
     }
 
@@ -4570,12 +4963,140 @@ impl Aurora {
         );
     }
 
+    fn take_workspace_ui_state(&mut self) -> WorkspaceUiState {
+        WorkspaceUiState {
+            folder_mode: self.folder_mode,
+            folder_entries: std::mem::take(&mut self.folder_entries),
+            folder_path: std::mem::take(&mut self.folder_path),
+            folder_selected: self.folder_selected.take(),
+            folder_scroll: self.folder_scroll,
+            folder_front: self.folder_front,
+            folder_more_open: self.folder_more_open,
+            folder_sort_open: self.folder_sort_open,
+            folder_sort: self.folder_sort,
+            folder_width: self.folder_width,
+            folder_height: self.folder_height,
+            folder_terminal_width: self.folder_terminal_width,
+            folder_terminal_height: self.folder_terminal_height,
+            folder_terminal: std::mem::replace(
+                &mut self.folder_terminal,
+                FolderTerminal::new(folder_path_for(FolderMode::Home)),
+            ),
+            media: self.media.take(),
+            media_slots: std::mem::take(&mut self.media_slots),
+            media_front: self.media_front,
+            media_front_slot: self.media_front_slot,
+            media_text_selection: self.media_text_selection.take(),
+            media_text_selecting: self.media_text_selecting,
+            media_text_selection_redraw_at: self.media_text_selection_redraw_at.take(),
+            media_text_live_rects: std::mem::take(&mut self.media_text_live_rects),
+            media_context_open: self.media_context_open,
+            media_trash_prompt: self.media_trash_prompt,
+            folder_context_open: self.folder_context_open,
+            folder_context_pos: self.folder_context_pos,
+            folder_clipboard: self.folder_clipboard.take(),
+            folder_info: self.folder_info.take(),
+            folder_terminal_selection: self.folder_terminal_selection.take(),
+            folder_terminal_selecting: self.folder_terminal_selecting,
+            folder_terminal_live_rects: std::mem::take(&mut self.folder_terminal_live_rects),
+            folder_drag: self.folder_drag.take(),
+            folder_press: self.folder_press.take(),
+        }
+    }
+
+    fn apply_workspace_ui_state(&mut self, state: WorkspaceUiState) {
+        self.folder_mode = state.folder_mode;
+        self.folder_entries = state.folder_entries;
+        self.folder_path = state.folder_path;
+        self.folder_selected = state.folder_selected;
+        self.folder_scroll = state.folder_scroll;
+        self.folder_front = state.folder_front;
+        self.folder_more_open = state.folder_more_open;
+        self.folder_sort_open = state.folder_sort_open;
+        self.folder_sort = state.folder_sort;
+        self.folder_width = state.folder_width;
+        self.folder_height = state.folder_height;
+        self.folder_terminal_width = state.folder_terminal_width;
+        self.folder_terminal_height = state.folder_terminal_height;
+        self.folder_terminal = state.folder_terminal;
+        self.media = state.media;
+        self.media_slots = state.media_slots;
+        self.media_front = state.media_front;
+        self.media_front_slot = state.media_front_slot;
+        self.media_text_selection = state.media_text_selection;
+        self.media_text_selecting = state.media_text_selecting;
+        self.media_text_selection_redraw_at = state.media_text_selection_redraw_at;
+        self.media_text_live_rects = state.media_text_live_rects;
+        self.media_context_open = state.media_context_open;
+        self.media_trash_prompt = state.media_trash_prompt;
+        self.folder_context_open = state.folder_context_open;
+        self.folder_context_pos = state.folder_context_pos;
+        self.folder_clipboard = state.folder_clipboard;
+        self.folder_info = state.folder_info;
+        self.folder_terminal_selection = state.folder_terminal_selection;
+        self.folder_terminal_selecting = state.folder_terminal_selecting;
+        self.folder_terminal_live_rects = state.folder_terminal_live_rects;
+        self.folder_drag = state.folder_drag;
+        self.folder_press = state.folder_press;
+    }
+
+    fn restore_workspace_ui_windows(&mut self) -> AnyResult<()> {
+        let folder = self.folder_geometry();
+        let terminal = self.folder_terminal_geometry();
+        self.conn.configure_window(
+            self.ui.folder,
+            &ConfigureWindowAux::new()
+                .x(i32::from(folder.0))
+                .y(i32::from(folder.1))
+                .width(u32::from(folder.2))
+                .height(u32::from(folder.3)),
+        )?;
+        self.conn.configure_window(
+            self.ui.folder_terminal,
+            &ConfigureWindowAux::new()
+                .x(i32::from(terminal.0))
+                .y(i32::from(terminal.1))
+                .width(u32::from(terminal.2))
+                .height(u32::from(terminal.3)),
+        )?;
+        self.sync_folder_terminal_size();
+        self.conn.map_window(self.ui.folder)?;
+        if self.folder_terminal.visible {
+            self.conn.map_window(self.ui.folder_terminal)?;
+        } else {
+            self.conn.unmap_window(self.ui.folder_terminal)?;
+        }
+        for (idx, window) in self.ui.media.iter().copied().enumerate() {
+            if self.media_slots.get(idx).and_then(|m| m.as_ref()).is_some() {
+                self.conn.map_window(window)?;
+            } else {
+                self.conn.unmap_window(window)?;
+            }
+        }
+        self.redraw_folder()?;
+        if self.folder_terminal.visible {
+            self.redraw_folder_terminal()?;
+        }
+        for slot in 0..MEDIA_SLOT_COUNT {
+            if self
+                .media_slots
+                .get(slot)
+                .and_then(|m| m.as_ref())
+                .is_some()
+            {
+                self.redraw_media_slot(slot)?;
+            }
+        }
+        Ok(())
+    }
+
     fn add_workspace(&mut self) -> AnyResult<()> {
         if self.workspace_count >= MAX_WORKSPACE_COUNT {
             return Ok(());
         }
         let workspace = self.workspace_count;
         self.workspace_count += 1;
+        self.workspace_ui.push(WorkspaceUiState::new());
 
         // Update EWMH _NET_NUMBER_OF_DESKTOPS
         if let Ok(num_atom) = self.atom(b"_NET_NUMBER_OF_DESKTOPS") {
@@ -4615,6 +5136,15 @@ impl Aurora {
             self.ignored_unmaps.push(frame);
             self.conn.unmap_window(frame)?;
         }
+        while self.workspace_ui.len() <= workspace {
+            self.workspace_ui.push(WorkspaceUiState::new());
+        }
+        let previous_ui = self.take_workspace_ui_state();
+        if let Some(slot) = self.workspace_ui.get_mut(previous) {
+            *slot = previous_ui;
+        }
+        let next_ui = std::mem::replace(&mut self.workspace_ui[workspace], WorkspaceUiState::new());
+        self.apply_workspace_ui_state(next_ui);
         self.active_workspace = workspace;
 
         // Update EWMH _NET_CURRENT_DESKTOP
@@ -4634,8 +5164,10 @@ impl Aurora {
             self.conn.map_window(frame)?;
         }
         self.dock_last_click = None;
+        self.active_client = None;
         self.conn
             .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+        self.restore_workspace_ui_windows()?;
         self.redraw_topbar()?;
         self.redraw_dock()?;
         self.raise_ui()
@@ -5146,13 +5678,14 @@ impl Aurora {
             }
         }
         self.folder_more_open = false;
-        self.folder_info = None;
         if y < 86 {
+            self.folder_info = None;
             self.redraw_folder()?;
             return Ok(());
         }
         let idx = (y - 86) / 42;
         if !(0..9).contains(&idx) {
+            self.folder_info = None;
             self.redraw_folder()?;
             return Ok(());
         }
@@ -5173,6 +5706,7 @@ impl Aurora {
         match entry.kind {
             FileKind::Directory => {
                 self.folder_selected = Some(entry.path.clone());
+                self.folder_info = Some(folder_entry_info(&entry));
                 self.redraw_folder()?;
             }
             FileKind::Text
@@ -5184,6 +5718,7 @@ impl Aurora {
                     self.open_media(entry)?;
                 } else {
                     self.folder_selected = Some(entry.path.clone());
+                    self.folder_info = Some(folder_entry_info(&entry));
                     self.redraw_folder()?;
                 }
             }
@@ -5203,7 +5738,10 @@ impl Aurora {
                 || (i32::from(ev.root_y) - i32::from(press.root_y)).abs() > 6
         });
         if target == self.ui.folder && !moved {
-            if let Some(press) = press {
+            if let Some(press) = press.filter(|press| {
+                press.entry.kind == FileKind::Directory
+                    || self.folder_selected.as_ref() != Some(&press.entry.path)
+            }) {
                 self.activate_folder_entry(press.entry)?;
             }
             return Ok(());
@@ -5276,6 +5814,7 @@ impl Aurora {
                 self.folder_path = entry.path.clone();
                 self.folder_entries = folder_entries_in(entry.path, self.folder_sort);
                 self.folder_selected = None;
+                self.folder_info = None;
                 self.folder_scroll = 0;
                 self.sync_folder_terminal_cwd();
                 self.redraw_folder()?;
@@ -5292,6 +5831,7 @@ impl Aurora {
                     self.open_media(entry)?;
                 } else {
                     self.folder_selected = Some(entry.path.clone());
+                    self.folder_info = Some(folder_entry_info(&entry));
                     self.redraw_folder()?;
                 }
             }
@@ -5365,6 +5905,48 @@ impl Aurora {
         }
     }
 
+    fn sync_folder_to_terminal_cwd(&mut self) -> AnyResult<bool> {
+        let Some(pid) = self.folder_terminal.child_pid else {
+            return Ok(false);
+        };
+        let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) else {
+            return Ok(false);
+        };
+        if cwd == self.folder_terminal.cwd && cwd == self.folder_path {
+            return Ok(false);
+        }
+        self.folder_terminal.cwd = cwd.clone();
+        if cwd == self.folder_path || !cwd.is_dir() {
+            if self.folder_terminal.visible {
+                self.redraw_folder_terminal()?;
+            }
+            return Ok(false);
+        }
+        self.folder_mode = FolderMode::Home;
+        self.folder_path = cwd;
+        self.folder_entries = folder_entries_in(self.folder_path.clone(), self.folder_sort);
+        self.folder_selected = None;
+        self.folder_scroll = 0;
+        self.folder_more_open = false;
+        self.folder_sort_open = false;
+        self.redraw_folder()?;
+        if self.folder_terminal.visible {
+            self.redraw_folder_terminal()?;
+        }
+        Ok(true)
+    }
+
+    fn set_topbar_notice(&mut self, message: &str, duration: Duration) -> AnyResult<()> {
+        self.topbar_notice = Some((message.to_string(), Instant::now() + duration));
+        self.redraw_topbar()?;
+        Ok(())
+    }
+
+    fn handle_topbar_release(&mut self, _ev: ButtonReleaseEvent) -> AnyResult<()> {
+        self.pending_screenshot_button = None;
+        Ok(())
+    }
+
     fn toggle_folder_terminal(&mut self) -> AnyResult<()> {
         self.folder_terminal.visible = !self.folder_terminal.visible;
         self.folder_terminal.focused = self.folder_terminal.visible;
@@ -5404,20 +5986,34 @@ impl Aurora {
         } else {
             self.screenshot_mode = true;
             self.screenshot_selection = None;
-            self.folder_info = Some(
-                "Screenshot: drag a rectangle, or click camera again for full screen".to_string(),
-            );
-            self.folder_front = true;
-            self.redraw_folder()?;
+            self.screenshot_base = capture_screen_preview(&self.display);
+            self.set_topbar_notice(
+                "Drag to pick area. Hold camera 2s for full screen.",
+                Duration::from_secs(4),
+            )?;
+            self.conn.configure_window(
+                self.ui.screenshot_overlay,
+                &ConfigureWindowAux::new()
+                    .x(0)
+                    .y(0)
+                    .width(u32::from(self.screen_width))
+                    .height(u32::from(self.screen_height))
+                    .stack_mode(StackMode::ABOVE),
+            )?;
+            self.conn.map_window(self.ui.screenshot_overlay)?;
+            self.redraw_screenshot_overlay()?;
             self.raise_ui()?;
         }
         Ok(())
     }
 
     fn start_screenshot_selection(&mut self, root_x: i16, root_y: i16) -> AnyResult<()> {
+        self.erase_screenshot_live_rect()?;
         self.screenshot_selection = Some(ScreenshotSelection {
             start_x: root_x,
             start_y: root_y,
+            current_x: root_x,
+            current_y: root_y,
         });
         let _ = self
             .conn
@@ -5432,10 +6028,12 @@ impl Aurora {
                 CURRENT_TIME,
             )?
             .reply();
+        self.update_screenshot_live_rect()?;
         Ok(())
     }
 
     fn finish_screenshot_selection(&mut self, root_x: i16, root_y: i16) -> AnyResult<()> {
+        self.erase_screenshot_live_rect()?;
         let Some(selection) = self.screenshot_selection.take() else {
             return Ok(());
         };
@@ -5452,16 +6050,60 @@ impl Aurora {
             self.capture_screenshot(Some((x1, y1, x2 - x1, y2 - y1)))?;
         } else {
             self.screenshot_mode = false;
-            self.folder_info = Some("Screenshot cancelled".to_string());
-            self.redraw_folder()?;
+            self.screenshot_base = None;
+            self.conn.unmap_window(self.ui.screenshot_overlay)?;
+            self.set_topbar_notice("Screenshot cancelled", Duration::from_secs(2))?;
         }
+        Ok(())
+    }
+
+    fn erase_screenshot_live_rect(&mut self) -> AnyResult<()> {
+        if let Some((x, y, w, h)) = self.screenshot_live_rect.take() {
+            let rects = selection_border_rects(x, y, w, h);
+            self.draw_xor_rects(self.ui.screenshot_overlay, &rects)?;
+        }
+        Ok(())
+    }
+
+    fn update_screenshot_live_rect(&mut self) -> AnyResult<()> {
+        let Some(selection) = self.screenshot_selection else {
+            return Ok(());
+        };
+        let x1 = i32::from(selection.start_x)
+            .min(i32::from(selection.current_x))
+            .max(0);
+        let y1 = i32::from(selection.start_y)
+            .min(i32::from(selection.current_y))
+            .max(0);
+        let x2 = i32::from(selection.start_x)
+            .max(i32::from(selection.current_x))
+            .min(i32::from(self.screen_width));
+        let y2 = i32::from(selection.start_y)
+            .max(i32::from(selection.current_y))
+            .min(i32::from(self.screen_height));
+        let w = (x2 - x1).max(10) as u16;
+        let h = (y2 - y1).max(10) as u16;
+        let x = (x1.min(i32::from(self.screen_width.saturating_sub(w)))) as i16;
+        let y = (y1.min(i32::from(self.screen_height.saturating_sub(h)))) as i16;
+        let next = (x, y, w, h);
+        if self.screenshot_live_rect == Some(next) {
+            return Ok(());
+        }
+        self.erase_screenshot_live_rect()?;
+        self.screenshot_live_rect = Some(next);
+        let rects = selection_border_rects(x, y, w, h);
+        self.draw_xor_rects(self.ui.screenshot_overlay, &rects)?;
         Ok(())
     }
 
     fn capture_screenshot(&mut self, rect: Option<(i32, i32, i32, i32)>) -> AnyResult<()> {
         self.screenshot_mode = false;
         self.screenshot_selection = None;
+        self.screenshot_base = None;
+        self.screenshot_live_rect = None;
         let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+        self.conn.unmap_window(self.ui.screenshot_overlay)?;
+        self.conn.flush()?;
         let desktop = home_dir().join("Desktop");
         let _ = fs::create_dir_all(&desktop);
         let path = desktop.join(format!(
@@ -5475,20 +6117,14 @@ impl Aurora {
         }
         let ok = cmd.arg(&path).status().is_ok_and(|status| status.success());
         if !ok {
-            self.folder_info = Some("Screenshot failed".to_string());
-            self.redraw_folder()?;
+            self.set_topbar_notice("Screenshot failed", Duration::from_secs(3))?;
             return Ok(());
         }
         copy_image_to_clipboard(&path);
-        self.folder_mode = FolderMode::Home;
-        self.folder_path = desktop;
-        self.folder_entries = folder_entries_in(self.folder_path.clone(), self.folder_sort);
-        self.folder_selected = Some(path.clone());
-        self.folder_scroll = 0;
-        self.folder_front = true;
-        self.folder_info = Some("Screenshot saved and copied to clipboard".to_string());
-        self.sync_folder_terminal_cwd();
-        self.redraw_folder()?;
+        self.set_topbar_notice(
+            "Screenshot saved and copied to clipboard",
+            Duration::from_secs(3),
+        )?;
         self.open_media(FolderEntry {
             name: path
                 .file_name()
@@ -5503,6 +6139,61 @@ impl Aurora {
         }
         self.redraw_media_slot(0)?;
         Ok(())
+    }
+
+    fn redraw_screenshot_overlay(&self) -> AnyResult<()> {
+        let mut c = self
+            .screenshot_base
+            .as_ref()
+            .map(|preview| canvas_from_preview(preview, self.screen_width, self.screen_height))
+            .unwrap_or_else(|| {
+                Canvas::from_wallpaper_crop(
+                    &self.wallpaper_pixels,
+                    self.screen_width,
+                    0,
+                    0,
+                    self.screen_width,
+                    self.screen_height,
+                )
+            });
+        c.draw_rect(
+            0,
+            0,
+            i32::from(self.screen_width),
+            i32::from(self.screen_height),
+            Color::rgba(0, 0, 0, 128),
+        );
+        if let Some(selection) = self.screenshot_selection {
+            let x1 = i32::from(selection.start_x)
+                .min(i32::from(selection.current_x))
+                .max(0);
+            let y1 = i32::from(selection.start_y)
+                .min(i32::from(selection.current_y))
+                .max(0);
+            let x2 = i32::from(selection.start_x)
+                .max(i32::from(selection.current_x))
+                .min(i32::from(self.screen_width));
+            let y2 = i32::from(selection.start_y)
+                .max(i32::from(selection.current_y))
+                .min(i32::from(self.screen_height));
+            let w = x2 - x1;
+            let h = y2 - y1;
+            if w > 0 && h > 0 {
+                if let Some(base) = self.screenshot_base.as_ref() {
+                    paint_preview_region(&mut c, base, x1, y1, w, h);
+                }
+                c.draw_rect(x1, y1, w, 2, MINT_LIGHT);
+                c.draw_rect(x1, y2 - 2, w, 2, MINT_LIGHT);
+                c.draw_rect(x1, y1, 2, h, MINT_LIGHT);
+                c.draw_rect(x2 - 2, y1, 2, h, MINT_LIGHT);
+            } else {
+                c.draw_rect(x1 - 5, y1 - 5, 10, 2, MINT_LIGHT);
+                c.draw_rect(x1 - 5, y1 + 4, 10, 2, MINT_LIGHT);
+                c.draw_rect(x1 - 5, y1 - 5, 2, 10, MINT_LIGHT);
+                c.draw_rect(x1 + 4, y1 - 5, 2, 10, MINT_LIGHT);
+            }
+        }
+        self.upload_canvas(self.ui.screenshot_overlay, &c)
     }
 
     fn redraw_folder_terminal(&self) -> AnyResult<()> {
@@ -5547,34 +6238,48 @@ impl Aurora {
             1,
             Color::rgba(178, 202, 214, 100),
         );
-        let visible_rows = ((i32::from(h) - 56) / FOLDER_TERMINAL_CELL_H)
-            .max(1)
-            .min(FOLDER_TERMINAL_ROWS as i32) as usize;
+        let font_size = self.folder_terminal_font_size();
+        let cell_h = self.folder_terminal_cell_h();
+        let cols = self.folder_terminal.cols;
+        let rows_count = self.folder_terminal.rows;
+        let visible_rows = ((i32::from(h) - 56) / cell_h).max(1).min(rows_count as i32) as usize;
         let rows = self.folder_terminal_display_rows(visible_rows);
+        if let Some(selection) = self.folder_terminal_selection {
+            for rect in
+                terminal_selection_rects(selection, &rows, self.folder_terminal_cell_w(), cell_h)
+            {
+                c.draw_round_rect(
+                    i32::from(rect.x),
+                    i32::from(rect.y),
+                    i32::from(rect.width),
+                    i32::from(rect.height),
+                    3,
+                    Color::rgba(175, 229, 245, 92),
+                );
+            }
+        }
         for (idx, row) in rows.iter().enumerate() {
-            let y = 52 + idx as i32 * FOLDER_TERMINAL_CELL_H;
-            let shown = row.chars().take(FOLDER_TERMINAL_COLS).collect::<String>();
+            let y = 52 + idx as i32 * cell_h;
+            let shown = row.chars().take(cols).collect::<String>();
             let trimmed = shown.trim_end();
             if !trimmed.is_empty() {
-                c.draw_text(&self.regular, trimmed, 18, y, 13.0, INK);
+                c.draw_text(&self.regular, trimmed, 18, y, font_size, INK);
             }
         }
         if self.folder_terminal.focused {
             let row = self
                 .folder_terminal
                 .screen
-                .get(self.folder_terminal.cursor_y.min(FOLDER_TERMINAL_ROWS - 1))
+                .get(self.folder_terminal.cursor_y.min(rows_count - 1))
                 .map(|line| line.iter().collect::<String>())
                 .unwrap_or_default();
             let prefix = row
                 .chars()
-                .take(self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1))
+                .take(self.folder_terminal.cursor_x.min(cols - 1))
                 .collect::<String>();
-            let cursor_x = 18 + measure_text(&self.regular, &prefix, 13.0);
-            let cursor_y = 53
-                + self.folder_terminal.cursor_y.min(FOLDER_TERMINAL_ROWS - 1) as i32
-                    * FOLDER_TERMINAL_CELL_H;
-            c.draw_rect(cursor_x, cursor_y, 2, 14, MINT_DARK);
+            let cursor_x = 18 + measure_text(&self.regular, &prefix, font_size);
+            let cursor_y = 53 + self.folder_terminal.cursor_y.min(rows_count - 1) as i32 * cell_h;
+            c.draw_rect(cursor_x, cursor_y, 2, (font_size + 1.0) as i32, MINT_DARK);
         }
         self.upload_canvas(self.ui.folder_terminal, &c)
     }
@@ -5599,6 +6304,18 @@ impl Aurora {
         rows
     }
 
+    fn folder_terminal_font_size(&self) -> f32 {
+        13.0 + f32::from(self.folder_terminal.zoom)
+    }
+
+    fn folder_terminal_cell_w(&self) -> i32 {
+        (FOLDER_TERMINAL_CELL_W + i32::from(self.folder_terminal.zoom)).max(6)
+    }
+
+    fn folder_terminal_cell_h(&self) -> i32 {
+        (FOLDER_TERMINAL_CELL_H + i32::from(self.folder_terminal.zoom) * 2).max(12)
+    }
+
     fn handle_folder_terminal_key(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
         let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
         let shifted = u16::from(ev.state) & u16::from(KeyButMask::SHIFT) != 0;
@@ -5612,6 +6329,38 @@ impl Aurora {
         let Some(&keysym) = mapping.keysyms.get(column) else {
             return Ok(());
         };
+        let base_keysym = mapping.keysyms.first().copied().unwrap_or(keysym);
+        if controlled && shifted && matches!(base_keysym, 0x3d | 0x2b) {
+            self.folder_terminal.zoom = (self.folder_terminal.zoom + 1).min(8);
+            self.sync_folder_terminal_size();
+            self.folder_terminal.dirty = true;
+            self.redraw_folder_terminal()?;
+            return Ok(());
+        }
+        if controlled && shifted && matches!(base_keysym, 0x2d | 0x5f) {
+            self.folder_terminal.zoom = (self.folder_terminal.zoom - 1).max(-4);
+            self.sync_folder_terminal_size();
+            self.folder_terminal.dirty = true;
+            self.redraw_folder_terminal()?;
+            return Ok(());
+        }
+        if controlled && matches!(base_keysym, 0x76 | 0x56) {
+            if let Some(text) = read_text_clipboard() {
+                self.folder_terminal.scrollback = 0;
+                self.write_folder_terminal(text.as_bytes());
+            }
+            return Ok(());
+        }
+        if controlled && shifted && matches!(base_keysym, 0x63 | 0x43) {
+            if let Some(selection) = self.folder_terminal_selection {
+                let rows = self.folder_terminal_display_rows(self.folder_terminal.rows);
+                let text = selected_terminal_text(selection, &rows);
+                if !text.is_empty() {
+                    copy_text_to_clipboard(&text);
+                }
+            }
+            return Ok(());
+        }
         let mut bytes = match keysym {
             0xff08 => b"\x7f".to_vec(),
             0xff09 => b"\t".to_vec(),
@@ -5649,13 +6398,33 @@ impl Aurora {
     }
 
     fn handle_folder_terminal_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        if y >= 52 && !self.folder_terminal.mouse_enabled {
+            let (row, col) = terminal_point_to_cell(
+                x,
+                y,
+                self.folder_terminal_cell_w(),
+                self.folder_terminal_cell_h(),
+                self.folder_terminal.cols,
+                self.folder_terminal.rows,
+            );
+            self.folder_terminal_selection = Some(TerminalSelection {
+                start_row: row,
+                start_col: col,
+                end_row: row,
+                end_col: col,
+            });
+            self.folder_terminal_selecting = true;
+            self.folder_terminal_live_rects.clear();
+            self.update_folder_terminal_live_selection()?;
+            return Ok(());
+        }
         if y < 44 || !self.folder_terminal.mouse_enabled {
             return Ok(());
         }
-        let col =
-            ((x - 18).max(0) / FOLDER_TERMINAL_CELL_W + 1).clamp(1, FOLDER_TERMINAL_COLS as i32);
-        let row =
-            ((y - 52).max(0) / FOLDER_TERMINAL_CELL_H + 1).clamp(1, FOLDER_TERMINAL_ROWS as i32);
+        let col = ((x - 18).max(0) / self.folder_terminal_cell_w() + 1)
+            .clamp(1, self.folder_terminal.cols as i32);
+        let row = ((y - 52).max(0) / self.folder_terminal_cell_h() + 1)
+            .clamp(1, self.folder_terminal.rows as i32);
         let press = format!("\x1b[<0;{col};{row}M");
         let release = format!("\x1b[<0;{col};{row}m");
         self.write_folder_terminal(press.as_bytes());
@@ -5663,14 +6432,94 @@ impl Aurora {
         Ok(())
     }
 
+    fn handle_folder_terminal_motion(
+        &mut self,
+        x: i32,
+        y: i32,
+        button_down: bool,
+    ) -> AnyResult<()> {
+        if !button_down {
+            if self.folder_terminal_selecting {
+                self.handle_folder_terminal_release()?;
+            }
+            return Ok(());
+        }
+        if !self.folder_terminal_selecting {
+            return Ok(());
+        }
+        let (row, col) = terminal_point_to_cell(
+            x,
+            y,
+            self.folder_terminal_cell_w(),
+            self.folder_terminal_cell_h(),
+            self.folder_terminal.cols,
+            self.folder_terminal.rows,
+        );
+        let Some(selection) = self.folder_terminal_selection.as_mut() else {
+            return Ok(());
+        };
+        if selection.end_row == row && selection.end_col == col {
+            return Ok(());
+        }
+        selection.end_row = row;
+        selection.end_col = col;
+        self.update_folder_terminal_live_selection()
+    }
+
+    fn handle_folder_terminal_release(&mut self) -> AnyResult<()> {
+        self.folder_terminal_selecting = false;
+        self.erase_folder_terminal_live_selection()?;
+        if let Some(selection) = self.folder_terminal_selection {
+            let rows = self.folder_terminal_display_rows(self.folder_terminal.rows);
+            let text = selected_terminal_text(selection, &rows);
+            if !text.is_empty() {
+                copy_text_to_clipboard(&text);
+            }
+        }
+        self.redraw_folder_terminal()
+    }
+
+    fn erase_folder_terminal_live_selection(&mut self) -> AnyResult<()> {
+        if self.folder_terminal_live_rects.is_empty() {
+            return Ok(());
+        }
+        let rects = std::mem::take(&mut self.folder_terminal_live_rects);
+        self.draw_xor_rects(self.ui.folder_terminal, &rects)?;
+        Ok(())
+    }
+
+    fn update_folder_terminal_live_selection(&mut self) -> AnyResult<()> {
+        let rows = self.folder_terminal_display_rows(self.folder_terminal.rows);
+        let Some(selection) = self.folder_terminal_selection else {
+            return Ok(());
+        };
+        let rects = terminal_selection_rects(
+            selection,
+            &rows,
+            self.folder_terminal_cell_w(),
+            self.folder_terminal_cell_h(),
+        );
+        if same_rects(&rects, &self.folder_terminal_live_rects) {
+            return Ok(());
+        }
+        self.erase_folder_terminal_live_selection()?;
+        if !rects.is_empty() {
+            self.draw_xor_rects(self.ui.folder_terminal, &rects)?;
+            self.folder_terminal_live_rects = rects;
+        }
+        Ok(())
+    }
+
     fn ensure_folder_terminal_pty(&mut self) {
         if self.folder_terminal.master_fd.is_some() {
+            self.resize_folder_terminal_pty();
             return;
         }
+        self.sync_folder_terminal_size();
         match spawn_terminal_pty(
             &self.folder_terminal.cwd,
-            FOLDER_TERMINAL_COLS,
-            FOLDER_TERMINAL_ROWS,
+            self.folder_terminal.cols,
+            self.folder_terminal.rows,
         ) {
             Ok((fd, pid)) => {
                 self.folder_terminal.master_fd = Some(fd);
@@ -5678,7 +6527,7 @@ impl Aurora {
                 self.folder_terminal.history.clear();
                 self.folder_terminal.scrollback = 0;
                 self.folder_terminal.screen =
-                    vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+                    vec![vec![' '; self.folder_terminal.cols]; self.folder_terminal.rows];
                 self.folder_terminal.cursor_x = 0;
                 self.folder_terminal.cursor_y = 0;
                 self.folder_terminal.mouse_enabled = false;
@@ -5686,6 +6535,59 @@ impl Aurora {
             }
             Err(err) => {
                 self.draw_terminal_message(&format!("terminal error: {err}"));
+            }
+        }
+    }
+
+    fn sync_folder_terminal_size(&mut self) {
+        let (_, _, w, h) = self.folder_terminal_geometry();
+        let cols = ((i32::from(w) - 36) / self.folder_terminal_cell_w())
+            .max(24)
+            .min(160) as usize;
+        let rows = ((i32::from(h) - 56) / self.folder_terminal_cell_h())
+            .max(3)
+            .min(48) as usize;
+        if cols == self.folder_terminal.cols && rows == self.folder_terminal.rows {
+            return;
+        }
+        self.resize_folder_terminal_screen(cols, rows);
+        self.resize_folder_terminal_pty();
+    }
+
+    fn resize_folder_terminal_screen(&mut self, cols: usize, rows: usize) {
+        let old_rows = std::mem::take(&mut self.folder_terminal.screen);
+        let mut next = vec![vec![' '; cols]; rows];
+        let copy_rows = old_rows.len().min(rows);
+        let copy_cols = self.folder_terminal.cols.min(cols);
+        let old_start = old_rows.len().saturating_sub(copy_rows);
+        let new_start = rows.saturating_sub(copy_rows);
+        for idx in 0..copy_rows {
+            for col in 0..copy_cols {
+                next[new_start + idx][col] = old_rows[old_start + idx][col];
+            }
+        }
+        self.folder_terminal.cols = cols;
+        self.folder_terminal.rows = rows;
+        self.folder_terminal.cursor_x = self.folder_terminal.cursor_x.min(cols.saturating_sub(1));
+        self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.min(rows.saturating_sub(1));
+        self.folder_terminal.screen = next;
+        self.folder_terminal.dirty = true;
+    }
+
+    fn resize_folder_terminal_pty(&mut self) {
+        let Some(fd) = self.folder_terminal.master_fd else {
+            return;
+        };
+        let mut winsize = libc::winsize {
+            ws_row: self.folder_terminal.rows as u16,
+            ws_col: self.folder_terminal.cols as u16,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            let _ = libc::ioctl(fd, libc::TIOCSWINSZ, &mut winsize);
+            if let Some(pid) = self.folder_terminal.child_pid {
+                let _ = libc::kill(-pid, libc::SIGWINCH);
             }
         }
     }
@@ -5725,8 +6627,9 @@ impl Aurora {
     fn draw_terminal_message(&mut self, message: &str) {
         self.folder_terminal.history.clear();
         self.folder_terminal.scrollback = 0;
-        self.folder_terminal.screen = vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
-        for (idx, ch) in message.chars().take(FOLDER_TERMINAL_COLS).enumerate() {
+        self.folder_terminal.screen =
+            vec![vec![' '; self.folder_terminal.cols]; self.folder_terminal.rows];
+        for (idx, ch) in message.chars().take(self.folder_terminal.cols).enumerate() {
             self.folder_terminal.screen[0][idx] = ch;
         }
         self.folder_terminal.dirty = true;
@@ -5751,7 +6654,7 @@ impl Aurora {
             }
             '\t' => {
                 let next = ((self.folder_terminal.cursor_x / 4) + 1) * 4;
-                self.folder_terminal.cursor_x = next.min(FOLDER_TERMINAL_COLS - 1);
+                self.folder_terminal.cursor_x = next.min(self.folder_terminal.cols - 1);
             }
             c if !c.is_control() => self.terminal_put_char(c),
             _ => {}
@@ -5791,6 +6694,8 @@ impl Aurora {
     fn apply_terminal_csi(&mut self, body: &str) {
         let command = body.chars().last().unwrap_or('m');
         let params = &body[..body.len().saturating_sub(1)];
+        let cols = self.folder_terminal.cols;
+        let rows = self.folder_terminal.rows;
         let private = params.starts_with('?');
         let clean = params.trim_start_matches('?');
         let values = clean
@@ -5814,8 +6719,7 @@ impl Aurora {
                 .iter()
                 .any(|value| matches!(*value, 1047 | 1048 | 1049))
             {
-                self.folder_terminal.screen =
-                    vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+                self.folder_terminal.screen = vec![vec![' '; cols]; rows];
                 self.folder_terminal.cursor_x = 0;
                 self.folder_terminal.cursor_y = 0;
             }
@@ -5825,8 +6729,8 @@ impl Aurora {
             'H' | 'f' => {
                 let row = values.first().copied().unwrap_or(1).saturating_sub(1);
                 let col = values.get(1).copied().unwrap_or(1).saturating_sub(1);
-                self.folder_terminal.cursor_y = row.min(FOLDER_TERMINAL_ROWS - 1);
-                self.folder_terminal.cursor_x = col.min(FOLDER_TERMINAL_COLS - 1);
+                self.folder_terminal.cursor_y = row.min(rows - 1);
+                self.folder_terminal.cursor_x = col.min(cols - 1);
             }
             'A' => {
                 self.folder_terminal.cursor_y = self
@@ -5837,12 +6741,12 @@ impl Aurora {
             'B' => {
                 self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y
                     + values.first().copied().unwrap_or(1))
-                .min(FOLDER_TERMINAL_ROWS - 1)
+                .min(rows - 1)
             }
             'C' => {
                 self.folder_terminal.cursor_x = (self.folder_terminal.cursor_x
                     + values.first().copied().unwrap_or(1))
-                .min(FOLDER_TERMINAL_COLS - 1)
+                .min(cols - 1)
             }
             'D' => {
                 self.folder_terminal.cursor_x = self
@@ -5856,7 +6760,7 @@ impl Aurora {
                     .copied()
                     .unwrap_or(1)
                     .saturating_sub(1)
-                    .min(FOLDER_TERMINAL_COLS - 1);
+                    .min(cols - 1);
             }
             'd' => {
                 self.folder_terminal.cursor_y = values
@@ -5864,15 +6768,15 @@ impl Aurora {
                     .copied()
                     .unwrap_or(1)
                     .saturating_sub(1)
-                    .min(FOLDER_TERMINAL_ROWS - 1);
+                    .min(rows - 1);
             }
             'J' => match values.first().copied().unwrap_or(0) {
                 0 => {
                     let y = self.folder_terminal.cursor_y;
-                    for x in self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS {
+                    for x in self.folder_terminal.cursor_x..cols {
                         self.folder_terminal.screen[y][x] = ' ';
                     }
-                    for yy in y + 1..FOLDER_TERMINAL_ROWS {
+                    for yy in y + 1..rows {
                         self.folder_terminal.screen[yy].fill(' ');
                     }
                 }
@@ -5881,13 +6785,12 @@ impl Aurora {
                         self.folder_terminal.screen[yy].fill(' ');
                     }
                     let y = self.folder_terminal.cursor_y;
-                    for x in 0..=self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1) {
+                    for x in 0..=self.folder_terminal.cursor_x.min(cols - 1) {
                         self.folder_terminal.screen[y][x] = ' ';
                     }
                 }
                 _ => {
-                    self.folder_terminal.screen =
-                        vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+                    self.folder_terminal.screen = vec![vec![' '; cols]; rows];
                     self.folder_terminal.cursor_x = 0;
                     self.folder_terminal.cursor_y = 0;
                 }
@@ -5896,12 +6799,12 @@ impl Aurora {
                 let y = self.folder_terminal.cursor_y;
                 match values.first().copied().unwrap_or(0) {
                     0 => {
-                        for x in self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS {
+                        for x in self.folder_terminal.cursor_x..cols {
                             self.folder_terminal.screen[y][x] = ' ';
                         }
                     }
                     1 => {
-                        for x in 0..=self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1) {
+                        for x in 0..=self.folder_terminal.cursor_x.min(cols - 1) {
                             self.folder_terminal.screen[y][x] = ' ';
                         }
                     }
@@ -5911,22 +6814,18 @@ impl Aurora {
             'X' => {
                 let count = values.first().copied().unwrap_or(1);
                 let y = self.folder_terminal.cursor_y;
-                for x in self.folder_terminal.cursor_x
-                    ..(self.folder_terminal.cursor_x + count).min(FOLDER_TERMINAL_COLS)
+                for x in
+                    self.folder_terminal.cursor_x..(self.folder_terminal.cursor_x + count).min(cols)
                 {
                     self.folder_terminal.screen[y][x] = ' ';
                 }
             }
             'P' => {
-                let count = values
-                    .first()
-                    .copied()
-                    .unwrap_or(1)
-                    .min(FOLDER_TERMINAL_COLS);
+                let count = values.first().copied().unwrap_or(1).min(cols);
                 let y = self.folder_terminal.cursor_y;
-                for x in self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS {
+                for x in self.folder_terminal.cursor_x..cols {
                     let src = x + count;
-                    self.folder_terminal.screen[y][x] = if src < FOLDER_TERMINAL_COLS {
+                    self.folder_terminal.screen[y][x] = if src < cols {
                         self.folder_terminal.screen[y][src]
                     } else {
                         ' '
@@ -5934,13 +6833,9 @@ impl Aurora {
                 }
             }
             '@' => {
-                let count = values
-                    .first()
-                    .copied()
-                    .unwrap_or(1)
-                    .min(FOLDER_TERMINAL_COLS);
+                let count = values.first().copied().unwrap_or(1).min(cols);
                 let y = self.folder_terminal.cursor_y;
-                for x in (self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS).rev() {
+                for x in (self.folder_terminal.cursor_x..cols).rev() {
                     self.folder_terminal.screen[y][x] = x
                         .checked_sub(count)
                         .filter(|src| *src >= self.folder_terminal.cursor_x)
@@ -5949,33 +6844,22 @@ impl Aurora {
                 }
             }
             'L' => {
-                let count = values
-                    .first()
-                    .copied()
-                    .unwrap_or(1)
-                    .min(FOLDER_TERMINAL_ROWS);
+                let count = values.first().copied().unwrap_or(1).min(rows);
                 for _ in 0..count {
-                    self.folder_terminal.screen.insert(
-                        self.folder_terminal.cursor_y,
-                        vec![' '; FOLDER_TERMINAL_COLS],
-                    );
-                    self.folder_terminal.screen.truncate(FOLDER_TERMINAL_ROWS);
+                    self.folder_terminal
+                        .screen
+                        .insert(self.folder_terminal.cursor_y, vec![' '; cols]);
+                    self.folder_terminal.screen.truncate(rows);
                 }
             }
             'M' => {
-                let count = values
-                    .first()
-                    .copied()
-                    .unwrap_or(1)
-                    .min(FOLDER_TERMINAL_ROWS);
+                let count = values.first().copied().unwrap_or(1).min(rows);
                 for _ in 0..count {
                     if self.folder_terminal.cursor_y < self.folder_terminal.screen.len() {
                         self.folder_terminal
                             .screen
                             .remove(self.folder_terminal.cursor_y);
-                        self.folder_terminal
-                            .screen
-                            .push(vec![' '; FOLDER_TERMINAL_COLS]);
+                        self.folder_terminal.screen.push(vec![' '; cols]);
                     }
                 }
             }
@@ -5985,11 +6869,13 @@ impl Aurora {
     }
 
     fn terminal_put_char(&mut self, ch: char) {
-        if self.folder_terminal.cursor_x >= FOLDER_TERMINAL_COLS {
+        let cols = self.folder_terminal.cols;
+        let rows = self.folder_terminal.rows;
+        if self.folder_terminal.cursor_x >= cols {
             self.terminal_newline();
         }
-        let x = self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1);
-        let y = self.folder_terminal.cursor_y.min(FOLDER_TERMINAL_ROWS - 1);
+        let x = self.folder_terminal.cursor_x.min(cols - 1);
+        let y = self.folder_terminal.cursor_y.min(rows - 1);
         self.folder_terminal.screen[y][x] =
             terminal_display_char(ch, self.folder_terminal.line_drawing);
         self.folder_terminal.cursor_x += 1;
@@ -5997,7 +6883,7 @@ impl Aurora {
 
     fn terminal_newline(&mut self) {
         self.folder_terminal.cursor_x = 0;
-        if self.folder_terminal.cursor_y + 1 >= FOLDER_TERMINAL_ROWS {
+        if self.folder_terminal.cursor_y + 1 >= self.folder_terminal.rows {
             let removed = self.folder_terminal.screen.remove(0);
             self.folder_terminal
                 .history
@@ -6008,7 +6894,7 @@ impl Aurora {
             }
             self.folder_terminal
                 .screen
-                .push(vec![' '; FOLDER_TERMINAL_COLS]);
+                .push(vec![' '; self.folder_terminal.cols]);
         } else {
             self.folder_terminal.cursor_y += 1;
         }
@@ -6111,6 +6997,7 @@ impl Aurora {
             text_scroll: 0,
             text_cursor_line: 0,
             text_cursor_col: 0,
+            text_undo: Vec::new(),
             editing: false,
             file_info,
             image_preview,
@@ -6162,6 +7049,11 @@ impl Aurora {
         }
         self.media_context_open = None;
         self.media_trash_prompt = None;
+        let active_text_selection = self
+            .media_text_selection
+            .as_ref()
+            .filter(|selection| selection.slot == slot)
+            .cloned();
         if let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) {
             if x >= 24 && x <= i32::from(w) - 92 && (18..=38).contains(&y) {
                 copy_text_to_clipboard(&media.entry.path.to_string_lossy());
@@ -6191,6 +7083,21 @@ impl Aurora {
                 let preview_y = 58;
                 let preview_w = i32::from(w) - 48;
                 let preview_h = i32::from(h) - 130;
+                if active_text_selection.is_some() {
+                    let (bx, by, bw, bh) =
+                        media_text_copy_button_rect(preview_x, preview_y, preview_w, preview_h);
+                    if x >= bx && x <= bx + bw && y >= by && y <= by + bh {
+                        if let Some(selection) = active_text_selection.as_ref() {
+                            let selected = selected_text_from_lines(&media.text_lines, selection);
+                            if !selected.is_empty() {
+                                copy_text_to_clipboard(&selected);
+                                media.notice = Some("Copied selection".to_string());
+                            }
+                        }
+                        self.redraw_media_slot(slot)?;
+                        return Ok(());
+                    }
+                }
                 if x >= preview_x
                     && x <= preview_x + preview_w
                     && y >= preview_y
@@ -6218,6 +7125,8 @@ impl Aurora {
                         end_line: line_idx,
                         end_col: media.text_cursor_col,
                     });
+                    self.media_text_selecting = true;
+                    self.media_text_selection_redraw_at = Some(Instant::now());
                     self.redraw_media_slot(slot)?;
                     return Ok(());
                 }
@@ -6237,6 +7146,7 @@ impl Aurora {
                     media.text_scroll = 0;
                     media.text_cursor_line = 0;
                     media.text_cursor_col = 0;
+                    media.text_undo.clear();
                     media.notice = None;
                     self.redraw_media_slot(slot)?;
                     return Ok(());
@@ -6360,7 +7270,25 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_media_motion(&mut self, slot: usize, x: i32, y: i32) -> AnyResult<()> {
+    fn handle_media_motion(
+        &mut self,
+        slot: usize,
+        x: i32,
+        y: i32,
+        button_down: bool,
+    ) -> AnyResult<()> {
+        if !button_down {
+            if self.media_text_selecting {
+                self.media_text_selecting = false;
+                self.media_text_selection_redraw_at = None;
+                self.erase_media_live_selection()?;
+                self.redraw_media_slot(slot)?;
+            }
+            return Ok(());
+        }
+        if !self.media_text_selecting {
+            return Ok(());
+        }
         let Some(selection_slot) = self
             .media_text_selection
             .as_ref()
@@ -6390,29 +7318,125 @@ impl Aurora {
         let Some(selection) = self.media_text_selection.as_mut() else {
             return Ok(());
         };
+        if selection.end_line == line && selection.end_col == col {
+            return Ok(());
+        }
         selection.end_line = line;
         selection.end_col = col;
-        self.redraw_media_slot(slot)?;
+        let should_redraw = self
+            .media_text_selection_redraw_at
+            .is_none_or(|last| last.elapsed() >= Duration::from_millis(16));
+        if should_redraw {
+            self.media_text_selection_redraw_at = Some(Instant::now());
+            self.update_media_live_selection(slot)?;
+        }
         Ok(())
     }
 
     fn handle_media_release(&mut self, slot: usize) -> AnyResult<()> {
-        let Some(selection) = self.media_text_selection.take() else {
+        self.media_text_selecting = false;
+        self.media_text_selection_redraw_at = None;
+        self.erase_media_live_selection()?;
+        let Some(selection) = self.media_text_selection.as_ref().cloned() else {
             return Ok(());
         };
         if selection.slot != slot {
             return Ok(());
         }
-        let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) else {
-            return Ok(());
-        };
-        let selected = selected_text_from_lines(&media.text_lines, &selection);
-        if !selected.is_empty() {
-            copy_text_to_clipboard(&selected);
-            media.notice = Some("Copied selection".to_string());
-        }
         self.redraw_media_slot(slot)?;
         Ok(())
+    }
+
+    fn erase_media_live_selection(&mut self) -> AnyResult<()> {
+        if self.media_text_live_rects.is_empty() {
+            return Ok(());
+        }
+        let slot = self
+            .media_text_selection
+            .as_ref()
+            .map(|s| s.slot)
+            .unwrap_or(0);
+        let rects = std::mem::take(&mut self.media_text_live_rects);
+        self.draw_xor_rects(self.ui.media[slot], &rects)?;
+        Ok(())
+    }
+
+    fn update_media_live_selection(&mut self, slot: usize) -> AnyResult<()> {
+        let rects = self.media_text_selection_rects(slot);
+        if same_rects(&rects, &self.media_text_live_rects) {
+            return Ok(());
+        }
+        self.erase_media_live_selection()?;
+        if !rects.is_empty() {
+            self.draw_xor_rects(self.ui.media[slot], &rects)?;
+            self.media_text_live_rects = rects;
+        }
+        Ok(())
+    }
+
+    fn media_text_selection_rects(&self, slot: usize) -> Vec<Rectangle> {
+        let Some(media) = self.media_slots.get(slot).and_then(|m| m.as_ref()) else {
+            return Vec::new();
+        };
+        let Some(selection) = self
+            .media_text_selection
+            .as_ref()
+            .filter(|selection| selection.slot == slot)
+        else {
+            return Vec::new();
+        };
+        let (_, _, w, h) = self.media_geometry(slot);
+        let preview_x = 18;
+        let preview_y = 58;
+        let preview_w = i32::from(w) - 48;
+        let preview_h = i32::from(h) - 130;
+        let line_h = 19;
+        let max_lines = ((preview_h - 20) / line_h).max(1) as usize;
+        let start = media
+            .text_scroll
+            .min(media.text_lines.len().saturating_sub(1));
+        let text_x = preview_x + 42;
+        let (sel_start, sel_end) = normalized_media_selection(selection);
+        let mut rects = Vec::new();
+        for idx in 0..max_lines {
+            let line_no = start + idx;
+            if line_no > sel_end.0 || line_no >= media.text_lines.len() {
+                break;
+            }
+            if line_no < sel_start.0 {
+                continue;
+            }
+            let Some(line) = media.text_lines.get(line_no) else {
+                continue;
+            };
+            let line_len = line.chars().count();
+            let start_col = if line_no == sel_start.0 {
+                sel_start.1.min(line_len)
+            } else {
+                0
+            };
+            let end_col = if line_no == sel_end.0 {
+                sel_end.1.min(line_len)
+            } else {
+                line_len
+            };
+            if end_col <= start_col {
+                continue;
+            }
+            let sx = text_x + fast_text_width_cols(&self.regular, line, 0, start_col, 13.0);
+            let sw = fast_text_width_cols(&self.regular, line, start_col, end_col, 13.0).max(3);
+            let yy = preview_y + 13 + idx as i32 * line_h;
+            let x = sx.max(preview_x).min(preview_x + preview_w - 1) as i16;
+            let y = yy.max(preview_y).min(preview_y + preview_h - 1) as i16;
+            let width = sw.min(preview_x + preview_w - i32::from(x)).max(1) as u16;
+            rects.push(Rectangle {
+                x,
+                y,
+                width,
+                height: 16,
+            });
+        }
+        rects
     }
 
     fn handle_media_scroll(&mut self, slot: usize, button: u8) -> AnyResult<()> {
@@ -6438,6 +7462,11 @@ impl Aurora {
     fn handle_media_key(&mut self, slot: usize, ev: KeyPressEvent) -> AnyResult<()> {
         let (_, _, _, h) = self.media_geometry(slot);
         let visible_lines = ((i32::from(h) - 150) / 19).max(1) as usize;
+        let active_selection = self
+            .media_text_selection
+            .as_ref()
+            .filter(|selection| selection.slot == slot)
+            .cloned();
         let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) else {
             return Ok(());
         };
@@ -6457,8 +7486,94 @@ impl Aurora {
         if media.text_lines.is_empty() {
             media.text_lines.push(String::new());
         }
+        let ctrl = u16::from(ev.state) & u16::from(KeyButMask::CONTROL) != 0;
+        if ctrl {
+            match keysym {
+                0x61 | 0x41 => {
+                    let last_line = media.text_lines.len().saturating_sub(1);
+                    let last_col = media
+                        .text_lines
+                        .get(last_line)
+                        .map(|line| line.chars().count())
+                        .unwrap_or(0);
+                    self.media_text_selection = Some(MediaTextSelection {
+                        slot,
+                        start_line: 0,
+                        start_col: 0,
+                        end_line: last_line,
+                        end_col: last_col,
+                    });
+                    self.media_text_selecting = false;
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
+                0x63 | 0x43 => {
+                    if let Some(selection) = active_selection.as_ref() {
+                        let selected = selected_text_from_lines(&media.text_lines, selection);
+                        if !selected.is_empty() {
+                            copy_text_to_clipboard(&selected);
+                            media.notice = Some("Copied selection".to_string());
+                        }
+                    }
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
+                0x78 | 0x58 => {
+                    if let Some(selection) = active_selection.as_ref() {
+                        let selected = selected_text_from_lines(&media.text_lines, selection);
+                        if !selected.is_empty() {
+                            copy_text_to_clipboard(&selected);
+                            push_text_undo(media);
+                            delete_text_selection(media, selection);
+                            self.media_text_selection = None;
+                            media.notice = Some("Cut selection".to_string());
+                        }
+                    }
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
+                0x76 | 0x56 => {
+                    if let Some(text) = read_text_clipboard() {
+                        if !text.is_empty() {
+                            push_text_undo(media);
+                            if let Some(selection) = active_selection.as_ref() {
+                                delete_text_selection(media, selection);
+                                self.media_text_selection = None;
+                            }
+                            insert_text_at_cursor(media, &text);
+                        }
+                    }
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
+                0x7a | 0x5a => {
+                    if let Some(previous) = media.text_undo.pop() {
+                        media.text_lines = previous;
+                        media.text_cursor_line = media
+                            .text_cursor_line
+                            .min(media.text_lines.len().saturating_sub(1));
+                        media.text_cursor_col = media
+                            .text_lines
+                            .get(media.text_cursor_line)
+                            .map(|line| media.text_cursor_col.min(line.chars().count()))
+                            .unwrap_or(0);
+                        self.media_text_selection = None;
+                    }
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
         match keysym {
             0xff08 => {
+                if let Some(selection) = active_selection.as_ref() {
+                    push_text_undo(media);
+                    delete_text_selection(media, selection);
+                    self.media_text_selection = None;
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
                 let line_idx = media
                     .text_cursor_line
                     .min(media.text_lines.len().saturating_sub(1));
@@ -6466,10 +7581,12 @@ impl Aurora {
                     .text_cursor_col
                     .min(media.text_lines[line_idx].chars().count());
                 if col > 0 {
+                    push_text_undo(media);
                     let byte_idx = nth_char_byte(&media.text_lines[line_idx], col - 1);
                     media.text_lines[line_idx].remove(byte_idx);
                     media.text_cursor_col = col - 1;
                 } else if line_idx > 0 {
+                    push_text_undo(media);
                     let removed = media.text_lines.remove(line_idx);
                     media.text_cursor_line = line_idx - 1;
                     media.text_cursor_col =
@@ -6478,6 +7595,13 @@ impl Aurora {
                 }
             }
             0xff0d => {
+                if let Some(selection) = active_selection.as_ref() {
+                    push_text_undo(media);
+                    delete_text_selection(media, selection);
+                    self.media_text_selection = None;
+                } else {
+                    push_text_undo(media);
+                }
                 let line_idx = media
                     .text_cursor_line
                     .min(media.text_lines.len().saturating_sub(1));
@@ -6519,6 +7643,13 @@ impl Aurora {
                 media.text_cursor_col = media.text_lines[line_idx].chars().count();
             }
             0x20..=0x7e => {
+                if let Some(selection) = active_selection.as_ref() {
+                    push_text_undo(media);
+                    delete_text_selection(media, selection);
+                    self.media_text_selection = None;
+                } else {
+                    push_text_undo(media);
+                }
                 let ch = char::from_u32(keysym).unwrap();
                 let line_idx = media
                     .text_cursor_line
@@ -6857,6 +7988,14 @@ impl Aurora {
                 .width(u32::from(menu.2))
                 .height(u32::from(menu.3)),
         )?;
+        self.conn.configure_window(
+            self.ui.screenshot_overlay,
+            &ConfigureWindowAux::new()
+                .x(0)
+                .y(0)
+                .width(u32::from(self.screen_width))
+                .height(u32::from(self.screen_height)),
+        )?;
         for (idx, window) in self.ui.media.iter().copied().enumerate() {
             let media = self.media_geometry(idx);
             self.conn.configure_window(
@@ -6915,6 +8054,10 @@ impl Aurora {
         }
         if self.screenshot_mode {
             self.conn.configure_window(
+                self.ui.screenshot_overlay,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+            self.conn.configure_window(
                 self.ui.topbar,
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
@@ -6954,6 +8097,16 @@ impl Aurora {
     }
 
     fn upload_canvas(&self, drawable: Drawable, canvas: &Canvas) -> AnyResult<()> {
+        self.upload_canvas_at(drawable, canvas, 0, 0)
+    }
+
+    fn upload_canvas_at(
+        &self,
+        drawable: Drawable,
+        canvas: &Canvas,
+        x: i32,
+        y: i32,
+    ) -> AnyResult<()> {
         let img = Image::new(
             canvas.width,
             canvas.height,
@@ -6963,7 +8116,29 @@ impl Aurora {
             ImageOrder::LsbFirst,
             Cow::Borrowed(&canvas.data),
         )?;
-        img.put(&self.conn, drawable, self.gc, 0, 0)?;
+        img.put(&self.conn, drawable, self.gc, x as i16, y as i16)?;
+        Ok(())
+    }
+
+    fn draw_xor_rects(&self, drawable: Drawable, rects: &[Rectangle]) -> AnyResult<()> {
+        if rects.is_empty() {
+            return Ok(());
+        }
+        self.conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new()
+                .function(GX::XOR)
+                .foreground(0x00af_e5f5)
+                .line_width(2),
+        )?;
+        self.conn.poly_fill_rectangle(drawable, self.gc, rects)?;
+        self.conn.change_gc(
+            self.gc,
+            &ChangeGCAux::new()
+                .function(GX::COPY)
+                .foreground(0)
+                .line_width(1),
+        )?;
         Ok(())
     }
 
@@ -7088,25 +8263,43 @@ impl Aurora {
     }
 
     fn folder_geometry(&self) -> (i16, i16, u16, u16) {
-        let width = 330u16
+        let width = self
+            .folder_width
             .min(self.screen_width.saturating_sub(48))
-            .max(260.min(self.screen_width));
-        let height = 480u16
+            .max(FOLDER_MIN_WIDTH.min(self.screen_width));
+        let height = self
+            .folder_height
             .min(
                 self.screen_height
                     .saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + 48),
             )
-            .max(320.min(self.screen_height));
+            .max(FOLDER_MIN_HEIGHT.min(self.screen_height));
         (24, (TOPBAR_HEIGHT + 26) as i16, width, height)
     }
 
     fn folder_terminal_geometry(&self) -> (i16, i16, u16, u16) {
         let folder = self.folder_geometry();
         let y = i32::from(folder.1) + i32::from(folder.3) + 8;
-        let dock = self.dock_geometry();
-        let available = i32::from(dock.1).saturating_sub(y + 10);
-        let height = available.clamp(120, 260) as u16;
-        (folder.0, y as i16, folder.2, height)
+        let available = i32::from(self.screen_height).saturating_sub(y + 50);
+        let width = self
+            .folder_terminal_width
+            .min(self.screen_width.saturating_sub(48))
+            .max(TERMINAL_MIN_WIDTH.min(self.screen_width));
+        let height = self
+            .folder_terminal_height
+            .min(available.max(i32::from(TERMINAL_MIN_HEIGHT)) as u16)
+            .max(TERMINAL_MIN_HEIGHT.min(self.screen_height));
+        (folder.0, y as i16, width, height)
+    }
+
+    fn ui_bottom_right_resize_hit(&self, target: UiResizeTarget, x: i16, y: i16) -> bool {
+        let (_, _, width, height) = match target {
+            UiResizeTarget::Folder => self.folder_geometry(),
+            UiResizeTarget::FolderTerminal => self.folder_terminal_geometry(),
+        };
+        let width = i16::try_from(width).unwrap_or(i16::MAX);
+        let height = i16::try_from(height).unwrap_or(i16::MAX);
+        x >= width - RESIZE_CORNER && y >= height - RESIZE_CORNER
     }
 
     fn app_menu_geometry(&self) -> (i16, i16, u16, u16) {
@@ -7194,6 +8387,7 @@ impl Aurora {
             || window == self.ui.settings
             || window == self.ui.folder
             || window == self.ui.folder_terminal
+            || window == self.ui.screenshot_overlay
             || window == self.ui.app_menu
             || self.ui.media.contains(&window)
     }
@@ -7260,28 +8454,60 @@ fn hover_title_button(x: i16, y: i16) -> Option<TitleButton> {
     Some(TitleButton::Close)
 }
 
-fn resize_edges_for_frame(info: &ClientInfo, title_h: u16, x: i16, y: i16) -> Option<ResizeEdges> {
+fn resize_corner_edges_for_frame(
+    info: &ClientInfo,
+    title_h: u16,
+    x: i16,
+    y: i16,
+) -> Option<ResizeEdges> {
     let frame_h = i16::try_from(info.height + title_h).unwrap_or(i16::MAX);
     let width = i16::try_from(info.width).unwrap_or(i16::MAX);
-    let edges = ResizeEdges {
-        left: x <= RESIZE_EDGE,
-        right: x >= width - RESIZE_EDGE,
+    let bottom = y >= frame_h - RESIZE_EDGE;
+    if !bottom {
+        return None;
+    }
+    let left = x <= RESIZE_CORNER;
+    let right = x >= width - RESIZE_CORNER;
+    (left || right).then_some(ResizeEdges {
+        left,
+        right,
         top: false,
-        bottom: y >= frame_h - RESIZE_EDGE,
-    };
-    (edges.left || edges.right || edges.bottom).then_some(edges)
+        bottom: true,
+    })
 }
 
-fn resize_edges_for_client(info: &ClientInfo, x: i16, y: i16) -> Option<ResizeEdges> {
+fn resize_corner_edges_for_client(info: &ClientInfo, x: i16, y: i16) -> Option<ResizeEdges> {
     let width = i16::try_from(info.width).unwrap_or(i16::MAX);
     let height = i16::try_from(info.height).unwrap_or(i16::MAX);
-    let edges = ResizeEdges {
-        left: x <= RESIZE_EDGE,
-        right: x >= width - RESIZE_EDGE,
+    let bottom = y >= height - RESIZE_EDGE;
+    if !bottom {
+        return None;
+    }
+    let left = x <= RESIZE_CORNER;
+    let right = x >= width - RESIZE_CORNER;
+    (left || right).then_some(ResizeEdges {
+        left,
+        right,
         top: false,
-        bottom: y >= height - RESIZE_EDGE,
-    };
-    (edges.left || edges.right || edges.bottom).then_some(edges)
+        bottom: true,
+    })
+}
+
+fn resize_side_hint_for_frame(info: &ClientInfo, x: i16) -> bool {
+    let width = i16::try_from(info.width).unwrap_or(i16::MAX);
+    x <= RESIZE_EDGE || x >= width - RESIZE_EDGE
+}
+
+fn resize_side_hint_for_client(info: &ClientInfo, x: i16) -> bool {
+    let width = i16::try_from(info.width).unwrap_or(i16::MAX);
+    x <= RESIZE_EDGE || x >= width - RESIZE_EDGE
+}
+
+fn terminal_default_height_for(folder_height: u16, screen_height: u16) -> u16 {
+    let y = i32::from(TOPBAR_HEIGHT) + 26 + i32::from(folder_height) + 8;
+    i32::from(screen_height)
+        .saturating_sub(y + 50)
+        .max(i32::from(TERMINAL_MIN_HEIGHT)) as u16
 }
 
 fn client_uses_own_chrome(class: &str, title: &str) -> bool {
@@ -7977,29 +9203,46 @@ fn draw_terminal_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 }
 
 fn draw_screenshot_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    let fill = if color == MINT_LIGHT {
+        Color::rgb(175, 218, 245)
+    } else {
+        color
+    };
+    c.draw_round_rect(cx - 10, cy - 8, 20, 16, 5, fill);
+    c.draw_circle(cx, cy, 4, Color::rgba(255, 255, 255, 210));
+    c.draw_circle(cx, cy, 2, fill);
+}
+
+fn draw_copy_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_round_rect(cx - 5, cy - 7, 10, 12, 2, Color::rgba(255, 255, 255, 150));
     c.draw_round_rect(
-        cx - 11,
-        cy - 8,
-        22,
-        16,
-        4,
-        Color::rgba(color.r, color.g, color.b, 42),
+        cx - 2,
+        cy - 4,
+        10,
+        12,
+        2,
+        Color::rgba(color.r, color.g, color.b, 155),
     );
-    c.draw_rect(cx - 5, cy - 11, 10, 3, color);
-    c.draw_circle(cx, cy, 5, color);
-    c.draw_circle(cx, cy, 2, Color::rgba(23, 34, 42, 178));
+    c.draw_rect(cx + 1, cy - 1, 4, 1, Color::rgba(255, 255, 255, 210));
+    c.draw_rect(cx + 1, cy + 3, 4, 1, Color::rgba(255, 255, 255, 210));
 }
 
 fn draw_edit_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_line(cx - 7, cy + 6, cx + 5, cy - 6, 2, color);
-    c.draw_line(cx + 3, cy - 8, cx + 7, cy - 4, 2, color);
-    c.draw_line(cx - 8, cy + 7, cx - 3, cy + 6, 2, color);
+    let square = Color::rgba(color.r, color.g, color.b, 86);
+    let pen = Color::rgb(32, 58, 68);
+    c.draw_line(cx - 8, cy - 7, cx - 8, cy + 7, 1, square);
+    c.draw_line(cx - 8, cy + 7, cx + 5, cy + 7, 1, square);
+    c.draw_line(cx - 8, cy - 7, cx + 4, cy - 7, 1, square);
+    c.draw_line(cx + 8, cy - 1, cx + 8, cy + 7, 1, square);
+    draw_round_line(c, cx - 4, cy + 4, cx + 6, cy - 6, 3, pen);
+    draw_round_line(c, cx - 6, cy + 6, cx - 4, cy + 4, 2, pen);
+    draw_round_line(c, cx + 6, cy - 6, cx + 8, cy - 8, 2, pen);
 }
 
 fn draw_save_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
-    c.draw_round_rect(cx - 8, cy - 8, 16, 16, 3, Color::rgba(255, 255, 255, 95));
-    c.draw_rect(cx - 4, cy - 6, 8, 5, color);
-    c.draw_rect(cx - 5, cy + 2, 10, 5, color);
+    c.draw_round_rect(cx - 8, cy - 8, 16, 16, 3, color);
+    c.draw_rect(cx + 3, cy - 8, 5, 5, Color::rgba(255, 255, 255, 180));
+    c.draw_round_rect(cx - 5, cy + 1, 10, 5, 2, Color::rgba(255, 255, 255, 210));
 }
 
 fn draw_picture_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -8440,6 +9683,80 @@ fn render_image_preview(path: &std::path::Path, w: i32, h: i32) -> Option<ImageP
     })
 }
 
+fn capture_screen_preview(display: &str) -> Option<ImagePreview> {
+    let path = env::temp_dir().join(format!(
+        "aurora-screenshot-overlay-{}.png",
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    let ok = Command::new("import")
+        .env("DISPLAY", display)
+        .args(["-window", "root"])
+        .arg(&path)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !ok {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (iw, ih) = img.dimensions();
+    Some(ImagePreview {
+        pixels: img.into_raw(),
+        width: iw.min(u16::MAX as u32) as u16,
+        height: ih.min(u16::MAX as u32) as u16,
+        resolution: Some((iw, ih)),
+    })
+}
+
+fn canvas_from_preview(preview: &ImagePreview, width: u16, height: u16) -> Canvas {
+    let mut c = Canvas::new(width, height, Color::rgba(0, 0, 0, 255));
+    let pw = usize::from(preview.width);
+    let ph = usize::from(preview.height);
+    let cw = usize::from(width);
+    let ch = usize::from(height);
+    for yy in 0..ph.min(ch) {
+        for xx in 0..pw.min(cw) {
+            let src = (yy * pw + xx) * 4;
+            let dst = (yy * cw + xx) * 4;
+            if src + 3 < preview.pixels.len() && dst + 3 < c.data.len() {
+                c.data[dst] = preview.pixels[src + 2];
+                c.data[dst + 1] = preview.pixels[src + 1];
+                c.data[dst + 2] = preview.pixels[src];
+                c.data[dst + 3] = preview.pixels[src + 3];
+            }
+        }
+    }
+    c
+}
+
+fn paint_preview_region(c: &mut Canvas, preview: &ImagePreview, x: i32, y: i32, w: i32, h: i32) {
+    let pw = i32::from(preview.width);
+    let ph = i32::from(preview.height);
+    for yy in 0..h {
+        for xx in 0..w {
+            let sx = x + xx;
+            let sy = y + yy;
+            if sx < 0 || sy < 0 || sx >= pw || sy >= ph {
+                continue;
+            }
+            let idx = ((sy * pw + sx) * 4) as usize;
+            if idx + 3 < preview.pixels.len() {
+                c.blend_pixel(
+                    sx,
+                    sy,
+                    Color::rgba(
+                        preview.pixels[idx],
+                        preview.pixels[idx + 1],
+                        preview.pixels[idx + 2],
+                        preview.pixels[idx + 3],
+                    ),
+                );
+            }
+        }
+    }
+}
+
 fn paint_cached_image_preview(
     c: &mut Canvas,
     preview: &ImagePreview,
@@ -8469,51 +9786,6 @@ fn paint_cached_image_preview(
             }
         }
     }
-}
-
-fn draw_image_info_overlay(
-    c: &mut Canvas,
-    font: &Font<'static>,
-    path: &std::path::Path,
-    x: i32,
-    y: i32,
-    w: i32,
-    cached_resolution: Option<(u32, u32)>,
-) {
-    let meta = fs::metadata(path).ok();
-    let size = meta.map(|m| m.len()).unwrap_or(0);
-    let resolution = cached_resolution
-        .or_else(|| image_dimensions(path))
-        .map(|(iw, ih)| format!("{iw}x{ih}"))
-        .unwrap_or_else(|| "unknown".to_string());
-    c.draw_round_rect(x, y, w, 70, 10, Color::rgba(0, 0, 0, 102));
-    c.draw_text(
-        font,
-        &compact(
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("Image"),
-            22,
-        ),
-        x + 10,
-        y + 10,
-        11.0,
-        Color::rgb(255, 255, 255),
-    );
-    c.draw_text(
-        font,
-        &format_size_mb(size),
-        x + 10,
-        y + 30,
-        10.0,
-        Color::rgb(255, 255, 255),
-    );
-    c.draw_text(
-        font,
-        &resolution,
-        x + 10,
-        y + 48,
-        10.0,
-        Color::rgb(255, 255, 255),
-    );
 }
 
 fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
@@ -9101,6 +10373,36 @@ fn format_size_mb(bytes: u64) -> String {
     format!("{:.2} MB", bytes as f64 / 1024.0 / 1024.0)
 }
 
+fn folder_entry_info(entry: &FolderEntry) -> String {
+    let size = fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0);
+    let mut parts = vec![
+        entry.name.clone(),
+        file_kind_label(entry.kind).to_string(),
+        format_size_mb(size),
+    ];
+    if entry.kind == FileKind::Image {
+        if let Some((w, h)) = image_dimensions(&entry.path) {
+            parts.push(format!("{w}x{h}"));
+        }
+    }
+    parts.join("  ")
+}
+
+fn image_info_line(path: &Path, cached_resolution: Option<(u32, u32)>) -> String {
+    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut parts = vec![format_size_mb(size)];
+    if let Some((w, h)) = cached_resolution.or_else(|| image_dimensions(path)) {
+        parts.push(format!("{w}x{h}"));
+    }
+    parts.push(
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Image")
+            .to_string(),
+    );
+    parts.join("  ")
+}
+
 fn viewer_status(media: &MediaState) -> String {
     let size = fs::metadata(&media.entry.path)
         .map(|m| m.len())
@@ -9191,6 +10493,222 @@ fn selected_text_from_lines(lines: &[String], selection: &MediaTextSelection) ->
     out
 }
 
+fn push_text_undo(media: &mut MediaState) {
+    media.text_undo.push(media.text_lines.clone());
+    if media.text_undo.len() > 64 {
+        media.text_undo.remove(0);
+    }
+}
+
+fn delete_text_selection(media: &mut MediaState, selection: &MediaTextSelection) {
+    if media.text_lines.is_empty() {
+        media.text_lines.push(String::new());
+        media.text_cursor_line = 0;
+        media.text_cursor_col = 0;
+        return;
+    }
+    let (start, end) = normalized_media_selection(selection);
+    if start == end {
+        media.text_cursor_line = start.0.min(media.text_lines.len().saturating_sub(1));
+        media.text_cursor_col = start.1;
+        return;
+    }
+    let start_line = start.0.min(media.text_lines.len().saturating_sub(1));
+    let end_line = end.0.min(media.text_lines.len().saturating_sub(1));
+    let start_col = start.1.min(media.text_lines[start_line].chars().count());
+    let end_col = end.1.min(media.text_lines[end_line].chars().count());
+    let start_byte = nth_char_byte(&media.text_lines[start_line], start_col);
+    let end_byte = nth_char_byte(&media.text_lines[end_line], end_col);
+    if start_line == end_line {
+        media.text_lines[start_line].replace_range(start_byte..end_byte, "");
+    } else {
+        let prefix = media.text_lines[start_line][..start_byte].to_string();
+        let suffix = media.text_lines[end_line][end_byte..].to_string();
+        media
+            .text_lines
+            .splice(start_line..=end_line, [format!("{prefix}{suffix}")]);
+    }
+    if media.text_lines.is_empty() {
+        media.text_lines.push(String::new());
+    }
+    media.text_cursor_line = start_line.min(media.text_lines.len().saturating_sub(1));
+    media.text_cursor_col = start_col.min(media.text_lines[media.text_cursor_line].chars().count());
+}
+
+fn insert_text_at_cursor(media: &mut MediaState, text: &str) {
+    if media.text_lines.is_empty() {
+        media.text_lines.push(String::new());
+    }
+    let line_idx = media
+        .text_cursor_line
+        .min(media.text_lines.len().saturating_sub(1));
+    let col = media
+        .text_cursor_col
+        .min(media.text_lines[line_idx].chars().count());
+    let byte_idx = nth_char_byte(&media.text_lines[line_idx], col);
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let parts = normalized.split('\n').collect::<Vec<_>>();
+    if parts.len() == 1 {
+        media.text_lines[line_idx].insert_str(byte_idx, &normalized);
+        media.text_cursor_line = line_idx;
+        media.text_cursor_col = col + normalized.chars().count();
+        return;
+    }
+    let tail = media.text_lines[line_idx].split_off(byte_idx);
+    media.text_lines[line_idx].push_str(parts[0]);
+    let mut insert_at = line_idx + 1;
+    for part in parts.iter().skip(1).take(parts.len().saturating_sub(2)) {
+        media.text_lines.insert(insert_at, (*part).to_string());
+        insert_at += 1;
+    }
+    let last = parts.last().copied().unwrap_or("");
+    media.text_lines.insert(insert_at, format!("{last}{tail}"));
+    media.text_cursor_line = insert_at;
+    media.text_cursor_col = last.chars().count();
+}
+
+fn media_text_copy_button_rect(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    (x + w - 48, y + h - 42, 32, 30)
+}
+
+fn selection_border_rects(x: i16, y: i16, w: u16, h: u16) -> [Rectangle; 4] {
+    let bw = 2u16;
+    let right_x = x.saturating_add(w.saturating_sub(bw) as i16);
+    let bottom_y = y.saturating_add(h.saturating_sub(bw) as i16);
+    [
+        Rectangle {
+            x,
+            y,
+            width: w,
+            height: bw,
+        },
+        Rectangle {
+            x,
+            y: bottom_y,
+            width: w,
+            height: bw,
+        },
+        Rectangle {
+            x,
+            y,
+            width: bw,
+            height: h,
+        },
+        Rectangle {
+            x: right_x,
+            y,
+            width: bw,
+            height: h,
+        },
+    ]
+}
+
+fn same_rects(a: &[Rectangle], b: &[Rectangle]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(left, right)| {
+            left.x == right.x
+                && left.y == right.y
+                && left.width == right.width
+                && left.height == right.height
+        })
+}
+
+fn terminal_point_to_cell(
+    x: i32,
+    y: i32,
+    cell_w: i32,
+    cell_h: i32,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize) {
+    let row = ((y - 52).max(0) / cell_h).clamp(0, rows as i32 - 1) as usize;
+    let col = ((x - 18).max(0) / cell_w).clamp(0, cols as i32 - 1) as usize;
+    (row, col)
+}
+
+fn terminal_selection_rects(
+    selection: TerminalSelection,
+    rows: &[String],
+    cell_w: i32,
+    cell_h: i32,
+) -> Vec<Rectangle> {
+    let start = (selection.start_row, selection.start_col);
+    let end = (selection.end_row, selection.end_col);
+    let (start, end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let mut rects = Vec::new();
+    for row in start.0..=end.0.min(rows.len().saturating_sub(1)) {
+        let line_len = rows.get(row).map(|line| line.chars().count()).unwrap_or(0);
+        let start_col = if row == start.0 {
+            start
+                .1
+                .min(rows.get(row).map(|line| line.chars().count()).unwrap_or(0))
+        } else {
+            0
+        };
+        let end_col = if row == end.0 {
+            end.1
+                .min(rows.get(row).map(|line| line.chars().count()).unwrap_or(0))
+        } else {
+            line_len.max(start_col)
+        };
+        if end_col <= start_col {
+            continue;
+        }
+        rects.push(Rectangle {
+            x: (18 + start_col as i32 * cell_w) as i16,
+            y: (53 + row as i32 * cell_h) as i16,
+            width: ((end_col - start_col) as i32 * cell_w).max(4) as u16,
+            height: (cell_h - 3).max(10) as u16,
+        });
+    }
+    rects
+}
+
+fn selected_terminal_text(selection: TerminalSelection, rows: &[String]) -> String {
+    let start = (selection.start_row, selection.start_col);
+    let end = (selection.end_row, selection.end_col);
+    let (start, end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    if start == end {
+        return String::new();
+    }
+    let mut out = String::new();
+    for row in start.0..=end.0.min(rows.len().saturating_sub(1)) {
+        let line = rows.get(row).map(String::as_str).unwrap_or("");
+        let line_len = line.chars().count();
+        let start_col = if row == start.0 {
+            start.1.min(line_len)
+        } else {
+            0
+        };
+        let end_col = if row == end.0 {
+            end.1.min(line_len)
+        } else {
+            line_len
+        };
+        if end_col > start_col {
+            out.push_str(
+                &line
+                    .chars()
+                    .skip(start_col)
+                    .take(end_col - start_col)
+                    .collect::<String>(),
+            );
+        }
+        if row != end.0 {
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string()
+}
+
 fn text_position_for_point(
     media: &MediaState,
     font: &Font<'static>,
@@ -9219,26 +10737,76 @@ fn nth_char_byte(value: &str, col: usize) -> usize {
         .unwrap_or(value.len())
 }
 
+fn fast_text_width_cols(
+    font: &Font<'static>,
+    line: &str,
+    start_col: usize,
+    end_col: usize,
+    size: f32,
+) -> i32 {
+    if end_col <= start_col {
+        return 0;
+    }
+    let scale = Scale::uniform(size);
+    let space = font
+        .glyph(' ')
+        .scaled(scale)
+        .h_metrics()
+        .advance_width
+        .max(1.0);
+    let width = line
+        .chars()
+        .skip(start_col)
+        .take(end_col - start_col)
+        .map(|ch| {
+            if ch == '\t' {
+                space * 4.0
+            } else {
+                font.glyph(ch)
+                    .scaled(scale)
+                    .h_metrics()
+                    .advance_width
+                    .max(space)
+            }
+        })
+        .sum::<f32>();
+    width.ceil() as i32
+}
+
 fn cursor_col_for_x(font: &Font<'static>, line: &str, x: i32, size: f32) -> usize {
     if x <= 0 {
         return 0;
     }
-    let mut best = 0;
-    for col in 1..=line.chars().count() {
-        let prefix = line.chars().take(col).collect::<String>();
-        let width = measure_text(font, &prefix, size);
-        if x < width {
-            let prev = line.chars().take(col - 1).collect::<String>();
-            let prev_width = measure_text(font, &prev, size);
-            return if x - prev_width < width - x {
-                col - 1
-            } else {
+    let scale = Scale::uniform(size);
+    let space = font
+        .glyph(' ')
+        .scaled(scale)
+        .h_metrics()
+        .advance_width
+        .max(1.0);
+    let mut width = 0.0f32;
+    let target = x as f32;
+    for (col, ch) in line.chars().enumerate() {
+        let advance = if ch == '\t' {
+            space * 4.0
+        } else {
+            font.glyph(ch)
+                .scaled(scale)
+                .h_metrics()
+                .advance_width
+                .max(space)
+        };
+        let next = width + advance;
+        if target < next {
+            return if target - width < next - target {
                 col
+            } else {
+                col + 1
             };
         }
-        best = col;
+        width = next;
     }
-    best
+    line.chars().count()
 }
 
 fn terminal_display_char(ch: char, line_drawing: bool) -> char {
@@ -9326,6 +10894,25 @@ fn copy_text_to_clipboard(text: &str) {
             break;
         }
     }
+}
+
+fn read_text_clipboard() -> Option<String> {
+    let commands: [(&str, &[&str]); 3] = [
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+        ("wl-paste", &[]),
+    ];
+    for (name, args) in commands {
+        if !command_exists(name) {
+            continue;
+        }
+        if let Ok(output) = Command::new(name).args(args).stderr(Stdio::null()).output() {
+            if output.status.success() {
+                return Some(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+        }
+    }
+    None
 }
 
 fn copy_image_to_clipboard(path: &Path) {
@@ -9652,6 +11239,10 @@ fn place_entries() -> Vec<PlaceEntry> {
         PlaceEntry {
             name: "Documents".to_string(),
             path: home.join("Documents"),
+        },
+        PlaceEntry {
+            name: "Trash".to_string(),
+            path: home.join(".local/share/Trash/files"),
         },
         PlaceEntry {
             name: "Root /".to_string(),
