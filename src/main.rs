@@ -792,8 +792,18 @@ struct FolderTerminal {
     rows: usize,
     cursor_x: usize,
     cursor_y: usize,
+    saved_cursor_x: usize,
+    saved_cursor_y: usize,
     esc: String,
     line_drawing: bool,
+    saved_line_drawing: bool,
+    normal_screen: Option<Vec<Vec<char>>>,
+    scroll_top: usize,
+    scroll_bottom: usize,
+    insert_mode: bool,
+    auto_wrap: bool,
+    app_cursor_keys: bool,
+    bracketed_paste: bool,
     mouse_enabled: bool,
     zoom: i8,
     dirty: bool,
@@ -901,8 +911,18 @@ impl FolderTerminal {
             rows: FOLDER_TERMINAL_DEFAULT_ROWS,
             cursor_x: 0,
             cursor_y: 0,
+            saved_cursor_x: 0,
+            saved_cursor_y: 0,
             esc: String::new(),
             line_drawing: false,
+            saved_line_drawing: false,
+            normal_screen: None,
+            scroll_top: 0,
+            scroll_bottom: FOLDER_TERMINAL_DEFAULT_ROWS - 1,
+            insert_mode: false,
+            auto_wrap: true,
+            app_cursor_keys: false,
+            bracketed_paste: false,
             mouse_enabled: false,
             zoom: 0,
             dirty: true,
@@ -6347,7 +6367,13 @@ impl Aurora {
         if controlled && matches!(base_keysym, 0x76 | 0x56) {
             if let Some(text) = read_text_clipboard() {
                 self.folder_terminal.scrollback = 0;
-                self.write_folder_terminal(text.as_bytes());
+                if self.folder_terminal.bracketed_paste {
+                    self.write_folder_terminal(b"\x1b[200~");
+                    self.write_folder_terminal(text.as_bytes());
+                    self.write_folder_terminal(b"\x1b[201~");
+                } else {
+                    self.write_folder_terminal(text.as_bytes());
+                }
             }
             return Ok(());
         }
@@ -6366,10 +6392,56 @@ impl Aurora {
             0xff09 => b"\t".to_vec(),
             0xff0d => b"\r".to_vec(),
             0xff1b => b"\x1b".to_vec(),
-            0xff51 => b"\x1b[D".to_vec(),
-            0xff52 => b"\x1b[A".to_vec(),
-            0xff53 => b"\x1b[C".to_vec(),
-            0xff54 => b"\x1b[B".to_vec(),
+            0xffff => b"\x1b[3~".to_vec(),
+            0xff50 => b"\x1b[H".to_vec(),
+            0xff57 => b"\x1b[F".to_vec(),
+            0xff55 => b"\x1b[5~".to_vec(),
+            0xff56 => b"\x1b[6~".to_vec(),
+            0xff51 => {
+                if self.folder_terminal.app_cursor_keys {
+                    b"\x1bOD".to_vec()
+                } else {
+                    b"\x1b[D".to_vec()
+                }
+            }
+            0xff52 => {
+                if self.folder_terminal.app_cursor_keys {
+                    b"\x1bOA".to_vec()
+                } else {
+                    b"\x1b[A".to_vec()
+                }
+            }
+            0xff53 => {
+                if self.folder_terminal.app_cursor_keys {
+                    b"\x1bOC".to_vec()
+                } else {
+                    b"\x1b[C".to_vec()
+                }
+            }
+            0xff54 => {
+                if self.folder_terminal.app_cursor_keys {
+                    b"\x1bOB".to_vec()
+                } else {
+                    b"\x1b[B".to_vec()
+                }
+            }
+            0xffbe..=0xffc9 => {
+                const FKEYS: [&[u8]; 12] = [
+                    b"\x1bOP",
+                    b"\x1bOQ",
+                    b"\x1bOR",
+                    b"\x1bOS",
+                    b"\x1b[15~",
+                    b"\x1b[17~",
+                    b"\x1b[18~",
+                    b"\x1b[19~",
+                    b"\x1b[20~",
+                    b"\x1b[21~",
+                    b"\x1b[23~",
+                    b"\x1b[24~",
+                ];
+                FKEYS[(keysym - 0xffbe) as usize].to_vec()
+            }
             0x40..=0x5f if controlled => vec![(keysym as u8) & 0x1f],
             0x61..=0x7a if controlled => vec![((keysym as u8) - b'a' + 1)],
             0x20..=0x7e => vec![keysym as u8],
@@ -6530,6 +6602,18 @@ impl Aurora {
                     vec![vec![' '; self.folder_terminal.cols]; self.folder_terminal.rows];
                 self.folder_terminal.cursor_x = 0;
                 self.folder_terminal.cursor_y = 0;
+                self.folder_terminal.saved_cursor_x = 0;
+                self.folder_terminal.saved_cursor_y = 0;
+                self.folder_terminal.esc.clear();
+                self.folder_terminal.line_drawing = false;
+                self.folder_terminal.saved_line_drawing = false;
+                self.folder_terminal.normal_screen = None;
+                self.folder_terminal.scroll_top = 0;
+                self.folder_terminal.scroll_bottom = self.folder_terminal.rows.saturating_sub(1);
+                self.folder_terminal.insert_mode = false;
+                self.folder_terminal.auto_wrap = true;
+                self.folder_terminal.app_cursor_keys = false;
+                self.folder_terminal.bracketed_paste = false;
                 self.folder_terminal.mouse_enabled = false;
                 self.folder_terminal.dirty = true;
             }
@@ -6570,6 +6654,21 @@ impl Aurora {
         self.folder_terminal.rows = rows;
         self.folder_terminal.cursor_x = self.folder_terminal.cursor_x.min(cols.saturating_sub(1));
         self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.min(rows.saturating_sub(1));
+        self.folder_terminal.saved_cursor_x = self
+            .folder_terminal
+            .saved_cursor_x
+            .min(cols.saturating_sub(1));
+        self.folder_terminal.saved_cursor_y = self
+            .folder_terminal
+            .saved_cursor_y
+            .min(rows.saturating_sub(1));
+        self.folder_terminal.scroll_top =
+            self.folder_terminal.scroll_top.min(rows.saturating_sub(1));
+        self.folder_terminal.scroll_bottom = self
+            .folder_terminal
+            .scroll_bottom
+            .min(rows.saturating_sub(1))
+            .max(self.folder_terminal.scroll_top);
         self.folder_terminal.screen = next;
         self.folder_terminal.dirty = true;
     }
@@ -6667,8 +6766,32 @@ impl Aurora {
             return;
         }
         self.folder_terminal.esc.push(ch);
+        if self.folder_terminal.esc.len() > 4096 {
+            self.folder_terminal.esc.clear();
+            return;
+        }
         if self.folder_terminal.esc.starts_with("\x1b]") {
             if ch == '\x07' || self.folder_terminal.esc.ends_with("\x1b\\") {
+                self.folder_terminal.esc.clear();
+            }
+            return;
+        }
+        if self.folder_terminal.esc.starts_with("\x1bP")
+            || self.folder_terminal.esc.starts_with("\x1b^")
+            || self.folder_terminal.esc.starts_with("\x1b_")
+        {
+            if self.folder_terminal.esc.ends_with("\x1b\\") {
+                self.folder_terminal.esc.clear();
+            }
+            return;
+        }
+        if self.folder_terminal.esc.starts_with("\x1b#") {
+            if self.folder_terminal.esc.len() >= 3 {
+                if self.folder_terminal.esc.ends_with('8') {
+                    for row in &mut self.folder_terminal.screen {
+                        row.fill('E');
+                    }
+                }
                 self.folder_terminal.esc.clear();
             }
             return;
@@ -6682,7 +6805,50 @@ impl Aurora {
             }
             return;
         }
-        if !ch.is_ascii_alphabetic() && ch != '~' {
+        match self.folder_terminal.esc.as_str() {
+            "\x1b7" => {
+                self.save_terminal_cursor();
+                self.folder_terminal.esc.clear();
+                return;
+            }
+            "\x1b8" => {
+                self.restore_terminal_cursor();
+                self.folder_terminal.esc.clear();
+                return;
+            }
+            "\x1bD" => {
+                self.terminal_newline();
+                self.folder_terminal.esc.clear();
+                return;
+            }
+            "\x1bE" => {
+                self.folder_terminal.cursor_x = 0;
+                self.terminal_newline();
+                self.folder_terminal.esc.clear();
+                return;
+            }
+            "\x1bM" => {
+                self.terminal_reverse_index();
+                self.folder_terminal.esc.clear();
+                return;
+            }
+            "\x1bc" => {
+                self.reset_terminal_emulation();
+                self.folder_terminal.esc.clear();
+                return;
+            }
+            _ => {}
+        }
+        if self.folder_terminal.esc.starts_with("\x1bO") {
+            if self.folder_terminal.esc.len() >= 3 {
+                self.folder_terminal.esc.clear();
+            }
+            return;
+        }
+        if self.folder_terminal.esc == "\x1b[" {
+            return;
+        }
+        if !('\x40'..='\x7e').contains(&ch) {
             return;
         }
         let esc = std::mem::take(&mut self.folder_terminal.esc);
@@ -6693,35 +6859,37 @@ impl Aurora {
 
     fn apply_terminal_csi(&mut self, body: &str) {
         let command = body.chars().last().unwrap_or('m');
-        let params = &body[..body.len().saturating_sub(1)];
+        let private = body.starts_with('?');
+        let params = body[..body.len().saturating_sub(1)]
+            .trim_start_matches(['?', '>', '!', '='])
+            .trim_matches(|ch: char| ch == ' ' || ch == '$' || ch == '"' || ch == '\'');
+        let values = csi_values(params);
         let cols = self.folder_terminal.cols;
         let rows = self.folder_terminal.rows;
-        let private = params.starts_with('?');
-        let clean = params.trim_start_matches('?');
-        let values = clean
-            .split(';')
-            .filter_map(|part| {
-                part.chars()
-                    .filter(|ch| ch.is_ascii_digit())
-                    .collect::<String>()
-                    .parse::<usize>()
-                    .ok()
-            })
-            .collect::<Vec<_>>();
         if private && matches!(command, 'h' | 'l') {
-            if values
-                .iter()
-                .any(|value| matches!(*value, 1000 | 1002 | 1003 | 1006))
-            {
-                self.folder_terminal.mouse_enabled = command == 'h';
-            }
-            if values
-                .iter()
-                .any(|value| matches!(*value, 1047 | 1048 | 1049))
-            {
-                self.folder_terminal.screen = vec![vec![' '; cols]; rows];
-                self.folder_terminal.cursor_x = 0;
-                self.folder_terminal.cursor_y = 0;
+            let enabled = command == 'h';
+            for value in values {
+                match value {
+                    1 => self.folder_terminal.app_cursor_keys = enabled,
+                    3 => {
+                        self.folder_terminal.screen = vec![vec![' '; cols]; rows];
+                        self.folder_terminal.cursor_x = 0;
+                        self.folder_terminal.cursor_y = 0;
+                    }
+                    7 => self.folder_terminal.auto_wrap = enabled,
+                    9 | 1000 | 1002 | 1003 | 1006 => self.folder_terminal.mouse_enabled = enabled,
+                    1047 => self.set_terminal_alt_screen(enabled, false),
+                    1048 => {
+                        if enabled {
+                            self.save_terminal_cursor();
+                        } else {
+                            self.restore_terminal_cursor();
+                        }
+                    }
+                    1049 => self.set_terminal_alt_screen(enabled, true),
+                    2004 => self.folder_terminal.bracketed_paste = enabled,
+                    _ => {}
+                }
             }
             return;
         }
@@ -6754,6 +6922,19 @@ impl Aurora {
                     .cursor_x
                     .saturating_sub(values.first().copied().unwrap_or(1))
             }
+            'E' => {
+                self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y
+                    + values.first().copied().unwrap_or(1))
+                .min(rows - 1);
+                self.folder_terminal.cursor_x = 0;
+            }
+            'F' => {
+                self.folder_terminal.cursor_y = self
+                    .folder_terminal
+                    .cursor_y
+                    .saturating_sub(values.first().copied().unwrap_or(1));
+                self.folder_terminal.cursor_x = 0;
+            }
             'G' => {
                 self.folder_terminal.cursor_x = values
                     .first()
@@ -6761,6 +6942,18 @@ impl Aurora {
                     .unwrap_or(1)
                     .saturating_sub(1)
                     .min(cols - 1);
+            }
+            'I' => {
+                let next = ((self.folder_terminal.cursor_x / 8)
+                    + values.first().copied().unwrap_or(1))
+                    * 8;
+                self.folder_terminal.cursor_x = next.min(cols - 1);
+            }
+            'Z' => {
+                let previous = (self.folder_terminal.cursor_x / 8)
+                    .saturating_sub(values.first().copied().unwrap_or(1))
+                    * 8;
+                self.folder_terminal.cursor_x = previous.min(cols - 1);
             }
             'd' => {
                 self.folder_terminal.cursor_y = values
@@ -6789,6 +6982,7 @@ impl Aurora {
                         self.folder_terminal.screen[y][x] = ' ';
                     }
                 }
+                3 => self.folder_terminal.history.clear(),
                 _ => {
                     self.folder_terminal.screen = vec![vec![' '; cols]; rows];
                     self.folder_terminal.cursor_x = 0;
@@ -6832,39 +7026,193 @@ impl Aurora {
                     };
                 }
             }
-            '@' => {
-                let count = values.first().copied().unwrap_or(1).min(cols);
-                let y = self.folder_terminal.cursor_y;
-                for x in (self.folder_terminal.cursor_x..cols).rev() {
-                    self.folder_terminal.screen[y][x] = x
-                        .checked_sub(count)
-                        .filter(|src| *src >= self.folder_terminal.cursor_x)
-                        .map(|src| self.folder_terminal.screen[y][src])
-                        .unwrap_or(' ');
+            '@' => self.terminal_insert_blanks(values.first().copied().unwrap_or(1)),
+            'L' => self.terminal_insert_lines(values.first().copied().unwrap_or(1)),
+            'M' => self.terminal_delete_lines(values.first().copied().unwrap_or(1)),
+            'S' => self.terminal_scroll_up(values.first().copied().unwrap_or(1)),
+            'T' => self.terminal_scroll_down(values.first().copied().unwrap_or(1)),
+            'r' => {
+                let top = values.first().copied().unwrap_or(1).saturating_sub(1);
+                let bottom = values.get(1).copied().unwrap_or(rows).saturating_sub(1);
+                if top < bottom && bottom < rows {
+                    self.folder_terminal.scroll_top = top;
+                    self.folder_terminal.scroll_bottom = bottom;
+                    self.folder_terminal.cursor_y = top;
+                } else {
+                    self.folder_terminal.scroll_top = 0;
+                    self.folder_terminal.scroll_bottom = rows - 1;
+                    self.folder_terminal.cursor_y = 0;
                 }
+                self.folder_terminal.cursor_x = 0;
             }
-            'L' => {
-                let count = values.first().copied().unwrap_or(1).min(rows);
-                for _ in 0..count {
-                    self.folder_terminal
-                        .screen
-                        .insert(self.folder_terminal.cursor_y, vec![' '; cols]);
-                    self.folder_terminal.screen.truncate(rows);
-                }
-            }
-            'M' => {
-                let count = values.first().copied().unwrap_or(1).min(rows);
-                for _ in 0..count {
-                    if self.folder_terminal.cursor_y < self.folder_terminal.screen.len() {
-                        self.folder_terminal
-                            .screen
-                            .remove(self.folder_terminal.cursor_y);
-                        self.folder_terminal.screen.push(vec![' '; cols]);
+            's' => self.save_terminal_cursor(),
+            'u' => self.restore_terminal_cursor(),
+            'h' | 'l' => {
+                let enabled = command == 'h';
+                for value in values {
+                    if value == 4 {
+                        self.folder_terminal.insert_mode = enabled;
                     }
                 }
             }
-            'm' | 'r' | 's' | 'u' => {}
+            'm' | 'n' | 'q' => {}
             _ => {}
+        }
+    }
+
+    fn save_terminal_cursor(&mut self) {
+        self.folder_terminal.saved_cursor_x = self.folder_terminal.cursor_x;
+        self.folder_terminal.saved_cursor_y = self.folder_terminal.cursor_y;
+        self.folder_terminal.saved_line_drawing = self.folder_terminal.line_drawing;
+    }
+
+    fn restore_terminal_cursor(&mut self) {
+        self.folder_terminal.cursor_x = self
+            .folder_terminal
+            .saved_cursor_x
+            .min(self.folder_terminal.cols.saturating_sub(1));
+        self.folder_terminal.cursor_y = self
+            .folder_terminal
+            .saved_cursor_y
+            .min(self.folder_terminal.rows.saturating_sub(1));
+        self.folder_terminal.line_drawing = self.folder_terminal.saved_line_drawing;
+    }
+
+    fn reset_terminal_emulation(&mut self) {
+        let cols = self.folder_terminal.cols;
+        let rows = self.folder_terminal.rows;
+        self.folder_terminal.screen = vec![vec![' '; cols]; rows];
+        self.folder_terminal.cursor_x = 0;
+        self.folder_terminal.cursor_y = 0;
+        self.folder_terminal.saved_cursor_x = 0;
+        self.folder_terminal.saved_cursor_y = 0;
+        self.folder_terminal.line_drawing = false;
+        self.folder_terminal.saved_line_drawing = false;
+        self.folder_terminal.normal_screen = None;
+        self.folder_terminal.scroll_top = 0;
+        self.folder_terminal.scroll_bottom = rows.saturating_sub(1);
+        self.folder_terminal.insert_mode = false;
+        self.folder_terminal.auto_wrap = true;
+        self.folder_terminal.app_cursor_keys = false;
+        self.folder_terminal.bracketed_paste = false;
+        self.folder_terminal.mouse_enabled = false;
+    }
+
+    fn set_terminal_alt_screen(&mut self, enabled: bool, save_cursor: bool) {
+        let cols = self.folder_terminal.cols;
+        let rows = self.folder_terminal.rows;
+        if enabled {
+            if save_cursor {
+                self.save_terminal_cursor();
+            }
+            if self.folder_terminal.normal_screen.is_none() {
+                self.folder_terminal.normal_screen = Some(self.folder_terminal.screen.clone());
+            }
+            self.folder_terminal.screen = vec![vec![' '; cols]; rows];
+            self.folder_terminal.cursor_x = 0;
+            self.folder_terminal.cursor_y = 0;
+            self.folder_terminal.scroll_top = 0;
+            self.folder_terminal.scroll_bottom = rows.saturating_sub(1);
+        } else {
+            if let Some(screen) = self.folder_terminal.normal_screen.take() {
+                self.folder_terminal.screen = screen;
+            }
+            if save_cursor {
+                self.restore_terminal_cursor();
+            }
+            self.folder_terminal.scroll_top = 0;
+            self.folder_terminal.scroll_bottom = rows.saturating_sub(1);
+            self.folder_terminal.mouse_enabled = false;
+        }
+    }
+
+    fn terminal_insert_blanks(&mut self, count: usize) {
+        let cols = self.folder_terminal.cols;
+        let y = self.folder_terminal.cursor_y;
+        let count = count.min(cols);
+        for x in (self.folder_terminal.cursor_x..cols).rev() {
+            self.folder_terminal.screen[y][x] = x
+                .checked_sub(count)
+                .filter(|src| *src >= self.folder_terminal.cursor_x)
+                .map(|src| self.folder_terminal.screen[y][src])
+                .unwrap_or(' ');
+        }
+    }
+
+    fn terminal_insert_lines(&mut self, count: usize) {
+        let cols = self.folder_terminal.cols;
+        let bottom = self
+            .folder_terminal
+            .scroll_bottom
+            .min(self.folder_terminal.rows - 1);
+        if self.folder_terminal.cursor_y > bottom {
+            return;
+        }
+        for _ in 0..count.min(self.folder_terminal.rows) {
+            self.folder_terminal
+                .screen
+                .insert(self.folder_terminal.cursor_y, vec![' '; cols]);
+            self.folder_terminal.screen.remove(bottom + 1);
+        }
+    }
+
+    fn terminal_delete_lines(&mut self, count: usize) {
+        let cols = self.folder_terminal.cols;
+        let bottom = self
+            .folder_terminal
+            .scroll_bottom
+            .min(self.folder_terminal.rows - 1);
+        if self.folder_terminal.cursor_y > bottom {
+            return;
+        }
+        for _ in 0..count.min(self.folder_terminal.rows) {
+            self.folder_terminal
+                .screen
+                .remove(self.folder_terminal.cursor_y);
+            self.folder_terminal.screen.insert(bottom, vec![' '; cols]);
+        }
+    }
+
+    fn terminal_scroll_up(&mut self, count: usize) {
+        let cols = self.folder_terminal.cols;
+        let top = self.folder_terminal.scroll_top;
+        let bottom = self
+            .folder_terminal
+            .scroll_bottom
+            .min(self.folder_terminal.rows - 1);
+        for _ in 0..count.max(1) {
+            let removed = self.folder_terminal.screen.remove(top);
+            if top == 0 && bottom + 1 == self.folder_terminal.rows {
+                self.folder_terminal
+                    .history
+                    .push(removed.iter().collect::<String>());
+                if self.folder_terminal.history.len() > TERMINAL_HISTORY_LIMIT {
+                    let extra = self.folder_terminal.history.len() - TERMINAL_HISTORY_LIMIT;
+                    self.folder_terminal.history.drain(0..extra);
+                }
+            }
+            self.folder_terminal.screen.insert(bottom, vec![' '; cols]);
+        }
+    }
+
+    fn terminal_scroll_down(&mut self, count: usize) {
+        let cols = self.folder_terminal.cols;
+        let top = self.folder_terminal.scroll_top;
+        let bottom = self
+            .folder_terminal
+            .scroll_bottom
+            .min(self.folder_terminal.rows - 1);
+        for _ in 0..count.max(1) {
+            self.folder_terminal.screen.remove(bottom);
+            self.folder_terminal.screen.insert(top, vec![' '; cols]);
+        }
+    }
+
+    fn terminal_reverse_index(&mut self) {
+        if self.folder_terminal.cursor_y == self.folder_terminal.scroll_top {
+            self.terminal_scroll_down(1);
+        } else {
+            self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.saturating_sub(1);
         }
     }
 
@@ -6872,10 +7220,17 @@ impl Aurora {
         let cols = self.folder_terminal.cols;
         let rows = self.folder_terminal.rows;
         if self.folder_terminal.cursor_x >= cols {
-            self.terminal_newline();
+            if self.folder_terminal.auto_wrap {
+                self.terminal_newline();
+            } else {
+                self.folder_terminal.cursor_x = cols.saturating_sub(1);
+            }
         }
         let x = self.folder_terminal.cursor_x.min(cols - 1);
         let y = self.folder_terminal.cursor_y.min(rows - 1);
+        if self.folder_terminal.insert_mode {
+            self.terminal_insert_blanks(1);
+        }
         self.folder_terminal.screen[y][x] =
             terminal_display_char(ch, self.folder_terminal.line_drawing);
         self.folder_terminal.cursor_x += 1;
@@ -6883,18 +7238,8 @@ impl Aurora {
 
     fn terminal_newline(&mut self) {
         self.folder_terminal.cursor_x = 0;
-        if self.folder_terminal.cursor_y + 1 >= self.folder_terminal.rows {
-            let removed = self.folder_terminal.screen.remove(0);
-            self.folder_terminal
-                .history
-                .push(removed.iter().collect::<String>());
-            if self.folder_terminal.history.len() > TERMINAL_HISTORY_LIMIT {
-                let extra = self.folder_terminal.history.len() - TERMINAL_HISTORY_LIMIT;
-                self.folder_terminal.history.drain(0..extra);
-            }
-            self.folder_terminal
-                .screen
-                .push(vec![' '; self.folder_terminal.cols]);
+        if self.folder_terminal.cursor_y >= self.folder_terminal.scroll_bottom {
+            self.terminal_scroll_up(1);
         } else {
             self.folder_terminal.cursor_y += 1;
         }
@@ -10819,6 +11164,25 @@ fn terminal_display_char(ch: char, line_drawing: bool) -> char {
         'l' | 'k' | 'm' | 'j' | 't' | 'u' | 'v' | 'w' | 'n' => '+',
         _ => ch,
     }
+}
+
+fn csi_values(params: &str) -> Vec<usize> {
+    if params.is_empty() {
+        return Vec::new();
+    }
+    params
+        .split(';')
+        .map(|part| {
+            let number = part
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            number.parse::<usize>().unwrap_or(0)
+        })
+        .collect()
 }
 
 fn format_clock() -> String {
