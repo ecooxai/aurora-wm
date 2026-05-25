@@ -57,6 +57,8 @@ const TERMINAL_FALLBACKS: [&str; 5] = [
 ];
 const FONT_REGULAR: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Bold.ttf");
+const FONT_TERMINAL_REGULAR: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSansMono-Regular.ttf");
+const FONT_TERMINAL_BOLD: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSansMono-Bold.ttf");
 
 static WALLPAPERS: &[WallpaperAsset] = &[
     WallpaperAsset {
@@ -110,9 +112,9 @@ const MAX_WORKSPACE_COUNT: usize = 8;
 const WORKSPACE_STRIDE: i32 = 27;
 const WORKSPACE_SIZE: i32 = 18;
 const FOLDER_DEFAULT_WIDTH: u16 = 330;
-const FOLDER_DEFAULT_HEIGHT: u16 = 420;
+const FOLDER_DEFAULT_HEIGHT: u16 = 220;
 const FOLDER_MIN_WIDTH: u16 = 260;
-const FOLDER_MIN_HEIGHT: u16 = 320;
+const FOLDER_MIN_HEIGHT: u16 = 160;
 const TERMINAL_MIN_WIDTH: u16 = 260;
 const TERMINAL_MIN_HEIGHT: u16 = 120;
 const TERMINAL_DEFAULT_WIDTH: u16 = 760;
@@ -788,6 +790,9 @@ struct FolderTerminal {
     history: Vec<String>,
     scrollback: usize,
     screen: Vec<Vec<char>>,
+    screen_fg: Vec<Vec<u8>>,
+    screen_bg: Vec<Vec<u8>>,
+    screen_bold: Vec<Vec<bool>>,
     cols: usize,
     rows: usize,
     cursor_x: usize,
@@ -798,6 +803,9 @@ struct FolderTerminal {
     line_drawing: bool,
     saved_line_drawing: bool,
     normal_screen: Option<Vec<Vec<char>>>,
+    normal_screen_fg: Option<Vec<Vec<u8>>>,
+    normal_screen_bg: Option<Vec<Vec<u8>>>,
+    normal_screen_bold: Option<Vec<Vec<bool>>>,
     scroll_top: usize,
     scroll_bottom: usize,
     insert_mode: bool,
@@ -805,6 +813,9 @@ struct FolderTerminal {
     app_cursor_keys: bool,
     bracketed_paste: bool,
     mouse_enabled: bool,
+    current_fg: u8,
+    current_bg: u8,
+    current_bold: bool,
     zoom: i8,
     dirty: bool,
 }
@@ -846,10 +857,12 @@ struct WorkspaceUiState {
 }
 
 impl WorkspaceUiState {
-    fn new() -> Self {
+    fn new(screen_height: u16) -> Self {
         let folder_mode = FolderMode::Home;
         let folder_sort = FolderSort::Name;
         let folder_path = folder_path_for(folder_mode);
+        let fh = (screen_height as f32 * 0.5) as u16;
+        let th = (screen_height as f32 * 0.4) as u16;
         Self {
             folder_mode,
             folder_entries: folder_entries_in(folder_path.clone(), folder_sort),
@@ -861,9 +874,9 @@ impl WorkspaceUiState {
             folder_sort_open: false,
             folder_sort,
             folder_width: FOLDER_DEFAULT_WIDTH,
-            folder_height: FOLDER_DEFAULT_HEIGHT,
+            folder_height: fh,
             folder_terminal_width: TERMINAL_DEFAULT_WIDTH,
-            folder_terminal_height: terminal_default_height_for(FOLDER_DEFAULT_HEIGHT, 900),
+            folder_terminal_height: th,
             folder_terminal: FolderTerminal::new(folder_path),
             media: None,
             media_slots: vec![None; MEDIA_SLOT_COUNT],
@@ -907,6 +920,9 @@ impl FolderTerminal {
             history: Vec::new(),
             scrollback: 0,
             screen: vec![vec![' '; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
+            screen_fg: vec![vec![255; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
+            screen_bg: vec![vec![255; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
+            screen_bold: vec![vec![false; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
             cols: FOLDER_TERMINAL_DEFAULT_COLS,
             rows: FOLDER_TERMINAL_DEFAULT_ROWS,
             cursor_x: 0,
@@ -917,6 +933,9 @@ impl FolderTerminal {
             line_drawing: false,
             saved_line_drawing: false,
             normal_screen: None,
+            normal_screen_fg: None,
+            normal_screen_bg: None,
+            normal_screen_bold: None,
             scroll_top: 0,
             scroll_bottom: FOLDER_TERMINAL_DEFAULT_ROWS - 1,
             insert_mode: false,
@@ -924,6 +943,9 @@ impl FolderTerminal {
             app_cursor_keys: false,
             bracketed_paste: false,
             mouse_enabled: false,
+            current_fg: 255,
+            current_bg: 255,
+            current_bold: false,
             zoom: 0,
             dirty: true,
         }
@@ -1068,6 +1090,8 @@ struct Aurora {
     ui: UiWindows,
     regular: Font<'static>,
     bold: Font<'static>,
+    terminal_regular: Font<'static>,
+    terminal_bold: Font<'static>,
     settings: SettingsState,
     terminal_apps: Vec<InstalledApp>,
     browser_apps: Vec<InstalledApp>,
@@ -1229,6 +1253,8 @@ impl Aurora {
 
         let regular = Font::try_from_bytes(FONT_REGULAR).ok_or("failed to load regular font")?;
         let bold = Font::try_from_bytes(FONT_BOLD).ok_or("failed to load bold font")?;
+        let terminal_regular = Font::try_from_bytes(FONT_TERMINAL_REGULAR).ok_or("failed to load terminal regular font")?;
+        let terminal_bold = Font::try_from_bytes(FONT_TERMINAL_BOLD).ok_or("failed to load terminal bold font")?;
         let wallpaper_pixels = render_wallpaper_pixels(
             WALLPAPERS[0].bytes,
             screen.width_in_pixels,
@@ -1266,7 +1292,7 @@ impl Aurora {
         let display_modes =
             read_display_modes(&display, screen.width_in_pixels, screen.height_in_pixels);
         let workspace_ui = (0..DEFAULT_WORKSPACE_COUNT)
-            .map(|_| WorkspaceUiState::new())
+            .map(|_| WorkspaceUiState::new(screen.height_in_pixels))
             .collect();
         let mut app = Self {
             conn,
@@ -1287,6 +1313,8 @@ impl Aurora {
             ui,
             regular,
             bold,
+            terminal_regular,
+            terminal_bold,
             settings: SettingsState::default(),
             terminal_apps,
             browser_apps,
@@ -1320,12 +1348,9 @@ impl Aurora {
             folder_sort_open: false,
             folder_sort: FolderSort::Name,
             folder_width: FOLDER_DEFAULT_WIDTH,
-            folder_height: FOLDER_DEFAULT_HEIGHT,
+            folder_height: (screen.height_in_pixels as f32 * 0.5) as u16,
             folder_terminal_width: TERMINAL_DEFAULT_WIDTH,
-            folder_terminal_height: terminal_default_height_for(
-                FOLDER_DEFAULT_HEIGHT,
-                screen.height_in_pixels,
-            ),
+            folder_terminal_height: (screen.height_in_pixels as f32 * 0.4) as u16,
             folder_terminal: FolderTerminal::new(folder_path_for(FolderMode::Home)),
             media: None,
             media_slots: vec![None; MEDIA_SLOT_COUNT],
@@ -5116,7 +5141,7 @@ impl Aurora {
         }
         let workspace = self.workspace_count;
         self.workspace_count += 1;
-        self.workspace_ui.push(WorkspaceUiState::new());
+        self.workspace_ui.push(WorkspaceUiState::new(self.screen_height));
 
         // Update EWMH _NET_NUMBER_OF_DESKTOPS
         if let Ok(num_atom) = self.atom(b"_NET_NUMBER_OF_DESKTOPS") {
@@ -5157,13 +5182,13 @@ impl Aurora {
             self.conn.unmap_window(frame)?;
         }
         while self.workspace_ui.len() <= workspace {
-            self.workspace_ui.push(WorkspaceUiState::new());
+            self.workspace_ui.push(WorkspaceUiState::new(self.screen_height));
         }
         let previous_ui = self.take_workspace_ui_state();
         if let Some(slot) = self.workspace_ui.get_mut(previous) {
             *slot = previous_ui;
         }
-        let next_ui = std::mem::replace(&mut self.workspace_ui[workspace], WorkspaceUiState::new());
+        let next_ui = std::mem::replace(&mut self.workspace_ui[workspace], WorkspaceUiState::new(self.screen_height));
         self.apply_workspace_ui_state(next_ui);
         self.active_workspace = workspace;
 
@@ -6260,6 +6285,7 @@ impl Aurora {
         );
         let font_size = self.folder_terminal_font_size();
         let cell_h = self.folder_terminal_cell_h();
+        let cell_w = self.folder_terminal_cell_w();
         let cols = self.folder_terminal.cols;
         let rows_count = self.folder_terminal.rows;
         let visible_rows = ((i32::from(h) - 56) / cell_h).max(1).min(rows_count as i32) as usize;
@@ -6269,21 +6295,51 @@ impl Aurora {
                 terminal_selection_rects(selection, &rows, self.folder_terminal_cell_w(), cell_h)
             {
                 c.draw_round_rect(
-                    i32::from(rect.x),
-                    i32::from(rect.y),
-                    i32::from(rect.width),
-                    i32::from(rect.height),
-                    3,
-                    Color::rgba(175, 229, 245, 92),
+                     i32::from(rect.x),
+                     i32::from(rect.y),
+                     i32::from(rect.width),
+                     i32::from(rect.height),
+                     3,
+                     Color::rgba(175, 229, 245, 92),
                 );
             }
         }
         for (idx, row) in rows.iter().enumerate() {
             let y = 52 + idx as i32 * cell_h;
-            let shown = row.chars().take(cols).collect::<String>();
-            let trimmed = shown.trim_end();
-            if !trimmed.is_empty() {
-                c.draw_text(&self.regular, trimmed, 18, y, font_size, INK);
+            let row_chars: Vec<char> = row.chars().take(cols).collect();
+            let mut col_idx = 0;
+            while col_idx < row_chars.len() {
+                let fg_color_idx = self.folder_terminal.screen_fg.get(idx).and_then(|r| r.get(col_idx)).copied().unwrap_or(255);
+                let bg_color_idx = self.folder_terminal.screen_bg.get(idx).and_then(|r| r.get(col_idx)).copied().unwrap_or(255);
+                let is_bold = self.folder_terminal.screen_bold.get(idx).and_then(|r| r.get(col_idx)).copied().unwrap_or(false);
+                
+                let mut run_len = 1;
+                while col_idx + run_len < row_chars.len() 
+                    && self.folder_terminal.screen_fg.get(idx).and_then(|r| r.get(col_idx + run_len)).copied().unwrap_or(255) == fg_color_idx
+                    && self.folder_terminal.screen_bg.get(idx).and_then(|r| r.get(col_idx + run_len)).copied().unwrap_or(255) == bg_color_idx
+                    && self.folder_terminal.screen_bold.get(idx).and_then(|r| r.get(col_idx + run_len)).copied().unwrap_or(false) == is_bold
+                {
+                    run_len += 1;
+                }
+                
+                let run_chars = &row_chars[col_idx..col_idx + run_len];
+                let x_pos = 18 + col_idx as i32 * cell_w;
+                let width_px = run_len as i32 * cell_w;
+                
+                if bg_color_idx != 255 {
+                    let bg_color = ansi_color(bg_color_idx);
+                    c.draw_rect(x_pos, y, width_px, cell_h, bg_color);
+                }
+                
+                let run_str: String = run_chars.iter().collect();
+                let trimmed_len = run_str.trim_end().len();
+                if trimmed_len > 0 {
+                    let fg_color = if fg_color_idx == 255 { INK } else { ansi_color(fg_color_idx) };
+                    let font = if is_bold { &self.terminal_bold } else { &self.terminal_regular };
+                    c.draw_text(font, &run_str[..trimmed_len], x_pos, y, font_size, fg_color);
+                }
+                
+                col_idx += run_len;
             }
         }
         if self.folder_terminal.focused {
@@ -6297,7 +6353,7 @@ impl Aurora {
                 .chars()
                 .take(self.folder_terminal.cursor_x.min(cols - 1))
                 .collect::<String>();
-            let cursor_x = 18 + measure_text(&self.regular, &prefix, font_size);
+            let cursor_x = 18 + measure_text(&self.terminal_regular, &prefix, font_size);
             let cursor_y = 53 + self.folder_terminal.cursor_y.min(rows_count - 1) as i32 * cell_h;
             c.draw_rect(cursor_x, cursor_y, 2, (font_size + 1.0) as i32, MINT_DARK);
         }
@@ -6329,7 +6385,7 @@ impl Aurora {
     }
 
     fn folder_terminal_cell_w(&self) -> i32 {
-        (FOLDER_TERMINAL_CELL_W + i32::from(self.folder_terminal.zoom)).max(6)
+        measure_text(&self.terminal_regular, "A", self.folder_terminal_font_size()).max(6)
     }
 
     fn folder_terminal_cell_h(&self) -> i32 {
@@ -6600,6 +6656,12 @@ impl Aurora {
                 self.folder_terminal.scrollback = 0;
                 self.folder_terminal.screen =
                     vec![vec![' '; self.folder_terminal.cols]; self.folder_terminal.rows];
+                self.folder_terminal.screen_fg =
+                    vec![vec![255; self.folder_terminal.cols]; self.folder_terminal.rows];
+                self.folder_terminal.screen_bg =
+                    vec![vec![255; self.folder_terminal.cols]; self.folder_terminal.rows];
+                self.folder_terminal.screen_bold =
+                    vec![vec![false; self.folder_terminal.cols]; self.folder_terminal.rows];
                 self.folder_terminal.cursor_x = 0;
                 self.folder_terminal.cursor_y = 0;
                 self.folder_terminal.saved_cursor_x = 0;
@@ -6608,6 +6670,9 @@ impl Aurora {
                 self.folder_terminal.line_drawing = false;
                 self.folder_terminal.saved_line_drawing = false;
                 self.folder_terminal.normal_screen = None;
+                self.folder_terminal.normal_screen_fg = None;
+                self.folder_terminal.normal_screen_bg = None;
+                self.folder_terminal.normal_screen_bold = None;
                 self.folder_terminal.scroll_top = 0;
                 self.folder_terminal.scroll_bottom = self.folder_terminal.rows.saturating_sub(1);
                 self.folder_terminal.insert_mode = false;
@@ -6640,7 +6705,13 @@ impl Aurora {
 
     fn resize_folder_terminal_screen(&mut self, cols: usize, rows: usize) {
         let old_rows = std::mem::take(&mut self.folder_terminal.screen);
+        let old_fg = std::mem::take(&mut self.folder_terminal.screen_fg);
+        let old_bg = std::mem::take(&mut self.folder_terminal.screen_bg);
+        let old_bold = std::mem::take(&mut self.folder_terminal.screen_bold);
         let mut next = vec![vec![' '; cols]; rows];
+        let mut next_fg = vec![vec![255; cols]; rows];
+        let mut next_bg = vec![vec![255; cols]; rows];
+        let mut next_bold = vec![vec![false; cols]; rows];
         let copy_rows = old_rows.len().min(rows);
         let copy_cols = self.folder_terminal.cols.min(cols);
         let old_start = old_rows.len().saturating_sub(copy_rows);
@@ -6648,6 +6719,15 @@ impl Aurora {
         for idx in 0..copy_rows {
             for col in 0..copy_cols {
                 next[new_start + idx][col] = old_rows[old_start + idx][col];
+                if old_fg.len() > old_start + idx && old_fg[old_start + idx].len() > col {
+                    next_fg[new_start + idx][col] = old_fg[old_start + idx][col];
+                }
+                if old_bg.len() > old_start + idx && old_bg[old_start + idx].len() > col {
+                    next_bg[new_start + idx][col] = old_bg[old_start + idx][col];
+                }
+                if old_bold.len() > old_start + idx && old_bold[old_start + idx].len() > col {
+                    next_bold[new_start + idx][col] = old_bold[old_start + idx][col];
+                }
             }
         }
         self.folder_terminal.cols = cols;
@@ -6670,6 +6750,9 @@ impl Aurora {
             .min(rows.saturating_sub(1))
             .max(self.folder_terminal.scroll_top);
         self.folder_terminal.screen = next;
+        self.folder_terminal.screen_fg = next_fg;
+        self.folder_terminal.screen_bg = next_bg;
+        self.folder_terminal.screen_bold = next_bold;
         self.folder_terminal.dirty = true;
     }
 
@@ -6685,7 +6768,10 @@ impl Aurora {
         };
         unsafe {
             let _ = libc::ioctl(fd, libc::TIOCSWINSZ, &mut winsize);
-            if let Some(pid) = self.folder_terminal.child_pid {
+            let pgrp = libc::tcgetpgrp(fd);
+            if pgrp > 0 {
+                let _ = libc::kill(-pgrp, libc::SIGWINCH);
+            } else if let Some(pid) = self.folder_terminal.child_pid {
                 let _ = libc::kill(-pid, libc::SIGWINCH);
             }
         }
@@ -6728,6 +6814,12 @@ impl Aurora {
         self.folder_terminal.scrollback = 0;
         self.folder_terminal.screen =
             vec![vec![' '; self.folder_terminal.cols]; self.folder_terminal.rows];
+        self.folder_terminal.screen_fg =
+            vec![vec![255; self.folder_terminal.cols]; self.folder_terminal.rows];
+        self.folder_terminal.screen_bg =
+            vec![vec![255; self.folder_terminal.cols]; self.folder_terminal.rows];
+        self.folder_terminal.screen_bold =
+            vec![vec![false; self.folder_terminal.cols]; self.folder_terminal.rows];
         for (idx, ch) in message.chars().take(self.folder_terminal.cols).enumerate() {
             self.folder_terminal.screen[0][idx] = ch;
         }
@@ -6752,7 +6844,7 @@ impl Aurora {
                 self.folder_terminal.cursor_x = self.folder_terminal.cursor_x.saturating_sub(1);
             }
             '\t' => {
-                let next = ((self.folder_terminal.cursor_x / 4) + 1) * 4;
+                let next = ((self.folder_terminal.cursor_x / 8) + 1) * 8;
                 self.folder_terminal.cursor_x = next.min(self.folder_terminal.cols - 1);
             }
             c if !c.is_control() => self.terminal_put_char(c),
@@ -6761,6 +6853,11 @@ impl Aurora {
     }
 
     fn feed_terminal_escape(&mut self, ch: char) {
+        if ch == '\x1b' {
+            self.folder_terminal.esc.clear();
+            self.folder_terminal.esc.push('\x1b');
+            return;
+        }
         if self.folder_terminal.esc.is_empty() {
             self.folder_terminal.esc.push(ch);
             return;
@@ -6805,39 +6902,84 @@ impl Aurora {
             }
             return;
         }
-        match self.folder_terminal.esc.as_str() {
-            "\x1b7" => {
-                self.save_terminal_cursor();
-                self.folder_terminal.esc.clear();
-                return;
+        if self.folder_terminal.esc.len() == 2 {
+            match self.folder_terminal.esc.as_str() {
+                "\x1b7" => {
+                    self.save_terminal_cursor();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1b8" => {
+                    self.restore_terminal_cursor();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1bD" => {
+                    self.terminal_linefeed();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1bE" => {
+                    self.terminal_newline();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1bM" => {
+                    self.terminal_reverse_index();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1bc" => {
+                    self.reset_terminal_emulation();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1b=" | "\x1b>" | "\x1b<" => {
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                _ => {
+                    let second = self.folder_terminal.esc.chars().nth(1).unwrap();
+                    if !matches!(second, '[' | '(' | ')' | '#' | 'O' | ']' | 'P' | '^' | '_') {
+                        self.folder_terminal.esc.clear();
+                        return;
+                    }
+                }
             }
-            "\x1b8" => {
-                self.restore_terminal_cursor();
-                self.folder_terminal.esc.clear();
-                return;
+        } else {
+            match self.folder_terminal.esc.as_str() {
+                "\x1b7" => {
+                    self.save_terminal_cursor();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1b8" => {
+                    self.restore_terminal_cursor();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1bD" => {
+                    self.terminal_linefeed();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1bE" => {
+                    self.terminal_newline();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1bM" => {
+                    self.terminal_reverse_index();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                "\x1bc" => {
+                    self.reset_terminal_emulation();
+                    self.folder_terminal.esc.clear();
+                    return;
+                }
+                _ => {}
             }
-            "\x1bD" => {
-                self.terminal_newline();
-                self.folder_terminal.esc.clear();
-                return;
-            }
-            "\x1bE" => {
-                self.folder_terminal.cursor_x = 0;
-                self.terminal_newline();
-                self.folder_terminal.esc.clear();
-                return;
-            }
-            "\x1bM" => {
-                self.terminal_reverse_index();
-                self.folder_terminal.esc.clear();
-                return;
-            }
-            "\x1bc" => {
-                self.reset_terminal_emulation();
-                self.folder_terminal.esc.clear();
-                return;
-            }
-            _ => {}
         }
         if self.folder_terminal.esc.starts_with("\x1bO") {
             if self.folder_terminal.esc.len() >= 3 {
@@ -6895,155 +7037,243 @@ impl Aurora {
         }
         match command {
             'H' | 'f' => {
-                let row = values.first().copied().unwrap_or(1).saturating_sub(1);
-                let col = values.get(1).copied().unwrap_or(1).saturating_sub(1);
+                let row = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
+                let col = values.get(1).copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
                 self.folder_terminal.cursor_y = row.min(rows - 1);
                 self.folder_terminal.cursor_x = col.min(cols - 1);
             }
             'A' => {
-                self.folder_terminal.cursor_y = self
-                    .folder_terminal
-                    .cursor_y
-                    .saturating_sub(values.first().copied().unwrap_or(1))
+                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.saturating_sub(amt);
             }
             'B' => {
-                self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y
-                    + values.first().copied().unwrap_or(1))
-                .min(rows - 1)
+                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y + amt).min(rows - 1);
             }
             'C' => {
-                self.folder_terminal.cursor_x = (self.folder_terminal.cursor_x
-                    + values.first().copied().unwrap_or(1))
-                .min(cols - 1)
+                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.folder_terminal.cursor_x = (self.folder_terminal.cursor_x + amt).min(cols - 1);
             }
             'D' => {
-                self.folder_terminal.cursor_x = self
-                    .folder_terminal
-                    .cursor_x
-                    .saturating_sub(values.first().copied().unwrap_or(1))
+                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.folder_terminal.cursor_x = self.folder_terminal.cursor_x.saturating_sub(amt);
             }
             'E' => {
-                self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y
-                    + values.first().copied().unwrap_or(1))
-                .min(rows - 1);
+                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y + amt).min(rows - 1);
                 self.folder_terminal.cursor_x = 0;
             }
             'F' => {
-                self.folder_terminal.cursor_y = self
-                    .folder_terminal
-                    .cursor_y
-                    .saturating_sub(values.first().copied().unwrap_or(1));
+                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.saturating_sub(amt);
                 self.folder_terminal.cursor_x = 0;
             }
             'G' => {
-                self.folder_terminal.cursor_x = values
-                    .first()
-                    .copied()
-                    .unwrap_or(1)
-                    .saturating_sub(1)
-                    .min(cols - 1);
+                let col = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
+                self.folder_terminal.cursor_x = col.min(cols - 1);
             }
             'I' => {
-                let next = ((self.folder_terminal.cursor_x / 8)
-                    + values.first().copied().unwrap_or(1))
-                    * 8;
+                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let next = ((self.folder_terminal.cursor_x / 8) + amt) * 8;
                 self.folder_terminal.cursor_x = next.min(cols - 1);
             }
             'Z' => {
-                let previous = (self.folder_terminal.cursor_x / 8)
-                    .saturating_sub(values.first().copied().unwrap_or(1))
-                    * 8;
+                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let previous = (self.folder_terminal.cursor_x / 8).saturating_sub(amt) * 8;
                 self.folder_terminal.cursor_x = previous.min(cols - 1);
             }
             'd' => {
-                self.folder_terminal.cursor_y = values
-                    .first()
-                    .copied()
-                    .unwrap_or(1)
-                    .saturating_sub(1)
-                    .min(rows - 1);
+                let row = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
+                self.folder_terminal.cursor_y = row.min(rows - 1);
             }
             'J' => match values.first().copied().unwrap_or(0) {
                 0 => {
-                    let y = self.folder_terminal.cursor_y;
+                    let y = self.folder_terminal.cursor_y.min(rows - 1);
                     for x in self.folder_terminal.cursor_x..cols {
                         self.folder_terminal.screen[y][x] = ' ';
+                        self.folder_terminal.screen_fg[y][x] = 255;
+                        self.folder_terminal.screen_bg[y][x] = 255;
+                        self.folder_terminal.screen_bold[y][x] = false;
                     }
                     for yy in y + 1..rows {
                         self.folder_terminal.screen[yy].fill(' ');
+                        self.folder_terminal.screen_fg[yy].fill(255);
+                        self.folder_terminal.screen_bg[yy].fill(255);
+                        self.folder_terminal.screen_bold[yy].fill(false);
                     }
                 }
                 1 => {
-                    for yy in 0..self.folder_terminal.cursor_y {
+                    let y = self.folder_terminal.cursor_y.min(rows - 1);
+                    for yy in 0..y {
                         self.folder_terminal.screen[yy].fill(' ');
+                        self.folder_terminal.screen_fg[yy].fill(255);
+                        self.folder_terminal.screen_bg[yy].fill(255);
+                        self.folder_terminal.screen_bold[yy].fill(false);
                     }
-                    let y = self.folder_terminal.cursor_y;
                     for x in 0..=self.folder_terminal.cursor_x.min(cols - 1) {
                         self.folder_terminal.screen[y][x] = ' ';
+                        self.folder_terminal.screen_fg[y][x] = 255;
+                        self.folder_terminal.screen_bg[y][x] = 255;
+                        self.folder_terminal.screen_bold[y][x] = false;
                     }
                 }
                 3 => self.folder_terminal.history.clear(),
                 _ => {
+                    // Erase entire display (CSI 2 J) - Cursor position does NOT change!
                     self.folder_terminal.screen = vec![vec![' '; cols]; rows];
-                    self.folder_terminal.cursor_x = 0;
-                    self.folder_terminal.cursor_y = 0;
+                    self.folder_terminal.screen_fg = vec![vec![255; cols]; rows];
+                    self.folder_terminal.screen_bg = vec![vec![255; cols]; rows];
+                    self.folder_terminal.screen_bold = vec![vec![false; cols]; rows];
                 }
             },
             'K' => {
-                let y = self.folder_terminal.cursor_y;
+                let y = self.folder_terminal.cursor_y.min(rows - 1);
                 match values.first().copied().unwrap_or(0) {
                     0 => {
                         for x in self.folder_terminal.cursor_x..cols {
                             self.folder_terminal.screen[y][x] = ' ';
+                            self.folder_terminal.screen_fg[y][x] = 255;
+                            self.folder_terminal.screen_bg[y][x] = 255;
+                            self.folder_terminal.screen_bold[y][x] = false;
                         }
                     }
                     1 => {
                         for x in 0..=self.folder_terminal.cursor_x.min(cols - 1) {
                             self.folder_terminal.screen[y][x] = ' ';
+                            self.folder_terminal.screen_fg[y][x] = 255;
+                            self.folder_terminal.screen_bg[y][x] = 255;
+                            self.folder_terminal.screen_bold[y][x] = false;
                         }
                     }
-                    _ => self.folder_terminal.screen[y].fill(' '),
+                    _ => {
+                        self.folder_terminal.screen[y].fill(' ');
+                        self.folder_terminal.screen_fg[y].fill(255);
+                        self.folder_terminal.screen_bg[y].fill(255);
+                        self.folder_terminal.screen_bold[y].fill(false);
+                    }
                 }
             }
             'X' => {
-                let count = values.first().copied().unwrap_or(1);
-                let y = self.folder_terminal.cursor_y;
-                for x in
-                    self.folder_terminal.cursor_x..(self.folder_terminal.cursor_x + count).min(cols)
-                {
+                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let y = self.folder_terminal.cursor_y.min(rows - 1);
+                for x in self.folder_terminal.cursor_x..(self.folder_terminal.cursor_x + count).min(cols) {
                     self.folder_terminal.screen[y][x] = ' ';
+                    self.folder_terminal.screen_fg[y][x] = 255;
+                    self.folder_terminal.screen_bg[y][x] = 255;
+                    self.folder_terminal.screen_bold[y][x] = false;
                 }
             }
             'P' => {
-                let count = values.first().copied().unwrap_or(1).min(cols);
-                let y = self.folder_terminal.cursor_y;
+                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).min(cols);
+                let y = self.folder_terminal.cursor_y.min(rows - 1);
                 for x in self.folder_terminal.cursor_x..cols {
                     let src = x + count;
-                    self.folder_terminal.screen[y][x] = if src < cols {
-                        self.folder_terminal.screen[y][src]
+                    if src < cols {
+                        self.folder_terminal.screen[y][x] = self.folder_terminal.screen[y][src];
+                        self.folder_terminal.screen_fg[y][x] = self.folder_terminal.screen_fg[y][src];
+                        self.folder_terminal.screen_bg[y][x] = self.folder_terminal.screen_bg[y][src];
+                        self.folder_terminal.screen_bold[y][x] = self.folder_terminal.screen_bold[y][src];
                     } else {
-                        ' '
-                    };
+                        self.folder_terminal.screen[y][x] = ' ';
+                        self.folder_terminal.screen_fg[y][x] = 255;
+                        self.folder_terminal.screen_bg[y][x] = 255;
+                        self.folder_terminal.screen_bold[y][x] = false;
+                    }
                 }
             }
-            '@' => self.terminal_insert_blanks(values.first().copied().unwrap_or(1)),
-            'L' => self.terminal_insert_lines(values.first().copied().unwrap_or(1)),
-            'M' => self.terminal_delete_lines(values.first().copied().unwrap_or(1)),
-            'S' => self.terminal_scroll_up(values.first().copied().unwrap_or(1)),
-            'T' => self.terminal_scroll_down(values.first().copied().unwrap_or(1)),
+            'm' => {
+                if values.is_empty() {
+                    self.folder_terminal.current_fg = 255;
+                    self.folder_terminal.current_bg = 255;
+                    self.folder_terminal.current_bold = false;
+                } else {
+                    let mut i = 0;
+                    while i < values.len() {
+                        let val = values[i];
+                        match val {
+                            0 => {
+                                self.folder_terminal.current_fg = 255;
+                                self.folder_terminal.current_bg = 255;
+                                self.folder_terminal.current_bold = false;
+                            }
+                            1 => {
+                                self.folder_terminal.current_bold = true;
+                            }
+                            22 => {
+                                self.folder_terminal.current_bold = false;
+                            }
+                            30..=37 => {
+                                self.folder_terminal.current_fg = (val - 30) as u8;
+                            }
+                            38 => {
+                                if i + 2 < values.len() && values[i + 1] == 5 {
+                                    self.folder_terminal.current_fg = values[i + 2] as u8;
+                                    i += 2;
+                                } else if i + 4 < values.len() && values[i + 1] == 2 {
+                                    i += 4;
+                                }
+                            }
+                            39 => {
+                                self.folder_terminal.current_fg = 255;
+                            }
+                            40..=47 => {
+                                self.folder_terminal.current_bg = (val - 40) as u8;
+                            }
+                            48 => {
+                                if i + 2 < values.len() && values[i + 1] == 5 {
+                                    self.folder_terminal.current_bg = values[i + 2] as u8;
+                                    i += 2;
+                                } else if i + 4 < values.len() && values[i + 1] == 2 {
+                                    i += 4;
+                                }
+                            }
+                            49 => {
+                                self.folder_terminal.current_bg = 255;
+                            }
+                            90..=97 => {
+                                self.folder_terminal.current_fg = (val - 90 + 8) as u8;
+                            }
+                            100..=107 => {
+                                self.folder_terminal.current_bg = (val - 100 + 8) as u8;
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            '@' => {
+                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.terminal_insert_blanks(count);
+            }
+            'L' => {
+                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.terminal_insert_lines(count);
+            }
+            'M' => {
+                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.terminal_delete_lines(count);
+            }
+            'S' => {
+                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.terminal_scroll_up(count);
+            }
+            'T' => {
+                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                self.terminal_scroll_down(count);
+            }
             'r' => {
-                let top = values.first().copied().unwrap_or(1).saturating_sub(1);
-                let bottom = values.get(1).copied().unwrap_or(rows).saturating_sub(1);
+                let top = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
+                let bottom = values.get(1).copied().map(|v| if v == 0 { rows } else { v }).unwrap_or(rows).saturating_sub(1);
                 if top < bottom && bottom < rows {
                     self.folder_terminal.scroll_top = top;
                     self.folder_terminal.scroll_bottom = bottom;
-                    self.folder_terminal.cursor_y = top;
                 } else {
                     self.folder_terminal.scroll_top = 0;
                     self.folder_terminal.scroll_bottom = rows - 1;
-                    self.folder_terminal.cursor_y = 0;
                 }
                 self.folder_terminal.cursor_x = 0;
+                self.folder_terminal.cursor_y = 0;
             }
             's' => self.save_terminal_cursor(),
             'u' => self.restore_terminal_cursor(),
@@ -7055,7 +7285,20 @@ impl Aurora {
                     }
                 }
             }
-            'm' | 'n' | 'q' => {}
+            'c' => {
+                self.write_folder_terminal(b"\x1b[?1;2c");
+            }
+            'n' => {
+                let val = values.first().copied().unwrap_or(0);
+                if val == 6 {
+                    let row = self.folder_terminal.cursor_y + 1;
+                    let col = self.folder_terminal.cursor_x + 1;
+                    let response = format!("\x1b[{};{}R", row, col);
+                    self.write_folder_terminal(response.as_bytes());
+                } else if val == 5 {
+                    self.write_folder_terminal(b"\x1b[0n");
+                }
+            }
             _ => {}
         }
     }
@@ -7082,6 +7325,9 @@ impl Aurora {
         let cols = self.folder_terminal.cols;
         let rows = self.folder_terminal.rows;
         self.folder_terminal.screen = vec![vec![' '; cols]; rows];
+        self.folder_terminal.screen_fg = vec![vec![255; cols]; rows];
+        self.folder_terminal.screen_bg = vec![vec![255; cols]; rows];
+        self.folder_terminal.screen_bold = vec![vec![false; cols]; rows];
         self.folder_terminal.cursor_x = 0;
         self.folder_terminal.cursor_y = 0;
         self.folder_terminal.saved_cursor_x = 0;
@@ -7089,6 +7335,12 @@ impl Aurora {
         self.folder_terminal.line_drawing = false;
         self.folder_terminal.saved_line_drawing = false;
         self.folder_terminal.normal_screen = None;
+        self.folder_terminal.normal_screen_fg = None;
+        self.folder_terminal.normal_screen_bg = None;
+        self.folder_terminal.normal_screen_bold = None;
+        self.folder_terminal.current_fg = 255;
+        self.folder_terminal.current_bg = 255;
+        self.folder_terminal.current_bold = false;
         self.folder_terminal.scroll_top = 0;
         self.folder_terminal.scroll_bottom = rows.saturating_sub(1);
         self.folder_terminal.insert_mode = false;
@@ -7108,7 +7360,19 @@ impl Aurora {
             if self.folder_terminal.normal_screen.is_none() {
                 self.folder_terminal.normal_screen = Some(self.folder_terminal.screen.clone());
             }
+            if self.folder_terminal.normal_screen_fg.is_none() {
+                self.folder_terminal.normal_screen_fg = Some(self.folder_terminal.screen_fg.clone());
+            }
+            if self.folder_terminal.normal_screen_bg.is_none() {
+                self.folder_terminal.normal_screen_bg = Some(self.folder_terminal.screen_bg.clone());
+            }
+            if self.folder_terminal.normal_screen_bold.is_none() {
+                self.folder_terminal.normal_screen_bold = Some(self.folder_terminal.screen_bold.clone());
+            }
             self.folder_terminal.screen = vec![vec![' '; cols]; rows];
+            self.folder_terminal.screen_fg = vec![vec![255; cols]; rows];
+            self.folder_terminal.screen_bg = vec![vec![255; cols]; rows];
+            self.folder_terminal.screen_bold = vec![vec![false; cols]; rows];
             self.folder_terminal.cursor_x = 0;
             self.folder_terminal.cursor_y = 0;
             self.folder_terminal.scroll_top = 0;
@@ -7116,6 +7380,15 @@ impl Aurora {
         } else {
             if let Some(screen) = self.folder_terminal.normal_screen.take() {
                 self.folder_terminal.screen = screen;
+            }
+            if let Some(screen_fg) = self.folder_terminal.normal_screen_fg.take() {
+                self.folder_terminal.screen_fg = screen_fg;
+            }
+            if let Some(screen_bg) = self.folder_terminal.normal_screen_bg.take() {
+                self.folder_terminal.screen_bg = screen_bg;
+            }
+            if let Some(screen_bold) = self.folder_terminal.normal_screen_bold.take() {
+                self.folder_terminal.screen_bold = screen_bold;
             }
             if save_cursor {
                 self.restore_terminal_cursor();
@@ -7131,11 +7404,11 @@ impl Aurora {
         let y = self.folder_terminal.cursor_y;
         let count = count.min(cols);
         for x in (self.folder_terminal.cursor_x..cols).rev() {
-            self.folder_terminal.screen[y][x] = x
-                .checked_sub(count)
-                .filter(|src| *src >= self.folder_terminal.cursor_x)
-                .map(|src| self.folder_terminal.screen[y][src])
-                .unwrap_or(' ');
+            let src_opt = x.checked_sub(count).filter(|src| *src >= self.folder_terminal.cursor_x);
+            self.folder_terminal.screen[y][x] = src_opt.map(|src| self.folder_terminal.screen[y][src]).unwrap_or(' ');
+            self.folder_terminal.screen_fg[y][x] = src_opt.map(|src| self.folder_terminal.screen_fg[y][src]).unwrap_or(255);
+            self.folder_terminal.screen_bg[y][x] = src_opt.map(|src| self.folder_terminal.screen_bg[y][src]).unwrap_or(255);
+            self.folder_terminal.screen_bold[y][x] = src_opt.map(|src| self.folder_terminal.screen_bold[y][src]).unwrap_or(false);
         }
     }
 
@@ -7153,6 +7426,18 @@ impl Aurora {
                 .screen
                 .insert(self.folder_terminal.cursor_y, vec![' '; cols]);
             self.folder_terminal.screen.remove(bottom + 1);
+            self.folder_terminal
+                .screen_fg
+                .insert(self.folder_terminal.cursor_y, vec![255; cols]);
+            self.folder_terminal.screen_fg.remove(bottom + 1);
+            self.folder_terminal
+                .screen_bg
+                .insert(self.folder_terminal.cursor_y, vec![255; cols]);
+            self.folder_terminal.screen_bg.remove(bottom + 1);
+            self.folder_terminal
+                .screen_bold
+                .insert(self.folder_terminal.cursor_y, vec![false; cols]);
+            self.folder_terminal.screen_bold.remove(bottom + 1);
         }
     }
 
@@ -7170,6 +7455,18 @@ impl Aurora {
                 .screen
                 .remove(self.folder_terminal.cursor_y);
             self.folder_terminal.screen.insert(bottom, vec![' '; cols]);
+            self.folder_terminal
+                .screen_fg
+                .remove(self.folder_terminal.cursor_y);
+            self.folder_terminal.screen_fg.insert(bottom, vec![255; cols]);
+            self.folder_terminal
+                .screen_bg
+                .remove(self.folder_terminal.cursor_y);
+            self.folder_terminal.screen_bg.insert(bottom, vec![255; cols]);
+            self.folder_terminal
+                .screen_bold
+                .remove(self.folder_terminal.cursor_y);
+            self.folder_terminal.screen_bold.insert(bottom, vec![false; cols]);
         }
     }
 
@@ -7182,6 +7479,9 @@ impl Aurora {
             .min(self.folder_terminal.rows - 1);
         for _ in 0..count.max(1) {
             let removed = self.folder_terminal.screen.remove(top);
+            self.folder_terminal.screen_fg.remove(top);
+            self.folder_terminal.screen_bg.remove(top);
+            self.folder_terminal.screen_bold.remove(top);
             if top == 0 && bottom + 1 == self.folder_terminal.rows {
                 self.folder_terminal
                     .history
@@ -7192,6 +7492,9 @@ impl Aurora {
                 }
             }
             self.folder_terminal.screen.insert(bottom, vec![' '; cols]);
+            self.folder_terminal.screen_fg.insert(bottom, vec![255; cols]);
+            self.folder_terminal.screen_bg.insert(bottom, vec![255; cols]);
+            self.folder_terminal.screen_bold.insert(bottom, vec![false; cols]);
         }
     }
 
@@ -7204,7 +7507,13 @@ impl Aurora {
             .min(self.folder_terminal.rows - 1);
         for _ in 0..count.max(1) {
             self.folder_terminal.screen.remove(bottom);
+            self.folder_terminal.screen_fg.remove(bottom);
+            self.folder_terminal.screen_bg.remove(bottom);
+            self.folder_terminal.screen_bold.remove(bottom);
             self.folder_terminal.screen.insert(top, vec![' '; cols]);
+            self.folder_terminal.screen_fg.insert(top, vec![255; cols]);
+            self.folder_terminal.screen_bg.insert(top, vec![255; cols]);
+            self.folder_terminal.screen_bold.insert(top, vec![false; cols]);
         }
     }
 
@@ -7233,16 +7542,27 @@ impl Aurora {
         }
         self.folder_terminal.screen[y][x] =
             terminal_display_char(ch, self.folder_terminal.line_drawing);
+        let mut fg = self.folder_terminal.current_fg;
+        if self.folder_terminal.current_bold && fg < 8 {
+            fg += 8;
+        }
+        self.folder_terminal.screen_fg[y][x] = fg;
+        self.folder_terminal.screen_bg[y][x] = self.folder_terminal.current_bg;
+        self.folder_terminal.screen_bold[y][x] = self.folder_terminal.current_bold;
         self.folder_terminal.cursor_x += 1;
     }
 
-    fn terminal_newline(&mut self) {
-        self.folder_terminal.cursor_x = 0;
+    fn terminal_linefeed(&mut self) {
         if self.folder_terminal.cursor_y >= self.folder_terminal.scroll_bottom {
             self.terminal_scroll_up(1);
         } else {
             self.folder_terminal.cursor_y += 1;
         }
+    }
+
+    fn terminal_newline(&mut self) {
+        self.folder_terminal.cursor_x = 0;
+        self.terminal_linefeed();
     }
 
     fn folder_context_action_at(&self, x: i32, y: i32) -> Option<FolderContextAction> {
@@ -11166,6 +11486,39 @@ fn terminal_display_char(ch: char, line_drawing: bool) -> char {
     }
 }
 
+fn ansi_color(idx: u8) -> Color {
+    match idx {
+        0 => Color::rgb(40, 40, 40),       // Black
+        1 => Color::rgb(205, 0, 0),        // Red
+        2 => Color::rgb(0, 205, 0),        // Green
+        3 => Color::rgb(205, 205, 0),      // Yellow
+        4 => Color::rgb(0, 0, 238),        // Blue
+        5 => Color::rgb(205, 0, 205),      // Magenta
+        6 => Color::rgb(0, 205, 205),      // Cyan
+        7 => Color::rgb(229, 229, 229),    // White
+        8 => Color::rgb(127, 127, 127),    // Bright Black
+        9 => Color::rgb(255, 0, 0),        // Bright Red
+        10 => Color::rgb(0, 255, 0),       // Bright Green
+        11 => Color::rgb(255, 255, 0),     // Bright Yellow
+        12 => Color::rgb(92, 92, 255),     // Bright Blue
+        13 => Color::rgb(255, 0, 255),     // Bright Magenta
+        14 => Color::rgb(0, 255, 255),     // Bright Cyan
+        15 => Color::rgb(255, 255, 255),   // Bright White
+        16..=231 => {
+            let offset = idx - 16;
+            let r = offset / 36;
+            let g = (offset % 36) / 6;
+            let b = offset % 6;
+            let scale = |v: u8| if v == 0 { 0 } else { v * 40 + 55 };
+            Color::rgb(scale(r), scale(g), scale(b))
+        }
+        232..=255 => {
+            let val = 8 + (idx - 232) * 10;
+            Color::rgb(val, val, val)
+        }
+    }
+}
+
 fn csi_values(params: &str) -> Vec<usize> {
     if params.is_empty() {
         return Vec::new();
@@ -11540,13 +11893,15 @@ fn spawn_terminal_pty(cwd: &Path, cols: usize, rows: usize) -> AnyResult<(RawFd,
             env::set_var("ENV", "/dev/null");
             env::set_var("BASH_ENV", "/dev/null");
         }
-        let shell_c = CString::new("/bin/sh").unwrap();
-        let interactive = CString::new("-i").unwrap();
+        let shell_c = CString::new("/bin/bash").unwrap();
+        let arg1 = CString::new("--norc").unwrap();
+        let arg2 = CString::new("--noprofile").unwrap();
         unsafe {
             libc::execlp(
                 shell_c.as_ptr(),
                 shell_c.as_ptr(),
-                interactive.as_ptr(),
+                arg1.as_ptr(),
+                arg2.as_ptr(),
                 std::ptr::null::<libc::c_char>(),
             );
             libc::_exit(127);
