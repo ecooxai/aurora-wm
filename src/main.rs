@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::env;
+use std::ffi::CString;
 use std::fs;
 use std::io::Read;
 use std::os::fd::RawFd;
@@ -46,6 +46,7 @@ const FOLDER_TERMINAL_COLS: usize = 58;
 const FOLDER_TERMINAL_ROWS: usize = 10;
 const FOLDER_TERMINAL_CELL_W: i32 = 8;
 const FOLDER_TERMINAL_CELL_H: i32 = 18;
+const CSD_DRAG_TOP_HEIGHT: i16 = 44;
 const TERMINAL_FALLBACKS: [&str; 5] = [
     "xfce4-terminal",
     "lxterminal",
@@ -55,7 +56,6 @@ const TERMINAL_FALLBACKS: [&str; 5] = [
 ];
 const FONT_REGULAR: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Bold.ttf");
-const FONT_MONO: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSansMono-Regular.ttf");
 
 static WALLPAPERS: &[WallpaperAsset] = &[
     WallpaperAsset {
@@ -288,15 +288,7 @@ impl Canvas {
         }
     }
 
-    fn draw_line(
-        &mut self,
-        x0: i32,
-        y0: i32,
-        x1: i32,
-        y1: i32,
-        thickness: i32,
-        color: Color,
-    ) {
+    fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, thickness: i32, color: Color) {
         let x_min = x0.min(x1) - (thickness + 2);
         let x_max = x0.max(x1) + (thickness + 2);
         let y_min = y0.min(y1) - (thickness + 2);
@@ -631,6 +623,7 @@ struct UiWindows {
 
 #[derive(Clone, Copy)]
 struct TopbarControls {
+    screenshot_x: i32,
     display_x: i32,
     audio_x: i32,
     network_x: i32,
@@ -698,6 +691,14 @@ struct PendingResize {
 }
 
 #[derive(Clone, Copy)]
+struct PendingClientDrag {
+    client: Window,
+    root_x: i16,
+    root_y: i16,
+    pressed_at: Instant,
+}
+
+#[derive(Clone, Copy)]
 struct DockClickState {
     client: Window,
     at: Instant,
@@ -758,6 +759,7 @@ struct FolderTerminal {
     cursor_x: usize,
     cursor_y: usize,
     esc: String,
+    line_drawing: bool,
     mouse_enabled: bool,
     dirty: bool,
 }
@@ -776,6 +778,7 @@ impl FolderTerminal {
             cursor_x: 0,
             cursor_y: 0,
             esc: String::new(),
+            line_drawing: false,
             mouse_enabled: false,
             dirty: true,
         }
@@ -783,10 +786,57 @@ impl FolderTerminal {
 }
 
 #[derive(Clone)]
+struct ImagePreview {
+    pixels: Vec<u8>,
+    width: u16,
+    height: u16,
+    resolution: Option<(u32, u32)>,
+}
+
+#[derive(Clone)]
 struct MediaState {
     entry: FolderEntry,
     playing: bool,
     progress: f32,
+    text_lines: Vec<String>,
+    text_scroll: usize,
+    text_cursor_line: usize,
+    text_cursor_col: usize,
+    editing: bool,
+    file_info: Option<String>,
+    image_preview: Option<ImagePreview>,
+    notice: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ScreenshotSelection {
+    start_x: i16,
+    start_y: i16,
+}
+
+#[derive(Clone, Copy)]
+enum MediaContextAction {
+    Rename,
+    CopyImage,
+    MoveTrash,
+    ConfirmTrash,
+    CancelTrash,
+}
+
+#[derive(Clone)]
+struct FolderPress {
+    entry: FolderEntry,
+    root_x: i16,
+    root_y: i16,
+}
+
+#[derive(Clone)]
+struct MediaTextSelection {
+    slot: usize,
+    start_line: usize,
+    start_col: usize,
+    end_line: usize,
+    end_col: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -865,7 +915,6 @@ struct Aurora {
     ui: UiWindows,
     regular: Font<'static>,
     bold: Font<'static>,
-    mono: Font<'static>,
     settings: SettingsState,
     terminal_apps: Vec<InstalledApp>,
     browser_apps: Vec<InstalledApp>,
@@ -880,6 +929,7 @@ struct Aurora {
     active_client: Option<Window>,
     drag: Option<DragState>,
     pending_resize: Option<PendingResize>,
+    pending_client_drag: Option<PendingClientDrag>,
     title_hover: Option<(Window, TitleButton)>,
     ignored_unmaps: Vec<Window>,
     settings_visible: bool,
@@ -897,9 +947,11 @@ struct Aurora {
     folder_terminal: FolderTerminal,
     media: Option<MediaState>,
     media_slots: Vec<Option<MediaState>>,
-    media_next_slot: usize,
     media_front: bool,
     media_front_slot: Option<usize>,
+    media_text_selection: Option<MediaTextSelection>,
+    media_context_open: Option<(usize, i32, i32)>,
+    media_trash_prompt: Option<usize>,
     app_menu_visible: bool,
     app_menu_more: bool,
     app_menu_scroll: usize,
@@ -908,12 +960,15 @@ struct Aurora {
     folder_clipboard: Option<(PathBuf, bool)>,
     folder_info: Option<String>,
     folder_drag: Option<PathBuf>,
+    folder_press: Option<FolderPress>,
     xdnd_source: Option<Window>,
     dock_last_click: Option<DockClickState>,
     icon_cache: HashMap<String, Option<Vec<u8>>>,
     last_clock_label: String,
     last_tick: Instant,
     last_media_tick: Instant,
+    screenshot_mode: bool,
+    screenshot_selection: Option<ScreenshotSelection>,
 }
 
 fn main() {
@@ -1004,7 +1059,6 @@ impl Aurora {
 
         let regular = Font::try_from_bytes(FONT_REGULAR).ok_or("failed to load regular font")?;
         let bold = Font::try_from_bytes(FONT_BOLD).ok_or("failed to load bold font")?;
-        let mono = Font::try_from_bytes(FONT_MONO).ok_or("failed to load mono font")?;
         let wallpaper_pixels = render_wallpaper_pixels(
             WALLPAPERS[0].bytes,
             screen.width_in_pixels,
@@ -1059,7 +1113,6 @@ impl Aurora {
             ui,
             regular,
             bold,
-            mono,
             settings: SettingsState::default(),
             terminal_apps,
             browser_apps,
@@ -1074,6 +1127,7 @@ impl Aurora {
             active_client: None,
             drag: None,
             pending_resize: None,
+            pending_client_drag: None,
             title_hover: None,
             ignored_unmaps: Vec::new(),
             settings_visible: true,
@@ -1091,9 +1145,11 @@ impl Aurora {
             folder_terminal: FolderTerminal::new(folder_path_for(FolderMode::Home)),
             media: None,
             media_slots: vec![None; MEDIA_SLOT_COUNT],
-            media_next_slot: 0,
             media_front: false,
             media_front_slot: None,
+            media_text_selection: None,
+            media_context_open: None,
+            media_trash_prompt: None,
             app_menu_visible: false,
             app_menu_more: false,
             app_menu_scroll: 0,
@@ -1102,12 +1158,15 @@ impl Aurora {
             folder_clipboard: None,
             folder_info: None,
             folder_drag: None,
+            folder_press: None,
             xdnd_source: None,
             dock_last_click: None,
             icon_cache: HashMap::new(),
             last_clock_label: format_clock(),
             last_tick: Instant::now(),
             last_media_tick: Instant::now(),
+            screenshot_mode: false,
+            screenshot_selection: None,
         };
         app.create_ui_windows()?;
         Ok(app)
@@ -1145,7 +1204,27 @@ impl Aurora {
             if let Some(pending) = self.pending_resize {
                 if pending.pressed_at.elapsed() >= Duration::from_secs(2) {
                     self.pending_resize = None;
-                    self.start_resize(pending.client, pending.root_x, pending.root_y, pending.edges)?;
+                    self.start_resize(
+                        pending.client,
+                        pending.root_x,
+                        pending.root_y,
+                        pending.edges,
+                    )?;
+                }
+            }
+
+            if let Some(pending) = self.pending_client_drag {
+                let pointer = self.conn.query_pointer(self.root)?.reply()?;
+                let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
+                if !button_down {
+                    self.pending_client_drag = None;
+                } else {
+                    let moved = (i32::from(pointer.root_x) - i32::from(pending.root_x)).abs() > 4
+                        || (i32::from(pointer.root_y) - i32::from(pending.root_y)).abs() > 4;
+                    if moved && pending.pressed_at.elapsed() >= Duration::from_millis(500) {
+                        self.pending_client_drag = None;
+                        self.start_drag(pending.client, pointer.root_x, pointer.root_y)?;
+                    }
                 }
             }
 
@@ -1189,6 +1268,7 @@ impl Aurora {
     }
 
     fn create_ui_windows(&mut self) -> AnyResult<()> {
+        self.grab_root_button1()?;
         let top_aux = CreateWindowAux::new()
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
@@ -1321,7 +1401,13 @@ impl Aurora {
 
         let media_aux = CreateWindowAux::new()
             .override_redirect(1)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::POINTER_MOTION
+                    | EventMask::KEY_PRESS,
+            )
             .cursor(self.cursor)
             .background_pixel(0);
         for (idx, window) in self.ui.media.iter().copied().enumerate() {
@@ -1345,7 +1431,7 @@ impl Aurora {
         self.conn.map_window(self.ui.topbar)?;
         self.conn.map_window(self.ui.dock)?;
         self.conn.map_window(self.ui.settings)?;
-        
+
         // Initialize EWMH desktops on the root window
         if let Ok(num_atom) = self.atom(b"_NET_NUMBER_OF_DESKTOPS") {
             if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
@@ -1445,9 +1531,14 @@ impl Aurora {
             Event::KeyPress(ev) => self.handle_key_press(ev)?,
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
             Event::ButtonRelease(ev) => {
-                if ev.event == self.ui.folder {
+                if self.screenshot_selection.is_some() {
+                    self.finish_screenshot_selection(ev.root_x, ev.root_y)?;
+                } else if ev.event == self.ui.folder {
                     self.handle_folder_release(ev)?;
+                } else if let Some(slot) = self.media_slot_for_window(ev.event) {
+                    self.handle_media_release(slot)?;
                 } else {
+                    self.pending_client_drag = None;
                     self.end_drag()?;
                 }
             }
@@ -1528,7 +1619,9 @@ impl Aurora {
     }
 
     fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
-        if ev.event == self.ui.settings {
+        if self.screenshot_mode && ev.event != self.ui.topbar {
+            self.start_screenshot_selection(ev.root_x, ev.root_y)?;
+        } else if ev.event == self.ui.settings {
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_settings_scroll(ev.detail, i32::from(ev.event_x))?;
                 self.conn.flush()?;
@@ -1554,7 +1647,7 @@ impl Aurora {
             if ev.detail == 3 {
                 self.handle_folder_context(i32::from(ev.event_x), i32::from(ev.event_y))?;
             } else {
-                self.handle_folder_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
+                self.handle_folder_click(ev)?;
             }
         } else if ev.event == self.ui.folder_terminal {
             if ev.detail == 4 || ev.detail == 5 {
@@ -1566,19 +1659,34 @@ impl Aurora {
             self.settings_front = false;
             self.media_front = false;
             self.folder_terminal.focused = true;
-            self.conn
-                .set_input_focus(InputFocus::POINTER_ROOT, self.ui.folder_terminal, CURRENT_TIME)?;
+            self.conn.set_input_focus(
+                InputFocus::POINTER_ROOT,
+                self.ui.folder_terminal,
+                CURRENT_TIME,
+            )?;
             self.raise_ui()?;
             self.handle_folder_terminal_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
             self.redraw_folder_terminal()?;
         } else if ev.event == self.ui.app_menu {
             self.handle_app_menu_click(ev.detail, i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if let Some(slot) = self.media_slot_for_window(ev.event) {
+            if ev.detail == 4 || ev.detail == 5 {
+                self.handle_media_scroll(slot, ev.detail)?;
+                self.conn.flush()?;
+                return Ok(());
+            }
             self.media_front = true;
             self.media_front_slot = Some(slot);
             self.settings_front = false;
             self.folder_front = false;
-            self.handle_media_click(slot, i32::from(ev.event_x), i32::from(ev.event_y))?;
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, ev.event, CURRENT_TIME)?;
+            self.handle_media_click(
+                slot,
+                ev.detail,
+                i32::from(ev.event_x),
+                i32::from(ev.event_y),
+            )?;
         } else if ev.event == self.ui.topbar {
             let x = i32::from(ev.event_x);
             let controls = self.topbar_controls();
@@ -1591,6 +1699,8 @@ impl Aurora {
                 .contains(&x)
             {
                 self.add_workspace()?;
+            } else if (controls.screenshot_x - 15..=controls.screenshot_x + 15).contains(&x) {
+                self.toggle_screenshot_mode()?;
             } else if (controls.display_x - 15..=controls.display_x + 15).contains(&x) {
                 self.open_settings_tab(SettingsTab::Display)?;
             } else if (controls.audio_x - 15..=controls.audio_x + 15).contains(&x) {
@@ -1600,6 +1710,8 @@ impl Aurora {
             } else if (controls.battery_left..=controls.battery_right).contains(&x) {
                 self.open_settings_tab(SettingsTab::Power)?;
             }
+        } else if ev.event == self.root {
+            self.handle_root_button_press(ev)?;
         } else if let Some(client) = self.client_or_ancestor_key_for(ev.event) {
             if self
                 .clients
@@ -1617,6 +1729,18 @@ impl Aurora {
 
     fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<()> {
         let Some(drag) = self.drag else {
+            if let Some(pending) = self.pending_client_drag {
+                let moved = (i32::from(ev.root_x) - i32::from(pending.root_x)).abs() > 4
+                    || (i32::from(ev.root_y) - i32::from(pending.root_y)).abs() > 4;
+                if moved && pending.pressed_at.elapsed() >= Duration::from_millis(500) {
+                    self.pending_client_drag = None;
+                    self.start_drag(pending.client, ev.root_x, ev.root_y)?;
+                    return Ok(());
+                }
+            }
+            if let Some(slot) = self.media_slot_for_window(ev.event) {
+                self.handle_media_motion(slot, i32::from(ev.event_x), i32::from(ev.event_y))?;
+            }
             if let Some(ref mut pending) = self.pending_resize {
                 pending.root_x = ev.root_x;
                 pending.root_y = ev.root_y;
@@ -1747,7 +1871,7 @@ impl Aurora {
             return Ok(());
         }
         let data = ev.data.as_data32();
-        let Some(client) = self.client_key_for(ev.window) else {
+        let Some(client) = self.client_or_ancestor_key_for(ev.window) else {
             return Ok(());
         };
         let root_x = data[0].min(i16::MAX as u32) as i16;
@@ -1985,10 +2109,7 @@ impl Aurora {
         };
         let title_h = self.titlebar_height(&info) as i16;
         let client_x = ev.root_x.saturating_sub(info.x);
-        let client_y = ev
-            .root_y
-            .saturating_sub(info.y)
-            .saturating_sub(title_h);
+        let client_y = ev.root_y.saturating_sub(info.y).saturating_sub(title_h);
         if let Some(edges) = resize_edges_for_client(&info, client_x, client_y) {
             self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.pending_resize = Some(PendingResize {
@@ -1999,9 +2120,81 @@ impl Aurora {
                 pressed_at: Instant::now(),
             });
         } else {
+            if !info.titlebar && ev.detail == 1 && client_y >= 0 && client_y <= CSD_DRAG_TOP_HEIGHT
+            {
+                self.pending_client_drag = Some(PendingClientDrag {
+                    client,
+                    root_x: ev.root_x,
+                    root_y: ev.root_y,
+                    pressed_at: Instant::now(),
+                });
+            }
             self.focus_window_at(client, ev.time)?;
             self.conn.flush()?;
             self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
+        }
+        Ok(())
+    }
+
+    fn handle_root_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
+        if ev.detail != 1 {
+            self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
+            return Ok(());
+        }
+        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+        let target = pointer.child;
+        if let Some(client) = self.client_or_ancestor_key_for(target) {
+            if let Some(info) = self.clients.get(&client).copied() {
+                let title_h = self.titlebar_height(&info) as i16;
+                let client_y = pointer
+                    .root_y
+                    .saturating_sub(info.y)
+                    .saturating_sub(title_h);
+                if !info.titlebar && client_y >= 0 && client_y <= CSD_DRAG_TOP_HEIGHT {
+                    self.pending_client_drag = Some(PendingClientDrag {
+                        client,
+                        root_x: pointer.root_x,
+                        root_y: pointer.root_y,
+                        pressed_at: Instant::now(),
+                    });
+                }
+            }
+        }
+        self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
+        Ok(())
+    }
+
+    fn grab_root_button1(&self) -> AnyResult<()> {
+        let res = self
+            .conn
+            .grab_button(
+                false,
+                self.root,
+                EventMask::BUTTON_PRESS,
+                GrabMode::SYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                x11rb::NONE,
+                ButtonIndex::M1,
+                ModMask::ANY,
+            )?
+            .check();
+        if let Err(ReplyError::X11Error(ref err)) = res {
+            if err.error_kind == ErrorKind::Access {
+                return Ok(());
+            }
+        }
+        res?;
+        Ok(())
+    }
+
+    fn grab_client_tree_buttons(&self, window: Window) -> AnyResult<()> {
+        self.grab_client_buttons(window)?;
+        let Ok(reply) = self.conn.query_tree(window)?.reply() else {
+            return Ok(());
+        };
+        for child in reply.children {
+            let _ = self.grab_client_tree_buttons(child);
         }
         Ok(())
     }
@@ -2242,10 +2435,15 @@ impl Aurora {
         )?;
         self.conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new()
-                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
+            &ChangeWindowAttributesAux::new().event_mask(
+                EventMask::PROPERTY_CHANGE
+                    | EventMask::STRUCTURE_NOTIFY
+                    | EventMask::POINTER_MOTION
+                    | EventMask::BUTTON_MOTION
+                    | EventMask::BUTTON_RELEASE,
+            ),
         )?;
-        self.grab_client_buttons(window)?;
+        self.grab_client_tree_buttons(window)?;
         self.conn.change_save_set(SetMode::INSERT, window)?;
         self.conn.configure_window(
             window,
@@ -2260,7 +2458,8 @@ impl Aurora {
             // A mapped reparent reports both structure and substructure unmaps.
             self.ignored_unmaps.extend([window, window]);
         }
-        self.conn.reparent_window(window, frame, 0, title_h as i16)?;
+        self.conn
+            .reparent_window(window, frame, 0, title_h as i16)?;
         self.conn.map_window(window)?;
         self.conn.map_window(frame)?;
         // Set EWMH _NET_WM_DESKTOP on the client window and its frame
@@ -2466,8 +2665,12 @@ impl Aurora {
             .value32()
             .is_some_and(|mut atoms| atoms.any(|atom| atom == wm_take_focus));
         if supports_take_focus {
-            let event =
-                ClientMessageEvent::new(32, info.window, wm_protocols, [wm_take_focus, time, 0, 0, 0]);
+            let event = ClientMessageEvent::new(
+                32,
+                info.window,
+                wm_protocols,
+                [wm_take_focus, time, 0, 0, 0],
+            );
             self.conn
                 .send_event(false, info.window, EventMask::NO_EVENT, event)?;
         }
@@ -2543,12 +2746,11 @@ impl Aurora {
         if self.titlebar_height(info) == 0 {
             return Ok(());
         }
-        c.draw_round_rect(
+        c.draw_rect(
             0,
             0,
             i32::from(info.width),
-            i32::from(TITLEBAR_HEIGHT) + 16,
-            FRAME_CORNER_RADIUS,
+            i32::from(TITLEBAR_HEIGHT),
             Color::rgba(250, 254, 255, 225),
         );
         c.draw_circle(19, 17, 8, Color::rgba(241, 96, 105, 235));
@@ -2702,7 +2904,9 @@ impl Aurora {
         let network_x = battery_left - 18;
         let audio_x = network_x - TOPBAR_ICON_SPACING;
         let display_x = audio_x - TOPBAR_ICON_SPACING;
+        let screenshot_x = display_x - TOPBAR_ICON_SPACING;
         TopbarControls {
+            screenshot_x,
             display_x,
             audio_x,
             network_x,
@@ -2738,7 +2942,7 @@ impl Aurora {
             i32::from(c.height),
             Color::rgba(23, 34, 42, 178),
         );
-        
+
         // Draw Brand on the far left
         let brand_x = 24;
         c.draw_circle(brand_x, 20, 10, Color::rgba(160, 238, 220, 38));
@@ -2776,6 +2980,7 @@ impl Aurora {
         );
 
         let controls = self.topbar_controls();
+        draw_screenshot_icon(&mut c, controls.screenshot_x, 20, MINT_LIGHT);
         draw_sidebar_display_icon(&mut c, controls.display_x, 20, MINT_LIGHT);
         draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
         draw_sidebar_network_icon(&mut c, controls.network_x, 20, MINT_LIGHT);
@@ -2939,7 +3144,14 @@ impl Aurora {
         );
         c.draw_round_rect(18, 18, 30, 30, 10, Color::rgba(255, 255, 255, 155));
         draw_home_icon(&mut c, 33, 33, MINT_DARK);
-        c.draw_round_rect(56, 18, FOLDER_HEADER_ICON, FOLDER_HEADER_ICON, 10, Color::rgba(255, 255, 255, 155));
+        c.draw_round_rect(
+            56,
+            18,
+            FOLDER_HEADER_ICON,
+            FOLDER_HEADER_ICON,
+            10,
+            Color::rgba(255, 255, 255, 155),
+        );
         draw_terminal_icon(
             &mut c,
             71,
@@ -2950,7 +3162,14 @@ impl Aurora {
                 SOFT_INK
             },
         );
-        c.draw_round_rect(94, 18, FOLDER_HEADER_ICON, FOLDER_HEADER_ICON, 10, Color::rgba(255, 255, 255, 155));
+        c.draw_round_rect(
+            94,
+            18,
+            FOLDER_HEADER_ICON,
+            FOLDER_HEADER_ICON,
+            10,
+            Color::rgba(255, 255, 255, 155),
+        );
         draw_sort_icon(&mut c, 109, 33, MINT_DARK);
         c.draw_text(
             &self.bold,
@@ -3058,14 +3277,7 @@ impl Aurora {
         if self.folder_sort_open {
             let menu_x = 94;
             let menu_y = 54;
-            c.draw_round_rect(
-                menu_x,
-                menu_y,
-                122,
-                96,
-                12,
-                Color::rgba(250, 254, 255, 242),
-            );
+            c.draw_round_rect(menu_x, menu_y, 122, 96, 12, Color::rgba(250, 254, 255, 242));
             for (idx, sort) in [FolderSort::Name, FolderSort::Date, FolderSort::Size]
                 .iter()
                 .copied()
@@ -3277,6 +3489,15 @@ impl Aurora {
             11.0,
             MUTED,
         );
+        if media.entry.kind == FileKind::Text {
+            let button_x = i32::from(w) - 78;
+            c.draw_round_rect(button_x, 17, 28, 24, 8, Color::rgba(116, 213, 198, 110));
+            if media.editing {
+                draw_save_icon(&mut c, button_x + 14, 29, MINT_DARK);
+            } else {
+                draw_edit_icon(&mut c, button_x + 14, 29, MINT_DARK);
+            }
+        }
         c.draw_round_rect(
             i32::from(w) - 43,
             17,
@@ -3301,18 +3522,11 @@ impl Aurora {
             2,
             Color::rgb(255, 255, 255),
         );
-        c.draw_rect(
-            20,
-            68,
-            i32::from(w) - 40,
-            1,
-            Color::rgba(178, 202, 214, 100),
-        );
 
-        let preview_x = 24;
-        let preview_y = 88;
+        let preview_x = 18;
+        let preview_y = 58;
         let preview_w = i32::from(w) - 48;
-        let preview_h = 174;
+        let preview_h = i32::from(h) - 130;
         c.draw_round_rect(
             preview_x,
             preview_y,
@@ -3323,24 +3537,41 @@ impl Aurora {
         );
         match media.entry.kind {
             FileKind::Text => {
-                draw_text_preview(
-                    &mut c,
-                    &self.regular,
-                    &media.entry.path,
-                    preview_x + 14,
-                    preview_y + 14,
-                    preview_w - 28,
-                    preview_h - 28,
+                self.draw_text_viewer(
+                    &mut c, slot, media, preview_x, preview_y, preview_w, preview_h,
                 );
             }
             FileKind::Image => {
-                paint_file_preview(
+                if let Some(preview) = media.image_preview.as_ref() {
+                    paint_cached_image_preview(
+                        &mut c,
+                        preview,
+                        preview_x + 8,
+                        preview_y + 8,
+                        preview_w - 16,
+                        preview_h - 16,
+                    );
+                } else {
+                    paint_file_preview(
+                        &mut c,
+                        &media.entry.path,
+                        preview_x + 8,
+                        preview_y + 8,
+                        preview_w - 16,
+                        preview_h - 16,
+                    );
+                }
+                draw_image_info_overlay(
                     &mut c,
+                    &self.regular,
                     &media.entry.path,
-                    preview_x + 8,
-                    preview_y + 8,
-                    preview_w - 16,
-                    preview_h - 16,
+                    preview_x + preview_w - 186,
+                    preview_y + 12,
+                    172,
+                    media
+                        .image_preview
+                        .as_ref()
+                        .and_then(|preview| preview.resolution),
                 );
                 c.draw_round_rect(
                     preview_x,
@@ -3352,13 +3583,13 @@ impl Aurora {
                 );
             }
             FileKind::Audio => {
-                draw_music_icon(&mut c, i32::from(w) / 2, preview_y + 78, MINT_DARK);
+                draw_music_icon(&mut c, i32::from(w) / 2, preview_y + 94, MINT_DARK);
                 draw_sparkline(
                     &mut c,
                     preview_x + 44,
-                    preview_y + 122,
+                    preview_y + 152,
                     preview_w - 88,
-                    28,
+                    42,
                     4200.0,
                     MINT_DARK,
                 );
@@ -3370,8 +3601,8 @@ impl Aurora {
                         "Audio ready"
                     },
                     i32::from(w) / 2,
-                    preview_y + 20,
-                    14.0,
+                    preview_y + 30,
+                    18.0,
                     INK,
                 );
             }
@@ -3383,13 +3614,24 @@ impl Aurora {
                 };
                 c.draw_round_rect(
                     preview_x + 18,
-                    preview_y + 16,
+                    preview_y + 14,
                     preview_w - 36,
-                    preview_h - 54,
+                    preview_h - 42,
                     10,
                     frame_color,
                 );
-                draw_play_icon(&mut c, i32::from(w) / 2, preview_y + 72, BLUE);
+                if paint_video_frame_preview(
+                    &mut c,
+                    &media.entry.path,
+                    preview_x + 18,
+                    preview_y + 14,
+                    preview_w - 36,
+                    preview_h - 42,
+                )
+                .is_none()
+                {
+                    draw_play_icon(&mut c, i32::from(w) / 2, preview_y + 88, BLUE);
+                }
                 c.draw_text_center(
                     &self.bold,
                     if media.playing {
@@ -3398,7 +3640,7 @@ impl Aurora {
                         "Video ready"
                     },
                     i32::from(w) / 2,
-                    preview_y + 20,
+                    preview_y + 30,
                     14.0,
                     INK,
                 );
@@ -3420,65 +3662,279 @@ impl Aurora {
                 );
             }
             FileKind::Directory | FileKind::Other => {
-                draw_file_kind_icon(&mut c, media.entry.kind, i32::from(w) / 2, preview_y + 78);
-                c.draw_text_center(
-                    &self.regular,
-                    "No embedded preview",
-                    i32::from(w) / 2,
-                    preview_y + 118,
-                    12.0,
-                    MUTED,
+                self.draw_unknown_file_view(
+                    &mut c, media, preview_x, preview_y, preview_w, preview_h,
                 );
             }
         }
 
+        let controls_y = i32::from(h) - 62;
         c.draw_text(
             &self.regular,
-            &compact_path(&media.entry.path, 48),
+            &compact_path(&media.entry.path, 42),
             24,
-            278,
+            controls_y - 24,
             11.0,
             MUTED,
+        );
+        let status = media.notice.clone().unwrap_or_else(|| viewer_status(media));
+        c.draw_text_right(
+            &self.regular,
+            &status,
+            i32::from(w) - 24,
+            controls_y - 24,
+            11.0,
+            if media.notice.is_some() {
+                MINT_DARK
+            } else {
+                MUTED
+            },
         );
         if matches!(media.entry.kind, FileKind::Audio | FileKind::Video) {
             c.draw_round_rect(
                 24,
-                304,
+                controls_y,
                 i32::from(w) - 48,
                 42,
                 13,
                 Color::rgba(116, 213, 198, 88),
             );
             if media.playing {
-                c.draw_rect(44, 316, 5, 18, MINT_DARK);
-                c.draw_rect(54, 316, 5, 18, MINT_DARK);
-                c.draw_text(&self.bold, "Pause in Aurora", 80, 315, 13.0, INK);
+                c.draw_rect(44, controls_y + 12, 5, 18, MINT_DARK);
+                c.draw_rect(54, controls_y + 12, 5, 18, MINT_DARK);
+                c.draw_text(&self.bold, "Pause", 80, controls_y + 11, 13.0, INK);
             } else {
-                draw_play_icon(&mut c, 50, 325, MINT_DARK);
-                c.draw_text(&self.bold, "Play in Aurora", 80, 315, 13.0, INK);
+                draw_play_icon(&mut c, 50, controls_y + 21, MINT_DARK);
+                c.draw_text(&self.bold, "Play", 80, controls_y + 11, 13.0, INK);
             }
-            let bar_x = 250;
+            let bar_x = 150;
             let bar_w = i32::from(w) - bar_x - 48;
-            c.draw_round_rect(bar_x, 321, bar_w, 8, 4, Color::rgba(255, 255, 255, 140));
             c.draw_round_rect(
                 bar_x,
-                321,
+                controls_y + 17,
+                bar_w,
+                8,
+                4,
+                Color::rgba(255, 255, 255, 140),
+            );
+            c.draw_round_rect(
+                bar_x,
+                controls_y + 17,
                 (bar_w as f32 * media.progress.clamp(0.0, 1.0)) as i32,
                 8,
                 4,
                 Color::rgba(29, 145, 137, 190),
             );
-        } else {
-            c.draw_text(
-                &self.regular,
-                "Preview rendered inside Aurora.",
-                24,
-                316,
-                12.0,
-                MUTED,
-            );
+        }
+        if self
+            .media_context_open
+            .is_some_and(|(ctx_slot, _, _)| ctx_slot == slot)
+        {
+            self.draw_media_context_menu(&mut c, slot, media);
+        }
+        if self.media_trash_prompt == Some(slot) {
+            self.draw_media_trash_prompt(&mut c, media, i32::from(w), i32::from(h));
         }
         self.upload_canvas(self.ui.media[slot], &c)
+    }
+
+    fn draw_media_context_menu(&self, c: &mut Canvas, slot: usize, media: &MediaState) {
+        let Some((_, x, y)) = self
+            .media_context_open
+            .filter(|(ctx_slot, _, _)| *ctx_slot == slot)
+        else {
+            return;
+        };
+        let (_, _, w, h) = self.media_geometry(slot);
+        let menu_x = x.min(i32::from(w) - 184).max(12);
+        let menu_y = y.min(i32::from(h) - 112).max(50);
+        let items = if media.entry.kind == FileKind::Image {
+            ["Rename", "Copy image", "Move to Trash"]
+        } else {
+            ["Rename", "Copy path", "Move to Trash"]
+        };
+        c.draw_round_rect(menu_x, menu_y, 172, 96, 10, Color::rgba(250, 254, 255, 244));
+        for (idx, item) in items.iter().enumerate() {
+            c.draw_text(
+                &self.regular,
+                item,
+                menu_x + 14,
+                menu_y + 16 + idx as i32 * 29,
+                12.0,
+                INK,
+            );
+        }
+    }
+
+    fn draw_media_trash_prompt(&self, c: &mut Canvas, media: &MediaState, w: i32, h: i32) {
+        let box_w = 310;
+        let box_h = 126;
+        let x = (w - box_w) / 2;
+        let y = (h - box_h) / 2;
+        c.draw_round_rect(x, y, box_w, box_h, 14, Color::rgba(250, 254, 255, 246));
+        c.draw_text(&self.bold, "Move to Trash?", x + 20, y + 18, 16.0, INK);
+        c.draw_text(
+            &self.regular,
+            &compact(&media.entry.name, 34),
+            x + 20,
+            y + 46,
+            12.0,
+            MUTED,
+        );
+        c.draw_round_rect(x + 48, y + 82, 84, 30, 9, Color::rgba(241, 126, 135, 105));
+        c.draw_text_center(&self.bold, "Yes", x + 90, y + 90, 12.0, INK);
+        c.draw_round_rect(x + 174, y + 82, 84, 30, 9, Color::rgba(178, 202, 214, 110));
+        c.draw_text_center(&self.bold, "No", x + 216, y + 90, 12.0, INK);
+    }
+
+    fn draw_text_viewer(
+        &self,
+        c: &mut Canvas,
+        slot: usize,
+        media: &MediaState,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) {
+        let line_h = 19;
+        let max_lines = ((h - 20) / line_h).max(1) as usize;
+        let start = media
+            .text_scroll
+            .min(media.text_lines.len().saturating_sub(1));
+        let gutter_w = 34;
+        let text_x = x + gutter_w + 8;
+        c.draw_rect(
+            x + gutter_w,
+            y + 8,
+            1,
+            h - 16,
+            Color::rgba(178, 202, 214, 90),
+        );
+        for (idx, line) in media
+            .text_lines
+            .iter()
+            .skip(start)
+            .take(max_lines)
+            .enumerate()
+        {
+            let yy = y + 12 + idx as i32 * line_h;
+            c.draw_text_right(
+                &self.regular,
+                &(start + idx + 1).to_string(),
+                x + gutter_w - 8,
+                yy,
+                11.0,
+                MUTED,
+            );
+            let shown = compact(line, ((w - gutter_w - 18) / 7).max(20) as usize);
+            if let Some((sel_start, sel_end)) = self
+                .media_text_selection
+                .as_ref()
+                .filter(|selection| selection.slot == slot)
+                .map(normalized_media_selection)
+            {
+                let line_no = start + idx;
+                if line_no >= sel_start.0 && line_no <= sel_end.0 {
+                    let line_len = line.chars().count();
+                    let start_col = if line_no == sel_start.0 {
+                        sel_start.1.min(line_len)
+                    } else {
+                        0
+                    };
+                    let end_col = if line_no == sel_end.0 {
+                        sel_end.1.min(line_len)
+                    } else {
+                        line_len
+                    };
+                    if end_col > start_col {
+                        let before = line.chars().take(start_col).collect::<String>();
+                        let selected = line
+                            .chars()
+                            .skip(start_col)
+                            .take(end_col - start_col)
+                            .collect::<String>();
+                        let sx = text_x + measure_text(&self.regular, &before, 13.0);
+                        let sw = measure_text(&self.regular, &selected, 13.0).max(3);
+                        c.draw_round_rect(sx, yy + 1, sw, 16, 4, Color::rgba(73, 156, 231, 70));
+                    }
+                }
+            }
+            c.draw_text(&self.regular, &shown, text_x, yy, 13.0, INK);
+        }
+        if media.editing {
+            let cursor_line = media
+                .text_cursor_line
+                .min(media.text_lines.len().saturating_sub(1));
+            if cursor_line >= start && cursor_line < start + max_lines {
+                let visible_idx = cursor_line - start;
+                let line = media
+                    .text_lines
+                    .get(cursor_line)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let prefix = line
+                    .chars()
+                    .take(media.text_cursor_col.min(line.chars().count()))
+                    .collect::<String>();
+                let cursor_x = text_x + measure_text(&self.regular, &prefix, 13.0);
+                let cursor_y = y + 13 + visible_idx as i32 * line_h;
+                c.draw_rect(cursor_x, cursor_y, 2, 15, MINT_DARK);
+            }
+        }
+    }
+
+    fn draw_unknown_file_view(
+        &self,
+        c: &mut Canvas,
+        media: &MediaState,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) {
+        draw_file_kind_icon(c, media.entry.kind, x + w / 2, y + 58);
+        let meta = fs::metadata(&media.entry.path).ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| format!("modified {}s", d.as_secs()))
+            .unwrap_or_else(|| "modified unknown".to_string());
+        let kind = media.file_info.as_deref().unwrap_or("Unknown file type");
+        let size_line = format_size_mb(size);
+        let lines = [
+            media.entry.name.as_str(),
+            size_line.as_str(),
+            modified.as_str(),
+            kind,
+        ];
+        for (idx, line) in lines.iter().enumerate() {
+            c.draw_text_center(
+                &self.regular,
+                &compact(line, 54),
+                x + w / 2,
+                y + 112 + idx as i32 * 24,
+                if idx == 0 { 15.0 } else { 12.0 },
+                if idx == 0 { INK } else { MUTED },
+            );
+        }
+        c.draw_round_rect(
+            x + 40,
+            y + h - 56,
+            w - 80,
+            34,
+            10,
+            Color::rgba(116, 213, 198, 90),
+        );
+        c.draw_text_center(
+            &self.bold,
+            "Open as text",
+            x + w / 2,
+            y + h - 47,
+            13.0,
+            MINT_DARK,
+        );
     }
 
     fn draw_settings_sidebar(&self, c: &mut Canvas) {
@@ -4120,7 +4576,7 @@ impl Aurora {
         }
         let workspace = self.workspace_count;
         self.workspace_count += 1;
-        
+
         // Update EWMH _NET_NUMBER_OF_DESKTOPS
         if let Ok(num_atom) = self.atom(b"_NET_NUMBER_OF_DESKTOPS") {
             if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
@@ -4160,7 +4616,7 @@ impl Aurora {
             self.conn.unmap_window(frame)?;
         }
         self.active_workspace = workspace;
-        
+
         // Update EWMH _NET_CURRENT_DESKTOP
         if let Ok(cur_atom) = self.atom(b"_NET_CURRENT_DESKTOP") {
             if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
@@ -4399,6 +4855,10 @@ impl Aurora {
             self.handle_folder_terminal_key(ev)?;
             return Ok(());
         }
+        if let Some(slot) = self.media_slot_for_window(ev.event) {
+            self.handle_media_key(slot, ev)?;
+            return Ok(());
+        }
         if ev.event != self.ui.settings
             || self.settings.tab != SettingsTab::Apps
             || self.settings.app_kind != DefaultAppKind::Terminal
@@ -4603,8 +5063,11 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_folder_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+    fn handle_folder_click(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
+        let x = i32::from(ev.event_x);
+        let y = i32::from(ev.event_y);
         let (_, _, w, _) = self.folder_geometry();
+        self.folder_press = None;
         if self.folder_sort_open {
             if let Some(sort) = self.folder_sort_at(x, y) {
                 self.folder_sort = sort;
@@ -4702,17 +5165,15 @@ impl Aurora {
             return Ok(());
         };
         self.folder_drag = Some(entry.path.clone());
+        self.folder_press = Some(FolderPress {
+            entry: entry.clone(),
+            root_x: ev.root_x,
+            root_y: ev.root_y,
+        });
         match entry.kind {
             FileKind::Directory => {
-                self.folder_path = entry.path.clone();
-                self.folder_entries = folder_entries_in(entry.path, self.folder_sort);
-                self.folder_selected = None;
-                self.folder_scroll = 0;
-                self.sync_folder_terminal_cwd();
+                self.folder_selected = Some(entry.path.clone());
                 self.redraw_folder()?;
-                if self.folder_terminal.visible {
-                    self.redraw_folder_terminal()?;
-                }
             }
             FileKind::Text
             | FileKind::Image
@@ -4730,12 +5191,35 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_folder_release(&mut self, _ev: ButtonReleaseEvent) -> AnyResult<()> {
+    fn handle_folder_release(&mut self, ev: ButtonReleaseEvent) -> AnyResult<()> {
+        let press = self.folder_press.take();
         let Some(path) = self.folder_drag.take() else {
             return Ok(());
         };
         let pointer = self.conn.query_pointer(self.root)?.reply()?;
         let mut target = pointer.child;
+        let moved = press.as_ref().is_some_and(|press| {
+            (i32::from(ev.root_x) - i32::from(press.root_x)).abs() > 6
+                || (i32::from(ev.root_y) - i32::from(press.root_y)).abs() > 6
+        });
+        if target == self.ui.folder && !moved {
+            if let Some(press) = press {
+                self.activate_folder_entry(press.entry)?;
+            }
+            return Ok(());
+        }
+        if target == self.ui.folder_terminal {
+            self.ensure_folder_terminal_pty();
+            self.folder_terminal.focused = true;
+            self.conn.set_input_focus(
+                InputFocus::POINTER_ROOT,
+                self.ui.folder_terminal,
+                CURRENT_TIME,
+            )?;
+            self.write_folder_terminal(shell_quote(&path).as_bytes());
+            self.redraw_folder_terminal()?;
+            return Ok(());
+        }
         if target == x11rb::NONE || target == self.ui.folder || self.is_ui_window(target) {
             return Ok(());
         }
@@ -4783,6 +5267,35 @@ impl Aurora {
                 [self.ui.folder, 0, CURRENT_TIME, 0, 0],
             ),
         )?;
+        Ok(())
+    }
+
+    fn activate_folder_entry(&mut self, entry: FolderEntry) -> AnyResult<()> {
+        match entry.kind {
+            FileKind::Directory => {
+                self.folder_path = entry.path.clone();
+                self.folder_entries = folder_entries_in(entry.path, self.folder_sort);
+                self.folder_selected = None;
+                self.folder_scroll = 0;
+                self.sync_folder_terminal_cwd();
+                self.redraw_folder()?;
+                if self.folder_terminal.visible {
+                    self.redraw_folder_terminal()?;
+                }
+            }
+            FileKind::Text
+            | FileKind::Image
+            | FileKind::Audio
+            | FileKind::Video
+            | FileKind::Other => {
+                if self.folder_selected.as_ref() == Some(&entry.path) {
+                    self.open_media(entry)?;
+                } else {
+                    self.folder_selected = Some(entry.path.clone());
+                    self.redraw_folder()?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4869,8 +5382,11 @@ impl Aurora {
                     .stack_mode(StackMode::ABOVE),
             )?;
             self.conn.map_window(self.ui.folder_terminal)?;
-            self.conn
-                .set_input_focus(InputFocus::POINTER_ROOT, self.ui.folder_terminal, CURRENT_TIME)?;
+            self.conn.set_input_focus(
+                InputFocus::POINTER_ROOT,
+                self.ui.folder_terminal,
+                CURRENT_TIME,
+            )?;
             self.redraw_folder_terminal()?;
         } else {
             self.conn.unmap_window(self.ui.folder_terminal)?;
@@ -4879,6 +5395,113 @@ impl Aurora {
         }
         self.redraw_folder()?;
         self.raise_ui()?;
+        Ok(())
+    }
+
+    fn toggle_screenshot_mode(&mut self) -> AnyResult<()> {
+        if self.screenshot_mode {
+            self.capture_screenshot(None)?;
+        } else {
+            self.screenshot_mode = true;
+            self.screenshot_selection = None;
+            self.folder_info = Some(
+                "Screenshot: drag a rectangle, or click camera again for full screen".to_string(),
+            );
+            self.folder_front = true;
+            self.redraw_folder()?;
+            self.raise_ui()?;
+        }
+        Ok(())
+    }
+
+    fn start_screenshot_selection(&mut self, root_x: i16, root_y: i16) -> AnyResult<()> {
+        self.screenshot_selection = Some(ScreenshotSelection {
+            start_x: root_x,
+            start_y: root_y,
+        });
+        let _ = self
+            .conn
+            .grab_pointer(
+                false,
+                self.root,
+                EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                self.cursor,
+                CURRENT_TIME,
+            )?
+            .reply();
+        Ok(())
+    }
+
+    fn finish_screenshot_selection(&mut self, root_x: i16, root_y: i16) -> AnyResult<()> {
+        let Some(selection) = self.screenshot_selection.take() else {
+            return Ok(());
+        };
+        let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+        let x1 = i32::from(selection.start_x).min(i32::from(root_x)).max(0);
+        let y1 = i32::from(selection.start_y).min(i32::from(root_y)).max(0);
+        let x2 = i32::from(selection.start_x)
+            .max(i32::from(root_x))
+            .min(i32::from(self.screen_width));
+        let y2 = i32::from(selection.start_y)
+            .max(i32::from(root_y))
+            .min(i32::from(self.screen_height));
+        if x2 - x1 >= 8 && y2 - y1 >= 8 {
+            self.capture_screenshot(Some((x1, y1, x2 - x1, y2 - y1)))?;
+        } else {
+            self.screenshot_mode = false;
+            self.folder_info = Some("Screenshot cancelled".to_string());
+            self.redraw_folder()?;
+        }
+        Ok(())
+    }
+
+    fn capture_screenshot(&mut self, rect: Option<(i32, i32, i32, i32)>) -> AnyResult<()> {
+        self.screenshot_mode = false;
+        self.screenshot_selection = None;
+        let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+        let desktop = home_dir().join("Desktop");
+        let _ = fs::create_dir_all(&desktop);
+        let path = desktop.join(format!(
+            "Aurora Screenshot {}.png",
+            OffsetDateTime::now_utc().unix_timestamp()
+        ));
+        let mut cmd = Command::new("import");
+        cmd.env("DISPLAY", &self.display).args(["-window", "root"]);
+        if let Some((x, y, w, h)) = rect {
+            cmd.args(["-crop", &format!("{w}x{h}+{x}+{y}")]);
+        }
+        let ok = cmd.arg(&path).status().is_ok_and(|status| status.success());
+        if !ok {
+            self.folder_info = Some("Screenshot failed".to_string());
+            self.redraw_folder()?;
+            return Ok(());
+        }
+        copy_image_to_clipboard(&path);
+        self.folder_mode = FolderMode::Home;
+        self.folder_path = desktop;
+        self.folder_entries = folder_entries_in(self.folder_path.clone(), self.folder_sort);
+        self.folder_selected = Some(path.clone());
+        self.folder_scroll = 0;
+        self.folder_front = true;
+        self.folder_info = Some("Screenshot saved and copied to clipboard".to_string());
+        self.sync_folder_terminal_cwd();
+        self.redraw_folder()?;
+        self.open_media(FolderEntry {
+            name: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Screenshot.png")
+                .to_string(),
+            path,
+            kind: FileKind::Image,
+        })?;
+        if let Some(media) = self.media_slots.get_mut(0).and_then(|m| m.as_mut()) {
+            media.notice = Some("Copied image to clipboard".to_string());
+        }
+        self.redraw_media_slot(0)?;
         Ok(())
     }
 
@@ -4930,23 +5553,24 @@ impl Aurora {
         let rows = self.folder_terminal_display_rows(visible_rows);
         for (idx, row) in rows.iter().enumerate() {
             let y = 52 + idx as i32 * FOLDER_TERMINAL_CELL_H;
-            for (col, ch) in row.chars().take(FOLDER_TERMINAL_COLS).enumerate() {
-                if ch != ' ' {
-                    c.draw_text(
-                        &self.mono,
-                        &ch.to_string(),
-                        18 + col as i32 * FOLDER_TERMINAL_CELL_W,
-                        y,
-                        13.5,
-                        INK,
-                    );
-                }
+            let shown = row.chars().take(FOLDER_TERMINAL_COLS).collect::<String>();
+            let trimmed = shown.trim_end();
+            if !trimmed.is_empty() {
+                c.draw_text(&self.regular, trimmed, 18, y, 13.0, INK);
             }
         }
         if self.folder_terminal.focused {
-            let cursor_x = 18
-                + self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1) as i32
-                    * FOLDER_TERMINAL_CELL_W;
+            let row = self
+                .folder_terminal
+                .screen
+                .get(self.folder_terminal.cursor_y.min(FOLDER_TERMINAL_ROWS - 1))
+                .map(|line| line.iter().collect::<String>())
+                .unwrap_or_default();
+            let prefix = row
+                .chars()
+                .take(self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1))
+                .collect::<String>();
+            let cursor_x = 18 + measure_text(&self.regular, &prefix, 13.0);
             let cursor_y = 53
                 + self.folder_terminal.cursor_y.min(FOLDER_TERMINAL_ROWS - 1) as i32
                     * FOLDER_TERMINAL_CELL_H;
@@ -5028,10 +5652,10 @@ impl Aurora {
         if y < 44 || !self.folder_terminal.mouse_enabled {
             return Ok(());
         }
-        let col = ((x - 18).max(0) / FOLDER_TERMINAL_CELL_W + 1)
-            .clamp(1, FOLDER_TERMINAL_COLS as i32);
-        let row = ((y - 52).max(0) / FOLDER_TERMINAL_CELL_H + 1)
-            .clamp(1, FOLDER_TERMINAL_ROWS as i32);
+        let col =
+            ((x - 18).max(0) / FOLDER_TERMINAL_CELL_W + 1).clamp(1, FOLDER_TERMINAL_COLS as i32);
+        let row =
+            ((y - 52).max(0) / FOLDER_TERMINAL_CELL_H + 1).clamp(1, FOLDER_TERMINAL_ROWS as i32);
         let press = format!("\x1b[<0;{col};{row}M");
         let release = format!("\x1b[<0;{col};{row}m");
         self.write_folder_terminal(press.as_bytes());
@@ -5043,13 +5667,18 @@ impl Aurora {
         if self.folder_terminal.master_fd.is_some() {
             return;
         }
-        match spawn_terminal_pty(&self.folder_terminal.cwd, FOLDER_TERMINAL_COLS, FOLDER_TERMINAL_ROWS) {
+        match spawn_terminal_pty(
+            &self.folder_terminal.cwd,
+            FOLDER_TERMINAL_COLS,
+            FOLDER_TERMINAL_ROWS,
+        ) {
             Ok((fd, pid)) => {
                 self.folder_terminal.master_fd = Some(fd);
                 self.folder_terminal.child_pid = Some(pid);
                 self.folder_terminal.history.clear();
                 self.folder_terminal.scrollback = 0;
-                self.folder_terminal.screen = vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+                self.folder_terminal.screen =
+                    vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
                 self.folder_terminal.cursor_x = 0;
                 self.folder_terminal.cursor_y = 0;
                 self.folder_terminal.mouse_enabled = false;
@@ -5145,6 +5774,7 @@ impl Aurora {
             || self.folder_terminal.esc.starts_with("\x1b)")
         {
             if self.folder_terminal.esc.len() >= 3 {
+                self.folder_terminal.line_drawing = self.folder_terminal.esc.ends_with('0');
                 self.folder_terminal.esc.clear();
             }
             return;
@@ -5165,7 +5795,13 @@ impl Aurora {
         let clean = params.trim_start_matches('?');
         let values = clean
             .split(';')
-            .filter_map(|part| part.parse::<usize>().ok())
+            .filter_map(|part| {
+                part.chars()
+                    .filter(|ch| ch.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .ok()
+            })
             .collect::<Vec<_>>();
         if private && matches!(command, 'h' | 'l') {
             if values
@@ -5173,6 +5809,15 @@ impl Aurora {
                 .any(|value| matches!(*value, 1000 | 1002 | 1003 | 1006))
             {
                 self.folder_terminal.mouse_enabled = command == 'h';
+            }
+            if values
+                .iter()
+                .any(|value| matches!(*value, 1047 | 1048 | 1049))
+            {
+                self.folder_terminal.screen =
+                    vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+                self.folder_terminal.cursor_x = 0;
+                self.folder_terminal.cursor_y = 0;
             }
             return;
         }
@@ -5183,21 +5828,158 @@ impl Aurora {
                 self.folder_terminal.cursor_y = row.min(FOLDER_TERMINAL_ROWS - 1);
                 self.folder_terminal.cursor_x = col.min(FOLDER_TERMINAL_COLS - 1);
             }
-            'A' => self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.saturating_sub(values.first().copied().unwrap_or(1)),
-            'B' => self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y + values.first().copied().unwrap_or(1)).min(FOLDER_TERMINAL_ROWS - 1),
-            'C' => self.folder_terminal.cursor_x = (self.folder_terminal.cursor_x + values.first().copied().unwrap_or(1)).min(FOLDER_TERMINAL_COLS - 1),
-            'D' => self.folder_terminal.cursor_x = self.folder_terminal.cursor_x.saturating_sub(values.first().copied().unwrap_or(1)),
-            'J' => {
-                self.folder_terminal.screen = vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
-                self.folder_terminal.cursor_x = 0;
-                self.folder_terminal.cursor_y = 0;
+            'A' => {
+                self.folder_terminal.cursor_y = self
+                    .folder_terminal
+                    .cursor_y
+                    .saturating_sub(values.first().copied().unwrap_or(1))
             }
+            'B' => {
+                self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y
+                    + values.first().copied().unwrap_or(1))
+                .min(FOLDER_TERMINAL_ROWS - 1)
+            }
+            'C' => {
+                self.folder_terminal.cursor_x = (self.folder_terminal.cursor_x
+                    + values.first().copied().unwrap_or(1))
+                .min(FOLDER_TERMINAL_COLS - 1)
+            }
+            'D' => {
+                self.folder_terminal.cursor_x = self
+                    .folder_terminal
+                    .cursor_x
+                    .saturating_sub(values.first().copied().unwrap_or(1))
+            }
+            'G' => {
+                self.folder_terminal.cursor_x = values
+                    .first()
+                    .copied()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(FOLDER_TERMINAL_COLS - 1);
+            }
+            'd' => {
+                self.folder_terminal.cursor_y = values
+                    .first()
+                    .copied()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(FOLDER_TERMINAL_ROWS - 1);
+            }
+            'J' => match values.first().copied().unwrap_or(0) {
+                0 => {
+                    let y = self.folder_terminal.cursor_y;
+                    for x in self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS {
+                        self.folder_terminal.screen[y][x] = ' ';
+                    }
+                    for yy in y + 1..FOLDER_TERMINAL_ROWS {
+                        self.folder_terminal.screen[yy].fill(' ');
+                    }
+                }
+                1 => {
+                    for yy in 0..self.folder_terminal.cursor_y {
+                        self.folder_terminal.screen[yy].fill(' ');
+                    }
+                    let y = self.folder_terminal.cursor_y;
+                    for x in 0..=self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1) {
+                        self.folder_terminal.screen[y][x] = ' ';
+                    }
+                }
+                _ => {
+                    self.folder_terminal.screen =
+                        vec![vec![' '; FOLDER_TERMINAL_COLS]; FOLDER_TERMINAL_ROWS];
+                    self.folder_terminal.cursor_x = 0;
+                    self.folder_terminal.cursor_y = 0;
+                }
+            },
             'K' => {
                 let y = self.folder_terminal.cursor_y;
-                for x in self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS {
+                match values.first().copied().unwrap_or(0) {
+                    0 => {
+                        for x in self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS {
+                            self.folder_terminal.screen[y][x] = ' ';
+                        }
+                    }
+                    1 => {
+                        for x in 0..=self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1) {
+                            self.folder_terminal.screen[y][x] = ' ';
+                        }
+                    }
+                    _ => self.folder_terminal.screen[y].fill(' '),
+                }
+            }
+            'X' => {
+                let count = values.first().copied().unwrap_or(1);
+                let y = self.folder_terminal.cursor_y;
+                for x in self.folder_terminal.cursor_x
+                    ..(self.folder_terminal.cursor_x + count).min(FOLDER_TERMINAL_COLS)
+                {
                     self.folder_terminal.screen[y][x] = ' ';
                 }
             }
+            'P' => {
+                let count = values
+                    .first()
+                    .copied()
+                    .unwrap_or(1)
+                    .min(FOLDER_TERMINAL_COLS);
+                let y = self.folder_terminal.cursor_y;
+                for x in self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS {
+                    let src = x + count;
+                    self.folder_terminal.screen[y][x] = if src < FOLDER_TERMINAL_COLS {
+                        self.folder_terminal.screen[y][src]
+                    } else {
+                        ' '
+                    };
+                }
+            }
+            '@' => {
+                let count = values
+                    .first()
+                    .copied()
+                    .unwrap_or(1)
+                    .min(FOLDER_TERMINAL_COLS);
+                let y = self.folder_terminal.cursor_y;
+                for x in (self.folder_terminal.cursor_x..FOLDER_TERMINAL_COLS).rev() {
+                    self.folder_terminal.screen[y][x] = x
+                        .checked_sub(count)
+                        .filter(|src| *src >= self.folder_terminal.cursor_x)
+                        .map(|src| self.folder_terminal.screen[y][src])
+                        .unwrap_or(' ');
+                }
+            }
+            'L' => {
+                let count = values
+                    .first()
+                    .copied()
+                    .unwrap_or(1)
+                    .min(FOLDER_TERMINAL_ROWS);
+                for _ in 0..count {
+                    self.folder_terminal.screen.insert(
+                        self.folder_terminal.cursor_y,
+                        vec![' '; FOLDER_TERMINAL_COLS],
+                    );
+                    self.folder_terminal.screen.truncate(FOLDER_TERMINAL_ROWS);
+                }
+            }
+            'M' => {
+                let count = values
+                    .first()
+                    .copied()
+                    .unwrap_or(1)
+                    .min(FOLDER_TERMINAL_ROWS);
+                for _ in 0..count {
+                    if self.folder_terminal.cursor_y < self.folder_terminal.screen.len() {
+                        self.folder_terminal
+                            .screen
+                            .remove(self.folder_terminal.cursor_y);
+                        self.folder_terminal
+                            .screen
+                            .push(vec![' '; FOLDER_TERMINAL_COLS]);
+                    }
+                }
+            }
+            'm' | 'r' | 's' | 'u' => {}
             _ => {}
         }
     }
@@ -5208,7 +5990,8 @@ impl Aurora {
         }
         let x = self.folder_terminal.cursor_x.min(FOLDER_TERMINAL_COLS - 1);
         let y = self.folder_terminal.cursor_y.min(FOLDER_TERMINAL_ROWS - 1);
-        self.folder_terminal.screen[y][x] = ch;
+        self.folder_terminal.screen[y][x] =
+            terminal_display_char(ch, self.folder_terminal.line_drawing);
         self.folder_terminal.cursor_x += 1;
     }
 
@@ -5223,7 +6006,9 @@ impl Aurora {
                 let extra = self.folder_terminal.history.len() - TERMINAL_HISTORY_LIMIT;
                 self.folder_terminal.history.drain(0..extra);
             }
-            self.folder_terminal.screen.push(vec![' '; FOLDER_TERMINAL_COLS]);
+            self.folder_terminal
+                .screen
+                .push(vec![' '; FOLDER_TERMINAL_COLS]);
         } else {
             self.folder_terminal.cursor_y += 1;
         }
@@ -5295,31 +6080,41 @@ impl Aurora {
     }
 
     fn open_media(&mut self, entry: FolderEntry) -> AnyResult<()> {
-        let default_kind = match entry.kind {
-            FileKind::Image => Some(DefaultAppKind::Photo),
-            FileKind::Video => Some(DefaultAppKind::Video),
-            _ => None,
-        };
-        if let Some(kind) = default_kind {
-            let command = self.selected_app_command(kind).to_string();
-            if !command.is_empty() {
-                if self.spawn_configured_app(&command, Some(&entry.path)) {
-                    return Ok(());
-                }
-                self.folder_info = Some(format!(
-                    "Could not launch default {}; choose another app.",
-                    kind.label()
-                ));
-                self.redraw_folder()?;
-                return Ok(());
+        for (idx, state) in self.media_slots.iter_mut().enumerate() {
+            if state.is_some() {
+                *state = None;
+                let _ = self.conn.unmap_window(self.ui.media[idx]);
             }
         }
-        let slot = self.media_next_slot % MEDIA_SLOT_COUNT;
-        self.media_next_slot = (slot + 1) % MEDIA_SLOT_COUNT;
+        let slot = 0;
+        let text_lines = if entry.kind == FileKind::Text {
+            read_text_lines_limited(&entry.path, 5000)
+        } else {
+            Vec::new()
+        };
+        let file_info = (entry.kind == FileKind::Other).then(|| file_command_summary(&entry.path));
+        let media = self.media_geometry(slot);
+        let image_preview = if entry.kind == FileKind::Image {
+            render_image_preview(
+                &entry.path,
+                i32::from(media.2) - 64,
+                i32::from(media.3) - 146,
+            )
+        } else {
+            None
+        };
         let state = MediaState {
             entry,
             playing: false,
             progress: 0.0,
+            text_lines,
+            text_scroll: 0,
+            text_cursor_line: 0,
+            text_cursor_col: 0,
+            editing: false,
+            file_info,
+            image_preview,
+            notice: None,
         };
         self.media = Some(state.clone());
         self.media_slots[slot] = Some(state);
@@ -5327,7 +6122,6 @@ impl Aurora {
         self.media_front_slot = Some(slot);
         self.folder_front = false;
         self.settings_front = false;
-        let media = self.media_geometry(slot);
         self.conn.configure_window(
             self.ui.media[slot],
             &ConfigureWindowAux::new()
@@ -5343,8 +6137,15 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_media_click(&mut self, slot: usize, x: i32, y: i32) -> AnyResult<()> {
-        let (_, _, w, _) = self.media_geometry(slot);
+    fn handle_media_click(&mut self, slot: usize, button: u8, x: i32, y: i32) -> AnyResult<()> {
+        let (_, _, w, h) = self.media_geometry(slot);
+        if button == 3 {
+            self.media_context_open = Some((slot, x, y));
+            self.media_trash_prompt = None;
+            self.redraw_media_slot(slot)?;
+            self.raise_media()?;
+            return Ok(());
+        }
         if x >= i32::from(w) - 43 && x <= i32::from(w) - 19 && (17..=41).contains(&y) {
             self.media_slots[slot] = None;
             if self.media_front_slot == Some(slot) {
@@ -5355,15 +6156,393 @@ impl Aurora {
             self.conn.unmap_window(self.ui.media[slot])?;
             return Ok(());
         }
+        if let Some(action) = self.media_context_action_at(slot, x, y) {
+            self.run_media_context_action(slot, action)?;
+            return Ok(());
+        }
+        self.media_context_open = None;
+        self.media_trash_prompt = None;
         if let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) {
+            if x >= 24 && x <= i32::from(w) - 92 && (18..=38).contains(&y) {
+                copy_text_to_clipboard(&media.entry.path.to_string_lossy());
+                media.notice = Some("Copied full path".to_string());
+                self.redraw_media_slot(slot)?;
+                return Ok(());
+            }
+            if media.entry.kind == FileKind::Text
+                && x >= i32::from(w) - 78
+                && x <= i32::from(w) - 50
+                && (17..=41).contains(&y)
+            {
+                if media.editing {
+                    let _ = fs::write(&media.entry.path, media.text_lines.join("\n"));
+                    media.notice = Some("Saved".to_string());
+                } else if media.text_lines.is_empty() {
+                    media.text_lines.push(String::new());
+                    media.text_cursor_line = 0;
+                    media.text_cursor_col = 0;
+                }
+                media.editing = !media.editing;
+                self.redraw_media_slot(slot)?;
+                return Ok(());
+            }
+            if media.entry.kind == FileKind::Text {
+                let preview_x = 18;
+                let preview_y = 58;
+                let preview_w = i32::from(w) - 48;
+                let preview_h = i32::from(h) - 130;
+                if x >= preview_x
+                    && x <= preview_x + preview_w
+                    && y >= preview_y
+                    && y <= preview_y + preview_h
+                {
+                    if media.text_lines.is_empty() {
+                        media.text_lines.push(String::new());
+                    }
+                    let line_h = 19;
+                    let clicked = ((y - preview_y - 12).max(0) / line_h) as usize;
+                    let line_idx =
+                        (media.text_scroll + clicked).min(media.text_lines.len().saturating_sub(1));
+                    let text_x = preview_x + 42;
+                    let line = media
+                        .text_lines
+                        .get(line_idx)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    media.text_cursor_line = line_idx;
+                    media.text_cursor_col = cursor_col_for_x(&self.regular, line, x - text_x, 13.0);
+                    self.media_text_selection = Some(MediaTextSelection {
+                        slot,
+                        start_line: line_idx,
+                        start_col: media.text_cursor_col,
+                        end_line: line_idx,
+                        end_col: media.text_cursor_col,
+                    });
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
+            }
+            if media.entry.kind == FileKind::Other {
+                let preview_y = 58;
+                let preview_h = i32::from(h) - 130;
+                if let Some(line) = unknown_file_info_line(media, y - preview_y) {
+                    copy_text_to_clipboard(&line);
+                    media.notice = Some("Copied text".to_string());
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
+                if y >= preview_y + preview_h - 56 && y <= preview_y + preview_h - 22 {
+                    media.entry.kind = FileKind::Text;
+                    media.text_lines = read_text_lines_limited(&media.entry.path, 5000);
+                    media.text_scroll = 0;
+                    media.text_cursor_line = 0;
+                    media.text_cursor_col = 0;
+                    media.notice = None;
+                    self.redraw_media_slot(slot)?;
+                    return Ok(());
+                }
+            }
             let playable = matches!(media.entry.kind, FileKind::Audio | FileKind::Video);
-            if playable && x >= 26 && x <= i32::from(w) - 26 && y >= 275 && y <= 330 {
-                media.playing = !media.playing;
+            let controls_y = i32::from(h) - 62;
+            if playable
+                && x >= 24
+                && x <= i32::from(w) - 24
+                && y >= controls_y
+                && y <= controls_y + 42
+            {
+                let bar_x = 150;
+                let bar_w = i32::from(w) - bar_x - 48;
+                if x >= bar_x && x <= bar_x + bar_w {
+                    media.progress = ((x - bar_x) as f32 / bar_w.max(1) as f32).clamp(0.0, 1.0);
+                    media.playing = true;
+                } else {
+                    media.playing = !media.playing;
+                }
                 self.media = self.media_slots.iter().rev().find_map(|m| m.clone());
                 self.redraw_media_slot(slot)?;
             }
         }
         self.raise_media()?;
+        Ok(())
+    }
+
+    fn media_context_action_at(&self, slot: usize, x: i32, y: i32) -> Option<MediaContextAction> {
+        if self.media_trash_prompt == Some(slot) {
+            let (_, _, w, h) = self.media_geometry(slot);
+            let box_w = 310;
+            let box_h = 126;
+            let px = (i32::from(w) - box_w) / 2;
+            let py = (i32::from(h) - box_h) / 2;
+            if x >= px + 48 && x <= px + 132 && y >= py + 82 && y <= py + 112 {
+                return Some(MediaContextAction::ConfirmTrash);
+            }
+            if x >= px + 174 && x <= px + 258 && y >= py + 82 && y <= py + 112 {
+                return Some(MediaContextAction::CancelTrash);
+            }
+        }
+        let (ctx_slot, ctx_x, ctx_y) = self.media_context_open?;
+        if ctx_slot != slot {
+            return None;
+        }
+        let (_, _, w, h) = self.media_geometry(slot);
+        let menu_x = ctx_x.min(i32::from(w) - 184).max(12);
+        let menu_y = ctx_y.min(i32::from(h) - 112).max(50);
+        if x < menu_x || x > menu_x + 172 || y < menu_y || y > menu_y + 96 {
+            return None;
+        }
+        match (y - menu_y) / 29 {
+            0 => Some(MediaContextAction::Rename),
+            1 => Some(MediaContextAction::CopyImage),
+            2 => Some(MediaContextAction::MoveTrash),
+            _ => None,
+        }
+    }
+
+    fn run_media_context_action(
+        &mut self,
+        slot: usize,
+        action: MediaContextAction,
+    ) -> AnyResult<()> {
+        match action {
+            MediaContextAction::Rename => {
+                if let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) {
+                    media.notice = Some("Rename from the folder context menu".to_string());
+                }
+                self.media_context_open = None;
+            }
+            MediaContextAction::CopyImage => {
+                if let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) {
+                    if media.entry.kind == FileKind::Image {
+                        copy_image_to_clipboard(&media.entry.path);
+                        media.notice = Some("Copied image to clipboard".to_string());
+                    } else {
+                        copy_text_to_clipboard(&media.entry.path.to_string_lossy());
+                        media.notice = Some("Copied path".to_string());
+                    }
+                }
+                self.media_context_open = None;
+            }
+            MediaContextAction::MoveTrash => {
+                self.media_trash_prompt = Some(slot);
+                self.media_context_open = None;
+            }
+            MediaContextAction::ConfirmTrash => {
+                if let Some(media) = self.media_slots.get(slot).and_then(|m| m.as_ref()).cloned() {
+                    if move_to_trash(&media.entry.path).is_ok() {
+                        self.media_slots[slot] = None;
+                        self.media = self.media_slots.iter().rev().find_map(|m| m.clone());
+                        self.conn.unmap_window(self.ui.media[slot])?;
+                        self.refresh_folder_entries();
+                        self.folder_info = Some("Moved to Trash".to_string());
+                        self.redraw_folder()?;
+                    } else if let Some(media) =
+                        self.media_slots.get_mut(slot).and_then(|m| m.as_mut())
+                    {
+                        media.notice = Some("Could not move to Trash".to_string());
+                    }
+                }
+                self.media_trash_prompt = None;
+                self.media_context_open = None;
+            }
+            MediaContextAction::CancelTrash => {
+                self.media_trash_prompt = None;
+                self.media_context_open = None;
+            }
+        }
+        if self
+            .media_slots
+            .get(slot)
+            .and_then(|m| m.as_ref())
+            .is_some()
+        {
+            self.redraw_media_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    fn handle_media_motion(&mut self, slot: usize, x: i32, y: i32) -> AnyResult<()> {
+        let Some(selection_slot) = self
+            .media_text_selection
+            .as_ref()
+            .map(|selection| selection.slot)
+        else {
+            return Ok(());
+        };
+        if selection_slot != slot {
+            return Ok(());
+        }
+        let (_, _, w, h) = self.media_geometry(slot);
+        let Some(media) = self.media_slots.get(slot).and_then(|m| m.as_ref()) else {
+            return Ok(());
+        };
+        if media.entry.kind != FileKind::Text {
+            return Ok(());
+        }
+        let preview_x = 18;
+        let preview_y = 58;
+        let preview_w = i32::from(w) - 48;
+        let preview_h = i32::from(h) - 130;
+        if x < preview_x || x > preview_x + preview_w || y < preview_y || y > preview_y + preview_h
+        {
+            return Ok(());
+        }
+        let (line, col) = text_position_for_point(media, &self.regular, x, y, preview_x, preview_y);
+        let Some(selection) = self.media_text_selection.as_mut() else {
+            return Ok(());
+        };
+        selection.end_line = line;
+        selection.end_col = col;
+        self.redraw_media_slot(slot)?;
+        Ok(())
+    }
+
+    fn handle_media_release(&mut self, slot: usize) -> AnyResult<()> {
+        let Some(selection) = self.media_text_selection.take() else {
+            return Ok(());
+        };
+        if selection.slot != slot {
+            return Ok(());
+        }
+        let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) else {
+            return Ok(());
+        };
+        let selected = selected_text_from_lines(&media.text_lines, &selection);
+        if !selected.is_empty() {
+            copy_text_to_clipboard(&selected);
+            media.notice = Some("Copied selection".to_string());
+        }
+        self.redraw_media_slot(slot)?;
+        Ok(())
+    }
+
+    fn handle_media_scroll(&mut self, slot: usize, button: u8) -> AnyResult<()> {
+        let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) else {
+            return Ok(());
+        };
+        if media.entry.kind != FileKind::Text {
+            return Ok(());
+        }
+        let old = media.text_scroll;
+        let max_scroll = media.text_lines.len().saturating_sub(1);
+        if button == 4 {
+            media.text_scroll = media.text_scroll.saturating_sub(4);
+        } else {
+            media.text_scroll = (media.text_scroll + 4).min(max_scroll);
+        }
+        if media.text_scroll != old {
+            self.redraw_media_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    fn handle_media_key(&mut self, slot: usize, ev: KeyPressEvent) -> AnyResult<()> {
+        let (_, _, _, h) = self.media_geometry(slot);
+        let visible_lines = ((i32::from(h) - 150) / 19).max(1) as usize;
+        let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) else {
+            return Ok(());
+        };
+        if media.entry.kind != FileKind::Text || !media.editing {
+            return Ok(());
+        }
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        let shifted = u16::from(ev.state) & u16::from(KeyButMask::SHIFT) != 0;
+        let column = if shifted && mapping.keysyms_per_keycode > 1 {
+            1
+        } else {
+            0
+        };
+        let Some(&keysym) = mapping.keysyms.get(column) else {
+            return Ok(());
+        };
+        if media.text_lines.is_empty() {
+            media.text_lines.push(String::new());
+        }
+        match keysym {
+            0xff08 => {
+                let line_idx = media
+                    .text_cursor_line
+                    .min(media.text_lines.len().saturating_sub(1));
+                let col = media
+                    .text_cursor_col
+                    .min(media.text_lines[line_idx].chars().count());
+                if col > 0 {
+                    let byte_idx = nth_char_byte(&media.text_lines[line_idx], col - 1);
+                    media.text_lines[line_idx].remove(byte_idx);
+                    media.text_cursor_col = col - 1;
+                } else if line_idx > 0 {
+                    let removed = media.text_lines.remove(line_idx);
+                    media.text_cursor_line = line_idx - 1;
+                    media.text_cursor_col =
+                        media.text_lines[media.text_cursor_line].chars().count();
+                    media.text_lines[media.text_cursor_line].push_str(&removed);
+                }
+            }
+            0xff0d => {
+                let line_idx = media
+                    .text_cursor_line
+                    .min(media.text_lines.len().saturating_sub(1));
+                let col = media
+                    .text_cursor_col
+                    .min(media.text_lines[line_idx].chars().count());
+                let byte_idx = nth_char_byte(&media.text_lines[line_idx], col);
+                let rest = media.text_lines[line_idx].split_off(byte_idx);
+                media.text_lines.insert(line_idx + 1, rest);
+                media.text_cursor_line = line_idx + 1;
+                media.text_cursor_col = 0;
+            }
+            0xff51 => {
+                media.text_cursor_col = media.text_cursor_col.saturating_sub(1);
+            }
+            0xff53 => {
+                let line_idx = media
+                    .text_cursor_line
+                    .min(media.text_lines.len().saturating_sub(1));
+                let len = media.text_lines[line_idx].chars().count();
+                media.text_cursor_col = (media.text_cursor_col + 1).min(len);
+            }
+            0xff52 => {
+                media.text_cursor_line = media.text_cursor_line.saturating_sub(1);
+                let len = media.text_lines[media.text_cursor_line].chars().count();
+                media.text_cursor_col = media.text_cursor_col.min(len);
+            }
+            0xff54 => {
+                media.text_cursor_line =
+                    (media.text_cursor_line + 1).min(media.text_lines.len().saturating_sub(1));
+                let len = media.text_lines[media.text_cursor_line].chars().count();
+                media.text_cursor_col = media.text_cursor_col.min(len);
+            }
+            0xff50 => media.text_cursor_col = 0,
+            0xff57 => {
+                let line_idx = media
+                    .text_cursor_line
+                    .min(media.text_lines.len().saturating_sub(1));
+                media.text_cursor_col = media.text_lines[line_idx].chars().count();
+            }
+            0x20..=0x7e => {
+                let ch = char::from_u32(keysym).unwrap();
+                let line_idx = media
+                    .text_cursor_line
+                    .min(media.text_lines.len().saturating_sub(1));
+                let col = media
+                    .text_cursor_col
+                    .min(media.text_lines[line_idx].chars().count());
+                let byte_idx = nth_char_byte(&media.text_lines[line_idx], col);
+                media.text_lines[line_idx].insert(byte_idx, ch);
+                media.text_cursor_col = col + 1;
+            }
+            _ => return Ok(()),
+        }
+        media.text_cursor_line = media
+            .text_cursor_line
+            .min(media.text_lines.len().saturating_sub(1));
+        let line_len = media.text_lines[media.text_cursor_line].chars().count();
+        media.text_cursor_col = media.text_cursor_col.min(line_len);
+        if media.text_cursor_line < media.text_scroll {
+            media.text_scroll = media.text_cursor_line;
+        } else if media.text_cursor_line >= media.text_scroll + visible_lines {
+            media.text_scroll = media.text_cursor_line.saturating_sub(visible_lines - 1);
+        }
+        self.redraw_media_slot(slot)?;
         Ok(())
     }
 
@@ -5733,6 +6912,12 @@ impl Aurora {
                     }),
                 )?;
             }
+        }
+        if self.screenshot_mode {
+            self.conn.configure_window(
+                self.ui.topbar,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
         }
         self.raise_chrome()?;
         if self.app_menu_visible {
@@ -6369,10 +7554,7 @@ fn draw_arc(
 
     let get_end_point = |deg: f32| {
         let rad = deg.to_radians();
-        (
-            cx as f32 + rad.cos() * r,
-            cy as f32 + rad.sin() * r,
-        )
+        (cx as f32 + rad.cos() * r, cy as f32 + rad.sin() * r)
     };
     let ep0 = get_end_point(start_degrees);
     let ep1 = get_end_point(end_degrees);
@@ -6444,8 +7626,16 @@ fn draw_sidebar_tile(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 fn draw_sidebar_display_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
-    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
+    let accent_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(82, 196, 180)
+    };
 
     // Monitor casing
     c.draw_round_rect(cx - 9, cy - 7, 18, 14, 3, base_color);
@@ -6456,19 +7646,75 @@ fn draw_sidebar_display_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 fn draw_sidebar_wallpaper_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
-    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
+    let accent_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(82, 196, 180)
+    };
 
     // Frame
     c.draw_round_rect(cx - 9, cy - 8, 18, 16, 3, base_color);
     // Moon/Sun
     c.draw_circle(cx + 4, cy - 4, 2, accent_color);
     // Left mountain peak
-    draw_round_line(c, cx - 7, cy + 6, cx - 3, cy + 1, 2, if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(110, 125, 145) });
-    draw_round_line(c, cx - 3, cy + 1, cx + 1, cy + 6, 2, if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(110, 125, 145) });
+    draw_round_line(
+        c,
+        cx - 7,
+        cy + 6,
+        cx - 3,
+        cy + 1,
+        2,
+        if is_topbar {
+            Color::rgb(175, 218, 245)
+        } else {
+            Color::rgb(110, 125, 145)
+        },
+    );
+    draw_round_line(
+        c,
+        cx - 3,
+        cy + 1,
+        cx + 1,
+        cy + 6,
+        2,
+        if is_topbar {
+            Color::rgb(175, 218, 245)
+        } else {
+            Color::rgb(110, 125, 145)
+        },
+    );
     // Right mountain peak
-    draw_round_line(c, cx - 2, cy + 6, cx + 3, cy - 1, 2, if is_topbar { Color::rgb(195, 228, 250) } else { Color::rgb(130, 145, 165) });
-    draw_round_line(c, cx + 3, cy - 1, cx + 7, cy + 6, 2, if is_topbar { Color::rgb(195, 228, 250) } else { Color::rgb(130, 145, 165) });
+    draw_round_line(
+        c,
+        cx - 2,
+        cy + 6,
+        cx + 3,
+        cy - 1,
+        2,
+        if is_topbar {
+            Color::rgb(195, 228, 250)
+        } else {
+            Color::rgb(130, 145, 165)
+        },
+    );
+    draw_round_line(
+        c,
+        cx + 3,
+        cy - 1,
+        cx + 7,
+        cy + 6,
+        2,
+        if is_topbar {
+            Color::rgb(195, 228, 250)
+        } else {
+            Color::rgb(130, 145, 165)
+        },
+    );
 }
 
 fn draw_sidebar_audio_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -6484,8 +7730,16 @@ fn draw_sidebar_network_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 fn draw_sidebar_bluetooth_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
-    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
+    let accent_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(82, 196, 180)
+    };
 
     // Spine
     draw_round_line(c, cx - 4, cy - 8, cx - 4, cy + 8, 3, accent_color);
@@ -6508,8 +7762,16 @@ fn draw_sidebar_bluetooth_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 fn draw_sidebar_startup_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
-    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
+    let accent_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(82, 196, 180)
+    };
 
     // Filled right-pointing triangle using vertical slices
     for dx in 0..=12 {
@@ -6524,7 +7786,11 @@ fn draw_sidebar_startup_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 fn draw_sidebar_apps_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
 
     // 2x2 grid of rounded squares
     for row in 0..2 {
@@ -6537,8 +7803,16 @@ fn draw_sidebar_apps_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 fn draw_sidebar_about_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
-    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
+    let accent_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(82, 196, 180)
+    };
 
     // Vertical capsule
     draw_round_line(c, cx, cy - 1, cx, cy + 7, 4, base_color);
@@ -6702,6 +7976,32 @@ fn draw_terminal_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     c.draw_line(cx + 1, cy + 5, cx + 8, cy + 5, 2, color);
 }
 
+fn draw_screenshot_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_round_rect(
+        cx - 11,
+        cy - 8,
+        22,
+        16,
+        4,
+        Color::rgba(color.r, color.g, color.b, 42),
+    );
+    c.draw_rect(cx - 5, cy - 11, 10, 3, color);
+    c.draw_circle(cx, cy, 5, color);
+    c.draw_circle(cx, cy, 2, Color::rgba(23, 34, 42, 178));
+}
+
+fn draw_edit_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_line(cx - 7, cy + 6, cx + 5, cy - 6, 2, color);
+    c.draw_line(cx + 3, cy - 8, cx + 7, cy - 4, 2, color);
+    c.draw_line(cx - 8, cy + 7, cx - 3, cy + 6, 2, color);
+}
+
+fn draw_save_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_round_rect(cx - 8, cy - 8, 16, 16, 3, Color::rgba(255, 255, 255, 95));
+    c.draw_rect(cx - 4, cy - 6, 8, 5, color);
+    c.draw_rect(cx - 5, cy + 2, 10, 5, color);
+}
+
 fn draw_picture_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     c.draw_round_rect(
         cx - 13,
@@ -6779,8 +8079,16 @@ fn draw_gear_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 fn draw_power_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     draw_sidebar_tile(c, cx, cy, color);
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
-    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
+    let accent_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(82, 196, 180)
+    };
 
     // Horizontal battery outline
     c.draw_round_rect(cx - 9, cy - 6, 16, 12, 3, base_color);
@@ -6792,20 +8100,32 @@ fn draw_power_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 
 fn draw_wifi_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
-    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
+    let accent_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(82, 196, 180)
+    };
 
     // Two concentric arcs centered at bottom dot (radii: 12 and 7, thickness: 3)
     draw_arc(c, cx, cy + 6, 12, 220.0, 320.0, 10, 3, base_color);
     draw_arc(c, cx, cy + 6, 7, 220.0, 320.0, 8, 3, base_color);
-    
+
     // Bottom center dot
     c.draw_circle(cx, cy + 6, 3, accent_color);
 }
 
 fn draw_speaker_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     let is_topbar = color == MINT_LIGHT;
-    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let base_color = if is_topbar {
+        Color::rgb(175, 218, 245)
+    } else {
+        Color::rgb(60, 75, 96)
+    };
 
     // Speaker flat base
     c.draw_round_rect(cx - 10, cy - 3, 5, 6, 2, base_color);
@@ -7100,31 +8420,156 @@ fn paint_file_preview(c: &mut Canvas, path: &std::path::Path, x: i32, y: i32, w:
     }
 }
 
-fn draw_text_preview(
+fn render_image_preview(path: &std::path::Path, w: i32, h: i32) -> Option<ImagePreview> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let resolution = image_dimensions(path);
+    let bytes = fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (iw, ih) = img.dimensions();
+    let scale = (w as f32 / iw as f32).min(h as f32 / ih as f32);
+    let nw = (iw as f32 * scale).round().max(1.0) as u32;
+    let nh = (ih as f32 * scale).round().max(1.0) as u32;
+    let resized = image::imageops::resize(&img, nw, nh, FilterType::Triangle);
+    Some(ImagePreview {
+        pixels: resized.into_raw(),
+        width: nw.min(u16::MAX as u32) as u16,
+        height: nh.min(u16::MAX as u32) as u16,
+        resolution,
+    })
+}
+
+fn paint_cached_image_preview(
+    c: &mut Canvas,
+    preview: &ImagePreview,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
+    let pw = i32::from(preview.width);
+    let ph = i32::from(preview.height);
+    let dx = x + (w - pw) / 2;
+    let dy = y + (h - ph) / 2;
+    for yy in 0..ph {
+        for xx in 0..pw {
+            let idx = ((yy * pw + xx) * 4) as usize;
+            if idx + 3 < preview.pixels.len() {
+                c.blend_pixel(
+                    dx + xx,
+                    dy + yy,
+                    Color::rgba(
+                        preview.pixels[idx],
+                        preview.pixels[idx + 1],
+                        preview.pixels[idx + 2],
+                        preview.pixels[idx + 3],
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn draw_image_info_overlay(
     c: &mut Canvas,
     font: &Font<'static>,
     path: &std::path::Path,
     x: i32,
     y: i32,
     w: i32,
-    h: i32,
+    cached_resolution: Option<(u32, u32)>,
 ) {
+    let meta = fs::metadata(path).ok();
+    let size = meta.map(|m| m.len()).unwrap_or(0);
+    let resolution = cached_resolution
+        .or_else(|| image_dimensions(path))
+        .map(|(iw, ih)| format!("{iw}x{ih}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    c.draw_round_rect(x, y, w, 70, 10, Color::rgba(0, 0, 0, 102));
+    c.draw_text(
+        font,
+        &compact(
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("Image"),
+            22,
+        ),
+        x + 10,
+        y + 10,
+        11.0,
+        Color::rgb(255, 255, 255),
+    );
+    c.draw_text(
+        font,
+        &format_size_mb(size),
+        x + 10,
+        y + 30,
+        10.0,
+        Color::rgb(255, 255, 255),
+    );
+    c.draw_text(
+        font,
+        &resolution,
+        x + 10,
+        y + 48,
+        10.0,
+        Color::rgb(255, 255, 255),
+    );
+}
+
+fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    image::image_dimensions(path).ok()
+}
+
+fn paint_video_frame_preview(
+    c: &mut Canvas,
+    path: &std::path::Path,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Option<()> {
+    c.draw_round_rect(x, y, w, h, 10, Color::rgba(23, 34, 42, 54));
+    c.draw_text_center(
+        &Font::try_from_bytes(FONT_REGULAR)?,
+        &compact(
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("Video"),
+            28,
+        ),
+        x + w / 2,
+        y + h / 2 - 12,
+        13.0,
+        Color::rgb(255, 255, 255),
+    );
+    None
+}
+
+fn read_text_lines_limited(path: &std::path::Path, max_lines: usize) -> Vec<String> {
     let Ok(mut file) = fs::File::open(path) else {
-        return;
+        return vec!["Could not open text file".to_string()];
     };
     let mut buf = String::new();
-    let _ = file.by_ref().take(4096).read_to_string(&mut buf);
-    let max_lines = (h / 18).max(1) as usize;
-    for (idx, line) in buf.lines().take(max_lines).enumerate() {
-        c.draw_text(
-            font,
-            &compact(line.trim_end(), (w / 7).max(12) as usize),
-            x,
-            y + idx as i32 * 18,
-            12.0,
-            INK,
-        );
+    let _ = file.by_ref().take(512 * 1024).read_to_string(&mut buf);
+    let mut lines = buf
+        .lines()
+        .take(max_lines)
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(String::new());
     }
+    lines
+}
+
+fn file_command_summary(path: &std::path::Path) -> String {
+    Command::new("file")
+        .arg("-b")
+        .arg(path)
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "Unknown file type".to_string())
 }
 
 fn read_display_modes(display: &str, current_width: u16, current_height: u16) -> Vec<DisplayMode> {
@@ -7652,6 +9097,162 @@ fn compact(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn format_size_mb(bytes: u64) -> String {
+    format!("{:.2} MB", bytes as f64 / 1024.0 / 1024.0)
+}
+
+fn viewer_status(media: &MediaState) -> String {
+    let size = fs::metadata(&media.entry.path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if media.entry.kind == FileKind::Text {
+        let lines = media.text_lines.len();
+        let words = media
+            .text_lines
+            .iter()
+            .map(|line| line.split_whitespace().count())
+            .sum::<usize>();
+        format!("{lines} lines  {words} words  {}", format_size_mb(size))
+    } else {
+        format_size_mb(size)
+    }
+}
+
+fn unknown_file_info_line(media: &MediaState, local_y: i32) -> Option<String> {
+    let idx = (local_y - 112) / 24;
+    if !(0..4).contains(&idx) {
+        return None;
+    }
+    let meta = fs::metadata(&media.entry.path).ok();
+    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let modified = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| format!("modified {}s", d.as_secs()))
+        .unwrap_or_else(|| "modified unknown".to_string());
+    let kind = media
+        .file_info
+        .as_deref()
+        .unwrap_or("Unknown file type")
+        .to_string();
+    match idx {
+        0 => Some(media.entry.name.clone()),
+        1 => Some(format_size_mb(size)),
+        2 => Some(modified),
+        3 => Some(kind),
+        _ => None,
+    }
+}
+
+fn normalized_media_selection(selection: &MediaTextSelection) -> ((usize, usize), (usize, usize)) {
+    let start = (selection.start_line, selection.start_col);
+    let end = (selection.end_line, selection.end_col);
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
+fn selected_text_from_lines(lines: &[String], selection: &MediaTextSelection) -> String {
+    let (start, end) = normalized_media_selection(selection);
+    if start == end {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line_no in start.0..=end.0.min(lines.len().saturating_sub(1)) {
+        let Some(line) = lines.get(line_no) else {
+            continue;
+        };
+        let line_len = line.chars().count();
+        let start_col = if line_no == start.0 {
+            start.1.min(line_len)
+        } else {
+            0
+        };
+        let end_col = if line_no == end.0 {
+            end.1.min(line_len)
+        } else {
+            line_len
+        };
+        if end_col > start_col {
+            out.push_str(
+                &line
+                    .chars()
+                    .skip(start_col)
+                    .take(end_col - start_col)
+                    .collect::<String>(),
+            );
+        }
+        if line_no != end.0 {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn text_position_for_point(
+    media: &MediaState,
+    font: &Font<'static>,
+    x: i32,
+    y: i32,
+    preview_x: i32,
+    preview_y: i32,
+) -> (usize, usize) {
+    let line_h = 19;
+    let clicked = ((y - preview_y - 12).max(0) / line_h) as usize;
+    let line_idx = (media.text_scroll + clicked).min(media.text_lines.len().saturating_sub(1));
+    let text_x = preview_x + 42;
+    let line = media
+        .text_lines
+        .get(line_idx)
+        .map(String::as_str)
+        .unwrap_or("");
+    (line_idx, cursor_col_for_x(font, line, x - text_x, 13.0))
+}
+
+fn nth_char_byte(value: &str, col: usize) -> usize {
+    value
+        .char_indices()
+        .nth(col)
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len())
+}
+
+fn cursor_col_for_x(font: &Font<'static>, line: &str, x: i32, size: f32) -> usize {
+    if x <= 0 {
+        return 0;
+    }
+    let mut best = 0;
+    for col in 1..=line.chars().count() {
+        let prefix = line.chars().take(col).collect::<String>();
+        let width = measure_text(font, &prefix, size);
+        if x < width {
+            let prev = line.chars().take(col - 1).collect::<String>();
+            let prev_width = measure_text(font, &prev, size);
+            return if x - prev_width < width - x {
+                col - 1
+            } else {
+                col
+            };
+        }
+        best = col;
+    }
+    best
+}
+
+fn terminal_display_char(ch: char, line_drawing: bool) -> char {
+    if !line_drawing {
+        return ch;
+    }
+    match ch {
+        'q' => '-',
+        'x' => '|',
+        'l' | 'k' | 'm' | 'j' | 't' | 'u' | 'v' | 'w' | 'n' => '+',
+        _ => ch,
+    }
+}
+
 fn format_clock() -> String {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     let month = match u8::from(now.month()) {
@@ -7725,6 +9326,44 @@ fn copy_text_to_clipboard(text: &str) {
             break;
         }
     }
+}
+
+fn copy_image_to_clipboard(path: &Path) {
+    if command_exists("xclip") {
+        let _ = Command::new("xclip")
+            .args(["-selection", "clipboard", "-target", "image/png", "-i"])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    } else {
+        copy_text_to_clipboard(&path.to_string_lossy());
+    }
+}
+
+fn move_to_trash(path: &Path) -> AnyResult<()> {
+    let trash_files = home_dir().join(".local/share/Trash/files");
+    let trash_info = home_dir().join(".local/share/Trash/info");
+    fs::create_dir_all(&trash_files)?;
+    fs::create_dir_all(&trash_info)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
+    let mut dst = trash_files.join(name);
+    if dst.exists() {
+        let stamp = OffsetDateTime::now_utc().unix_timestamp();
+        dst = trash_files.join(format!("{stamp}-{name}"));
+    }
+    fs::rename(path, &dst)?;
+    let info_name = dst.file_name().and_then(|n| n.to_str()).unwrap_or(name);
+    let deletion = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let info = format!(
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        path.to_string_lossy(),
+        deletion
+    );
+    fs::write(trash_info.join(format!("{info_name}.trashinfo")), info)?;
+    Ok(())
 }
 
 fn file_uri(path: &std::path::Path) -> String {
@@ -7874,11 +9513,9 @@ fn sort_folder_entries(entries: &mut [FolderEntry], sort: FolderSort) {
         }
         match sort {
             FolderSort::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            FolderSort::Date => entry_modified_secs(b).cmp(&entry_modified_secs(a)).then(
-                a.name
-                    .to_lowercase()
-                    .cmp(&b.name.to_lowercase()),
-            ),
+            FolderSort::Date => entry_modified_secs(b)
+                .cmp(&entry_modified_secs(a))
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
             FolderSort::Size => entry_size(b)
                 .cmp(&entry_size(a))
                 .then(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
@@ -7896,7 +9533,9 @@ fn entry_modified_secs(entry: &FolderEntry) -> u64 {
 }
 
 fn entry_size(entry: &FolderEntry) -> u64 {
-    fs::metadata(&entry.path).map(|meta| meta.len()).unwrap_or(0)
+    fs::metadata(&entry.path)
+        .map(|meta| meta.len())
+        .unwrap_or(0)
 }
 
 fn spawn_terminal_pty(cwd: &Path, cols: usize, rows: usize) -> AnyResult<(RawFd, libc::pid_t)> {
