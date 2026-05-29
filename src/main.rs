@@ -2523,6 +2523,19 @@ impl Aurora {
     }
 
     fn handle_client_message(&mut self, ev: ClientMessageEvent) -> AnyResult<()> {
+        let active_atom = self.atom(b"_NET_ACTIVE_WINDOW")?;
+        if ev.type_ == active_atom {
+            if let Some(client) = self.client_or_ancestor_key_for(ev.window) {
+                if let Some(info) = self.clients.get(&client) {
+                    if info.workspace != self.active_workspace {
+                        self.switch_workspace(info.workspace)?;
+                    }
+                }
+                self.focus_window(client)?;
+            }
+            return Ok(());
+        }
+
         let Ok(cookie) = self.conn.intern_atom(false, b"_NET_WM_MOVERESIZE") else {
             return Ok(());
         };
@@ -3485,6 +3498,7 @@ impl Aurora {
         let _ = self.conn.destroy_window(info.frame);
         if self.active_client == Some(client) {
             self.active_client = None;
+            self.update_active_window_property()?;
         }
         self.redraw_dock()?;
         Ok(())
@@ -3497,6 +3511,7 @@ impl Aurora {
             self.conn.unmap_window(info.frame)?;
             if self.active_client == Some(client) {
                 self.active_client = None;
+                self.update_active_window_property()?;
             }
             self.redraw_dock()?;
         }
@@ -3597,6 +3612,21 @@ impl Aurora {
                 .stack_mode(StackMode::BELOW),
         )?;
         self.raise_chrome()?;
+        self.update_active_window_property()?;
+        Ok(())
+    }
+
+    fn update_active_window_property(&self) -> AnyResult<()> {
+        let active_atom = self.atom(b"_NET_ACTIVE_WINDOW")?;
+        let window_atom = self.atom(b"WINDOW")?;
+        let active_val = self.active_client.unwrap_or(0);
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            active_atom,
+            window_atom,
+            &[active_val],
+        )?;
         Ok(())
     }
 
@@ -6265,6 +6295,7 @@ impl Aurora {
         self.hide_dock_more_menu()?;
         self.dock_last_click = None;
         self.active_client = None;
+        self.update_active_window_property()?;
         self.conn
             .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
         self.restore_workspace_ui_windows()?;
