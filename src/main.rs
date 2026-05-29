@@ -1228,6 +1228,7 @@ struct Aurora {
     topbar_notice: Option<(String, Instant)>,
     ffplay_process: Option<std::process::Child>,
     pending_window_nudges: Vec<PendingWindowNudge>,
+    focus_history: Vec<Window>,
 }
 
 fn main() {
@@ -1536,6 +1537,7 @@ impl Aurora {
             topbar_notice: None,
             ffplay_process: None,
             pending_window_nudges: Vec::new(),
+            focus_history: Vec::new(),
         };
         app.apply_sleep_timeout();
         if app.settings.auto_power_saver_minutes > 0 {
@@ -1772,6 +1774,7 @@ impl Aurora {
     fn create_ui_windows(&mut self) -> AnyResult<()> {
         self.grab_root_button1()?;
         self.grab_alt_tab()?;
+        self.grab_workspace_keys()?;
         let top_aux = CreateWindowAux::new()
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE)
@@ -2961,29 +2964,70 @@ impl Aurora {
         };
         let lock = ModMask::LOCK;
         let num_lock = ModMask::M2;
+        
+        // Grab Alt + Tab
         for modifiers in [
             ModMask::M1,
             ModMask::M1 | lock,
             ModMask::M1 | num_lock,
             ModMask::M1 | lock | num_lock,
         ] {
-            let res = self
-                .conn
-                .grab_key(
+            let _ = self.conn.grab_key(
+                false,
+                self.root,
+                modifiers,
+                tab_keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            );
+        }
+
+        // Grab Ctrl + Shift + Tab
+        for modifiers in [
+            ModMask::CONTROL | ModMask::SHIFT,
+            ModMask::CONTROL | ModMask::SHIFT | lock,
+            ModMask::CONTROL | ModMask::SHIFT | num_lock,
+            ModMask::CONTROL | ModMask::SHIFT | lock | num_lock,
+        ] {
+            let _ = self.conn.grab_key(
+                false,
+                self.root,
+                modifiers,
+                tab_keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            );
+        }
+        Ok(())
+    }
+
+    fn grab_workspace_keys(&self) -> AnyResult<()> {
+        let Some(left_keycode) = self.keycode_for_keysym(0xff51)? else {
+            return Ok(());
+        };
+        let Some(right_keycode) = self.keycode_for_keysym(0xff53)? else {
+            return Ok(());
+        };
+        let lock = ModMask::LOCK;
+        let num_lock = ModMask::M2;
+        let super_mod = ModMask::M4; // Mod4 is standard for Super/Win
+        
+        for keycode in [left_keycode, right_keycode] {
+            for modifiers in [
+                super_mod,
+                super_mod | lock,
+                super_mod | num_lock,
+                super_mod | lock | num_lock,
+            ] {
+                let _ = self.conn.grab_key(
                     false,
                     self.root,
                     modifiers,
-                    tab_keycode,
+                    keycode,
                     GrabMode::ASYNC,
                     GrabMode::ASYNC,
-                )?
-                .check();
-            if let Err(ReplyError::X11Error(ref err)) = res {
-                if err.error_kind == ErrorKind::Access {
-                    continue;
-                }
+                );
             }
-            res?;
         }
         Ok(())
     }
@@ -3496,6 +3540,7 @@ impl Aurora {
             .conn
             .reparent_window(info.window, self.root, info.x, info.y);
         let _ = self.conn.destroy_window(info.frame);
+        self.focus_history.retain(|&w| w != client);
         if self.active_client == Some(client) {
             self.active_client = None;
             self.update_active_window_property()?;
@@ -3509,6 +3554,7 @@ impl Aurora {
             info.mapped = false;
             self.ignored_unmaps.push(info.frame);
             self.conn.unmap_window(info.frame)?;
+            self.focus_history.retain(|&w| w != client);
             if self.active_client == Some(client) {
                 self.active_client = None;
                 self.update_active_window_property()?;
@@ -3579,6 +3625,8 @@ impl Aurora {
         }
         let previous_active = self.active_client;
         self.active_client = Some(client);
+        self.focus_history.retain(|&w| w != client);
+        self.focus_history.push(client);
         if !info.mapped {
             let mut mapped = info;
             mapped.mapped = true;
@@ -6733,6 +6781,20 @@ impl Aurora {
             self.switch_to_next_running_app()?;
             return Ok(());
         }
+        if let Some(forward) = self.is_workspace_switch_key(&ev)? {
+            let current = self.active_workspace;
+            let count = self.workspace_count;
+            if forward {
+                if current + 1 < count {
+                    self.switch_workspace(current + 1)?;
+                }
+            } else {
+                if current > 0 {
+                    self.switch_workspace(current - 1)?;
+                }
+            }
+            return Ok(());
+        }
         if ev.event == self.ui.folder_terminal && self.folder_terminal.visible {
             self.handle_folder_terminal_key(ev)?;
             return Ok(());
@@ -6861,11 +6923,27 @@ impl Aurora {
     }
 
     fn is_alt_tab_key(&self, ev: &KeyPressEvent) -> AnyResult<bool> {
-        if u16::from(ev.state) & u16::from(KeyButMask::MOD1) == 0 {
+        let is_alt = u16::from(ev.state) & u16::from(KeyButMask::MOD1) != 0;
+        let is_ctrl_shift = (u16::from(ev.state) & u16::from(KeyButMask::CONTROL) != 0) &&
+                             (u16::from(ev.state) & u16::from(KeyButMask::SHIFT) != 0);
+        if !is_alt && !is_ctrl_shift {
             return Ok(false);
         }
         let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
         Ok(mapping.keysyms.contains(&0xff09))
+    }
+
+    fn is_workspace_switch_key(&self, ev: &KeyPressEvent) -> AnyResult<Option<bool>> {
+        if u16::from(ev.state) & u16::from(KeyButMask::MOD4) == 0 {
+            return Ok(None);
+        }
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        if mapping.keysyms.contains(&0xff51) {
+            return Ok(Some(false)); // Left
+        } else if mapping.keysyms.contains(&0xff53) {
+            return Ok(Some(true)); // Right
+        }
+        Ok(None)
     }
 
     fn switch_to_next_running_app(&mut self) -> AnyResult<()> {
@@ -6873,11 +6951,19 @@ impl Aurora {
         if windows.is_empty() {
             return Ok(());
         }
-        let next = if let Some(active) = self.active_client {
-            let pos = windows.iter().position(|&window| window == active);
-            windows[(pos.map_or(0, |idx| idx + 1)) % windows.len()]
+        let mut mru: Vec<Window> = self.focus_history.iter()
+            .filter(|w| windows.contains(w))
+            .copied()
+            .collect();
+        for w in &windows {
+            if !mru.contains(w) {
+                mru.insert(0, *w);
+            }
+        }
+        let next = if mru.len() >= 2 {
+            mru[mru.len() - 2]
         } else {
-            windows[0]
+            mru[0]
         };
         self.focus_window(next)?;
         self.redraw_dock()?;
