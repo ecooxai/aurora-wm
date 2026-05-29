@@ -5784,24 +5784,51 @@ impl Aurora {
         draw_card(c, sx, 258, card_w, 288);
         c.draw_text(&self.bold, "Wi-Fi", sx + 16, 278, 15.0, INK);
 
-        // Beautiful Premium 24x24 Refresh Icon Button (Chrome-style, same bg as parent card)
+        // Beautiful Premium 24x24 Refresh Icon Button (Symmetric double circular sync arrows, same bg as parent card)
         let rx = sx + 75;
         let ry = 273;
         let rcx = rx + 12;
         let rcy = ry + 12;
-        for i in 0..12 {
-            let a1 = (i as f32 * 30.0 - 60.0).to_radians();
-            let a2 = ((i + 1) as f32 * 30.0 - 60.0).to_radians();
-            let x1 = rcx + (6.0 * a1.cos()) as i32;
-            let y1 = rcy + (6.0 * a1.sin()) as i32;
-            let x2 = rcx + (6.0 * a2.cos()) as i32;
-            let y2 = rcy + (6.0 * a2.sin()) as i32;
-            c.draw_line(x1, y1, x2, y2, 2, MINT_DARK);
+        let r = 7.0f32;
+
+        // Arc 1 (top-right): from -160 degrees (top-left) to 0 degrees (right)
+        let start1 = -160.0f32.to_radians();
+        let end1 = 0.0f32.to_radians();
+        let steps = 8;
+        let mut prev_x1 = rcx as f32 + r * start1.cos();
+        let mut prev_y1 = rcy as f32 + r * start1.sin();
+        for i in 1..=steps {
+            let angle = start1 + (end1 - start1) * (i as f32) / (steps as f32);
+            let px = rcx as f32 + r * angle.cos();
+            let py = rcy as f32 + r * angle.sin();
+            c.draw_line(prev_x1 as i32, prev_y1 as i32, px as i32, py as i32, 2, MINT_DARK);
+            prev_x1 = px;
+            prev_y1 = py;
         }
-        let ax = rcx + (6.0 * (-60.0f32).to_radians().cos()) as i32;
-        let ay = rcy + (6.0 * (-60.0f32).to_radians().sin()) as i32;
-        c.draw_line(ax, ay, ax - 4, ay + 1, 2, MINT_DARK);
-        c.draw_line(ax, ay, ax + 1, ay + 4, 2, MINT_DARK);
+        // Arrowhead 1 (on the right pointing downwards)
+        let ax1 = rcx + r as i32;
+        let ay1 = rcy;
+        c.draw_line(ax1, ay1, ax1 - 3, ay1 - 3, 2, MINT_DARK);
+        c.draw_line(ax1, ay1, ax1 + 3, ay1 - 3, 2, MINT_DARK);
+
+        // Arc 2 (bottom-left): from 20 degrees (bottom-right) to 180 degrees (left)
+        let start2 = 20.0f32.to_radians();
+        let end2 = 180.0f32.to_radians();
+        let mut prev_x2 = rcx as f32 + r * start2.cos();
+        let mut prev_y2 = rcy as f32 + r * start2.sin();
+        for i in 1..=steps {
+            let angle = start2 + (end2 - start2) * (i as f32) / (steps as f32);
+            let px = rcx as f32 + r * angle.cos();
+            let py = rcy as f32 + r * angle.sin();
+            c.draw_line(prev_x2 as i32, prev_y2 as i32, px as i32, py as i32, 2, MINT_DARK);
+            prev_x2 = px;
+            prev_y2 = py;
+        }
+        // Arrowhead 2 (on the left pointing upwards)
+        let ax2 = rcx - r as i32;
+        let ay2 = rcy;
+        c.draw_line(ax2, ay2, ax2 - 3, ay2 + 3, 2, MINT_DARK);
+        c.draw_line(ax2, ay2, ax2 + 3, ay2 + 3, 2, MINT_DARK);
 
         let connected_wifi = self.settings.wifi_connected.clone().unwrap_or_else(|| read_connected_wifi());
         let wifi_enabled = self.settings.wifi_radio_enabled.unwrap_or_else(|| read_wifi_radio_enabled());
