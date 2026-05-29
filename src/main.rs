@@ -669,6 +669,15 @@ struct ClientInfo {
 }
 
 #[derive(Clone, Copy)]
+struct PendingWindowNudge {
+    client: Window,
+    base_width: u16,
+    base_height: u16,
+    step: u8,
+    at: Instant,
+}
+
+#[derive(Clone, Copy)]
 enum DragKind {
     Move,
     Resize,
@@ -1187,6 +1196,8 @@ struct Aurora {
     screenshot_live_rect: Option<(i16, i16, u16, u16)>,
     pending_screenshot_button: Option<PendingScreenshotButton>,
     topbar_notice: Option<(String, Instant)>,
+    ffplay_process: Option<std::process::Child>,
+    pending_window_nudges: Vec<PendingWindowNudge>,
 }
 
 fn main() {
@@ -1206,14 +1217,21 @@ fn run() -> AnyResult<()> {
 
     // Acquire WM_S<screen_num> selection to announce presence and/or replace existing WM
     let selection_name = format!("WM_S{}", screen_num);
-    let wm_s_atom = conn.intern_atom(false, selection_name.as_bytes())?.reply()?.atom;
+    let wm_s_atom = conn
+        .intern_atom(false, selection_name.as_bytes())?
+        .reply()?
+        .atom;
 
     let wm_window = conn.generate_id()?;
     conn.create_window(
         x11rb::COPY_FROM_PARENT as u8,
         wm_window,
         screen.root,
-        -10, -10, 1, 1, 0,
+        -10,
+        -10,
+        1,
+        1,
+        0,
         WindowClass::INPUT_OUTPUT,
         screen.root_visual,
         &CreateWindowAux::new(),
@@ -1228,14 +1246,14 @@ fn run() -> AnyResult<()> {
             sequence: 0,
             window: screen.root,
             type_: manager_atom,
-            data: ClientMessageData::from([
-                CURRENT_TIME,
-                wm_s_atom,
-                wm_window,
-                0, 0,
-            ]),
+            data: ClientMessageData::from([CURRENT_TIME, wm_s_atom, wm_window, 0, 0]),
         };
-        conn.send_event(false, screen.root, EventMask::STRUCTURE_NOTIFY, client_message)?;
+        conn.send_event(
+            false,
+            screen.root,
+            EventMask::STRUCTURE_NOTIFY,
+            client_message,
+        )?;
     }
 
     // Now try to become WM (with retries if --replace)
@@ -1313,7 +1331,12 @@ fn init_light_compositor(conn: &RustConnection, root: Window) -> bool {
 }
 
 impl Aurora {
-    fn new(conn: RustConnection, display: String, screen: &Screen, screen_num: usize) -> AnyResult<Self> {
+    fn new(
+        conn: RustConnection,
+        display: String,
+        screen: &Screen,
+        screen_num: usize,
+    ) -> AnyResult<Self> {
         let gc = conn.generate_id()?;
         conn.create_gc(
             gc,
@@ -1376,7 +1399,10 @@ impl Aurora {
         let workspace_ui = (0..DEFAULT_WORKSPACE_COUNT)
             .map(|_| WorkspaceUiState::new(screen.height_in_pixels))
             .collect();
-        let wm_s_atom = conn.intern_atom(false, format!("WM_S{}", screen_num).as_bytes())?.reply()?.atom;
+        let wm_s_atom = conn
+            .intern_atom(false, format!("WM_S{}", screen_num).as_bytes())?
+            .reply()?
+            .atom;
         let mut app = Self {
             conn,
             display,
@@ -1478,6 +1504,8 @@ impl Aurora {
             screenshot_live_rect: None,
             pending_screenshot_button: None,
             topbar_notice: None,
+            ffplay_process: None,
+            pending_window_nudges: Vec::new(),
         };
         app.apply_sleep_timeout();
         if app.settings.auto_power_saver_minutes > 0 {
@@ -1607,6 +1635,11 @@ impl Aurora {
                     self.conn.flush()?;
                 }
             }
+
+            if self.process_pending_window_nudges()? {
+                handled_event = true;
+            }
+            self.reap_ffplay_process();
 
             if self
                 .pending_auto_power_saver_apply
@@ -2148,7 +2181,8 @@ impl Aurora {
     }
 
     fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
-        if self.dock_more_visible && ev.event != self.ui.dock_more_menu && ev.event != self.ui.dock {
+        if self.dock_more_visible && ev.event != self.ui.dock_more_menu && ev.event != self.ui.dock
+        {
             self.hide_dock_more_menu()?;
         }
         if self.aurora_menu_visible && ev.event != self.ui.topbar && ev.event != self.ui.aurora_menu
@@ -2435,6 +2469,7 @@ impl Aurora {
             }
         }
         self.clients.insert(drag.client, info);
+        self.send_synthetic_configure(&info)?;
         Ok(())
     }
 
@@ -2928,6 +2963,126 @@ impl Aurora {
         Ok(None)
     }
 
+    fn configure_managed_client(
+        &self,
+        info: &ClientInfo,
+        stack: Option<StackMode>,
+    ) -> AnyResult<()> {
+        let title_h = self.titlebar_height(info);
+        let mut frame_aux = ConfigureWindowAux::new()
+            .x(i32::from(info.x))
+            .y(i32::from(info.y))
+            .width(u32::from(info.width))
+            .height(u32::from(info.height + title_h));
+        if let Some(stack) = stack {
+            frame_aux = frame_aux.stack_mode(stack);
+        }
+        self.conn.configure_window(info.frame, &frame_aux)?;
+        self.conn.configure_window(
+            info.window,
+            &ConfigureWindowAux::new()
+                .x(0)
+                .y(i32::from(title_h))
+                .width(u32::from(info.width))
+                .height(u32::from(info.height))
+                .border_width(0),
+        )?;
+        self.apply_frame_shape(info)?;
+        self.send_synthetic_configure(info)
+    }
+
+    fn send_synthetic_configure(&self, info: &ClientInfo) -> AnyResult<()> {
+        let title_h = self.titlebar_height(info);
+        let client_y = (i32::from(info.y) + i32::from(title_h))
+            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        let event = ConfigureNotifyEvent {
+            response_type: CONFIGURE_NOTIFY_EVENT,
+            sequence: 0,
+            event: info.window,
+            window: info.window,
+            above_sibling: x11rb::NONE,
+            x: info.x,
+            y: client_y,
+            width: info.width,
+            height: info.height,
+            border_width: 0,
+            override_redirect: false,
+        };
+        self.conn
+            .send_event(false, info.window, EventMask::STRUCTURE_NOTIFY, event)?;
+        Ok(())
+    }
+
+    fn ffplay_geometry(&self) -> (i16, i16, u16, u16) {
+        let folder = self.folder_geometry();
+        let preferred_x = i32::from(folder.0) + i32::from(folder.2) + 8;
+        let preferred_w = (self.screen_width / 2).max(300.min(self.screen_width));
+        let max_w_at_preferred = i32::from(self.screen_width)
+            .saturating_sub(preferred_x + 16)
+            .max(240) as u16;
+        let width = preferred_w.min(max_w_at_preferred);
+        let x = preferred_x
+            .min(i32::from(self.screen_width.saturating_sub(width + 16)))
+            .max(16) as i16;
+        let height = folder
+            .3
+            .min(
+                self.screen_height
+                    .saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + 48),
+            )
+            .max(240.min(self.screen_height));
+        (x, folder.1, width, height)
+    }
+
+    fn schedule_window_nudge(&mut self, client: Window, width: u16, height: u16) {
+        self.pending_window_nudges
+            .retain(|pending| pending.client != client);
+        self.pending_window_nudges.push(PendingWindowNudge {
+            client,
+            base_width: width,
+            base_height: height,
+            step: 0,
+            at: Instant::now() + Duration::from_millis(850),
+        });
+    }
+
+    fn process_pending_window_nudges(&mut self) -> AnyResult<bool> {
+        let now = Instant::now();
+        let mut idx = 0;
+        let mut changed = false;
+        while idx < self.pending_window_nudges.len() {
+            if now < self.pending_window_nudges[idx].at {
+                idx += 1;
+                continue;
+            }
+            let mut pending = self.pending_window_nudges[idx];
+            let Some(mut info) = self.clients.get(&pending.client).copied() else {
+                self.pending_window_nudges.swap_remove(idx);
+                continue;
+            };
+            info.width = if pending.step == 0 {
+                pending.base_width.saturating_add(20)
+            } else {
+                pending.base_width
+            };
+            info.height = pending.base_height;
+            self.configure_managed_client(&info, Some(StackMode::ABOVE))?;
+            self.clients.insert(pending.client, info);
+            self.redraw_frame_titlebar(pending.client)?;
+            changed = true;
+
+            if pending.step == 0 {
+                pending.step = 1;
+                pending.at = now + Duration::from_millis(90);
+                self.pending_window_nudges[idx] = pending;
+                idx += 1;
+            } else {
+                self.pending_window_nudges.swap_remove(idx);
+            }
+        }
+        Ok(changed)
+    }
+
     fn start_drag(&mut self, client: Window, root_x: i16, root_y: i16) -> AnyResult<()> {
         let Some(info) = self.clients.get(&client).copied() else {
             return Ok(());
@@ -3146,6 +3301,7 @@ impl Aurora {
             )?;
             self.apply_frame_shape(&info)?;
             self.clients.insert(client, info);
+            self.send_synthetic_configure(&info)?;
             self.redraw_frame_titlebar(client)?;
             return Ok(());
         }
@@ -3165,21 +3321,28 @@ impl Aurora {
         }
         let was_mapped = attr.map_state != MapState::UNMAPPED;
         let geom = self.conn.get_geometry(window)?.reply()?;
-        let titlebar =
-            !client_uses_own_chrome(&self.window_class(window), &self.window_title(window));
+        let class = self.window_class(window);
+        let title = self.window_title(window);
+        let is_ffplay = client_is_ffplay(&class, &title);
+        let titlebar = !client_uses_own_chrome(&class, &title);
         let title_h = if titlebar { TITLEBAR_HEIGHT } else { 0 };
         let max_w = self.screen_width.saturating_sub(80).max(300);
         let max_h = self
             .screen_height
             .saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + title_h + 62)
             .max(240);
-        let width = geom.width.min(max_w);
-        let height = geom.height.min(max_h);
-        let x = if geom.x <= 0 { 42 } else { geom.x.max(16) };
-        let y = if geom.y <= 0 {
-            i16::try_from(TOPBAR_HEIGHT + 26).unwrap()
+        let (x, y, width, height) = if is_ffplay {
+            self.ffplay_geometry()
         } else {
-            geom.y.max(i16::try_from(TOPBAR_HEIGHT + 8).unwrap())
+            let width = geom.width.min(max_w);
+            let height = geom.height.min(max_h);
+            let x = if geom.x <= 0 { 42 } else { geom.x.max(16) };
+            let y = if geom.y <= 0 {
+                i16::try_from(TOPBAR_HEIGHT + 26).unwrap()
+            } else {
+                geom.y.max(i16::try_from(TOPBAR_HEIGHT + 8).unwrap())
+            };
+            (x, y, width, height)
         };
         let frame = self.conn.generate_id()?;
         let frame_aux = CreateWindowAux::new()
@@ -3268,6 +3431,10 @@ impl Aurora {
         };
         self.apply_frame_shape(&info)?;
         self.clients.insert(window, info);
+        self.send_synthetic_configure(&info)?;
+        if is_ffplay {
+            self.schedule_window_nudge(window, width, height);
+        }
         self.redraw_frame_titlebar(window)?;
         self.focus_window(window)?;
         self.redraw_dock()?;
@@ -3344,6 +3511,7 @@ impl Aurora {
         )?;
         self.apply_frame_shape(&info)?;
         self.clients.insert(client, info);
+        self.send_synthetic_configure(&info)?;
         self.redraw_frame_titlebar(client)?;
         self.focus_window(client)?;
         Ok(())
@@ -3458,6 +3626,7 @@ impl Aurora {
         )?;
         self.apply_frame_shape(&info)?;
         self.clients.insert(client, info);
+        self.send_synthetic_configure(&info)?;
         self.redraw_frame_titlebar(client)?;
         Ok(())
     }
@@ -4343,7 +4512,14 @@ impl Aurora {
                 );
                 draw_reload_menu_icon(&mut c, 32, row_y + 11, MINT_DARK);
                 c.draw_text(&self.bold, "Restart WM", 50, row_y, 13.0, INK);
-                c.draw_text(&self.regular, "Reload Aurora and keep saved settings", 50, row_y + 17, 10.0, MUTED);
+                c.draw_text(
+                    &self.regular,
+                    "Reload Aurora and keep saved settings",
+                    50,
+                    row_y + 17,
+                    10.0,
+                    MUTED,
+                );
             }
 
             let mut next_row_y = 114;
@@ -4383,7 +4559,14 @@ impl Aurora {
                 );
                 draw_info_menu_icon(&mut c, 32, row_y + 11, MINT_LIGHT);
                 c.draw_text(&self.bold, "About Aurora", 50, row_y, 13.0, INK);
-                c.draw_text(&self.regular, "Version, description, and quick help", 50, row_y + 17, 10.0, MUTED);
+                c.draw_text(
+                    &self.regular,
+                    "Version, description, and quick help",
+                    50,
+                    row_y + 17,
+                    10.0,
+                    MUTED,
+                );
             }
         }
         self.upload_canvas(self.ui.aurora_menu, &c)
@@ -6238,6 +6421,7 @@ impl Aurora {
                 .stack_mode(StackMode::ABOVE),
         )?;
         self.clients.insert(client, info);
+        self.send_synthetic_configure(&info)?;
         self.focus_window(client)?;
         Ok(())
     }
@@ -6333,7 +6517,11 @@ impl Aurora {
                 if !self.paint_window_icon(&mut c, window, icon_x, icon_y, 28)
                     && !self.paint_desktop_icon(&mut c, window, icon_x, icon_y, 28)
                 {
-                    let mapped = self.clients.get(&window).map(|info| info.mapped).unwrap_or(true);
+                    let mapped = self
+                        .clients
+                        .get(&window)
+                        .map(|info| info.mapped)
+                        .unwrap_or(true);
                     draw_client_task_icon(
                         &mut c,
                         &self.bold,
@@ -8703,7 +8891,31 @@ impl Aurora {
         Ok(())
     }
 
+    fn stop_ffplay_process(&mut self) {
+        let Some(mut child) = self.ffplay_process.take() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn reap_ffplay_process(&mut self) {
+        if self
+            .ffplay_process
+            .as_mut()
+            .and_then(|child| child.try_wait().ok())
+            .flatten()
+            .is_some()
+        {
+            self.ffplay_process = None;
+        }
+    }
+
     fn open_media(&mut self, entry: FolderEntry) -> AnyResult<()> {
+        self.stop_ffplay_process();
+
         for (idx, state) in self.media_slots.iter_mut().enumerate() {
             if state.is_some() {
                 *state = None;
@@ -8717,12 +8929,43 @@ impl Aurora {
             Vec::new()
         };
         let file_info = (entry.kind == FileKind::Other).then(|| file_command_summary(&entry.path));
-        let media = self.media_geometry(slot);
+        let is_playable = entry.kind == FileKind::Audio || entry.kind == FileKind::Video;
+
+        // For playable media, open ffplay in its own standalone window
+        if is_playable {
+            let (ffplay_x, ffplay_y, ffplay_w, ffplay_h) = self.ffplay_geometry();
+            let path_str = entry.path.to_string_lossy().into_owned();
+            let mut cmd = Command::new("ffplay");
+            cmd.env("DISPLAY", &self.display)
+                .args(["-window_title", "Aurora ffplay"])
+                .args(["-x", &ffplay_w.to_string()])
+                .args(["-y", &ffplay_h.to_string()])
+                .args(["-left", &i32::from(ffplay_x).to_string()])
+                .args(["-top", &i32::from(ffplay_y).to_string()])
+                .arg(&path_str);
+            match cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    self.ffplay_process = Some(child);
+                }
+                Err(e) => {
+                    eprintln!("aurora-wm: ffplay launch failed: {e}");
+                }
+            }
+            // Do not open the internal media panel for playable files
+            return Ok(());
+        }
+
+        let media_geom = self.media_geometry(slot);
         let image_preview = if entry.kind == FileKind::Image {
             render_image_preview(
                 &entry.path,
-                i32::from(media.2) - 64,
-                i32::from(media.3) - 146,
+                i32::from(media_geom.2) - 64,
+                i32::from(media_geom.3) - 146,
             )
         } else {
             None
@@ -8750,15 +8993,16 @@ impl Aurora {
         self.conn.configure_window(
             self.ui.media[slot],
             &ConfigureWindowAux::new()
-                .x(i32::from(media.0))
-                .y(i32::from(media.1))
-                .width(u32::from(media.2))
-                .height(u32::from(media.3))
+                .x(i32::from(media_geom.0))
+                .y(i32::from(media_geom.1))
+                .width(u32::from(media_geom.2))
+                .height(u32::from(media_geom.3))
                 .stack_mode(StackMode::ABOVE),
         )?;
         self.conn.map_window(self.ui.media[slot])?;
         self.redraw_media_slot(slot)?;
         self.raise_media()?;
+
         Ok(())
     }
 
@@ -8779,6 +9023,7 @@ impl Aurora {
             }
             self.media = self.media_slots.iter().rev().find_map(|m| m.clone());
             self.conn.unmap_window(self.ui.media[slot])?;
+            self.stop_ffplay_process();
             return Ok(());
         }
         if let Some(action) = self.media_context_action_at(slot, x, y) {
@@ -8903,8 +9148,27 @@ impl Aurora {
                 if x >= bar_x && x <= bar_x + bar_w {
                     media.progress = ((x - bar_x) as f32 / bar_w.max(1) as f32).clamp(0.0, 1.0);
                     media.playing = true;
+                    // Seek: write to named pipe
+                    let seek_pct = (media.progress * 100.0) as i32;
+                    if let Ok(f) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/tmp/aurora-player-control")
+                    {
+                        use std::io::Write;
+                        let mut w = f;
+                        let _ = w.write_all(format!("seek {}\n", seek_pct).as_bytes());
+                    }
                 } else {
                     media.playing = !media.playing;
+                    // Pause/resume: write to named pipe
+                    if let Ok(f) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/tmp/aurora-player-control")
+                    {
+                        use std::io::Write;
+                        let mut w = f;
+                        let _ = w.write_all(b"pause\n");
+                    }
                 }
                 self.media = self.media_slots.iter().rev().find_map(|m| m.clone());
                 self.redraw_media_slot(slot)?;
@@ -9417,6 +9681,11 @@ impl Aurora {
 
     fn advance_internal_media(&mut self) -> AnyResult<bool> {
         let mut changed = false;
+        // Read real playback progress from the C player's progress file
+        let file_progress: Option<f32> = std::fs::read_to_string("/tmp/aurora-player-progress")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok());
+
         for slot in 0..MEDIA_SLOT_COUNT {
             let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) else {
                 continue;
@@ -9424,13 +9693,14 @@ impl Aurora {
             if !media.playing || !matches!(media.entry.kind, FileKind::Audio | FileKind::Video) {
                 continue;
             }
-            media.progress += 0.006;
-            if media.progress >= 1.0 {
-                media.progress = 0.0;
-                media.playing = false;
+            if let Some(p) = file_progress {
+                let clamped = p.clamp(0.0, 1.0);
+                if (clamped - media.progress).abs() > 0.001 {
+                    media.progress = clamped;
+                    self.redraw_media_slot(slot)?;
+                    changed = true;
+                }
             }
-            self.redraw_media_slot(slot)?;
-            changed = true;
         }
         if changed {
             self.media = self.media_slots.iter().rev().find_map(|m| m.clone());
@@ -10329,6 +10599,11 @@ fn client_uses_own_chrome(class: &str, title: &str) -> bool {
     ["firefox", "chromium", "google-chrome", "brave", "vivaldi"]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+fn client_is_ffplay(class: &str, title: &str) -> bool {
+    let text = format!("{} {}", class, title.to_ascii_lowercase());
+    text.contains("ffplay") || text.contains("aurora ffplay")
 }
 
 fn rounded_top_shape_rects(width: u16, height: u16, radius: i32) -> Vec<Rectangle> {
