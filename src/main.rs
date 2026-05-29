@@ -41,7 +41,8 @@ const SIDEBAR_WIDTH: i32 = 58;
 const SETTINGS_SIDEBAR_TOP: i32 = 26;
 const MEDIA_SLOT_COUNT: usize = 5;
 const MEDIA_WIDTH: u16 = 600;
-const RESIZE_EDGE: i16 = 10;
+const MEDIA_WINDOW_NUDGE_WIDTH: u16 = 1;
+const RESIZE_EDGE: i16 = 1;
 const RESIZE_CORNER: i16 = 28;
 const FOLDER_HEADER_ICON: i32 = 30;
 const FOLDER_TERMINAL_DEFAULT_COLS: usize = 90;
@@ -413,9 +414,11 @@ fn measure_text(font: &Font<'static>, text: &str, size: f32) -> i32 {
 
 #[derive(Clone)]
 struct DisplayMode {
+    output: Option<String>,
     width: u16,
     height: u16,
     refresh: Option<f32>,
+    current: bool,
 }
 
 impl DisplayMode {
@@ -509,6 +512,14 @@ struct SettingsState {
     video_command: String,
     terminal_editing: bool,
     app_status: Option<String>,
+    display_status: Option<String>,
+    audio_status: Option<String>,
+    wifi_networks: Vec<WifiNetwork>,
+    wifi_selected: Option<String>,
+    wifi_password: String,
+    wifi_password_editing: bool,
+    wifi_status: Option<String>,
+    wifi_disconnect_confirm: bool,
 }
 
 impl Default for SettingsState {
@@ -530,6 +541,14 @@ impl Default for SettingsState {
             video_command: read_app_command(DefaultAppKind::Video),
             terminal_editing: false,
             app_status: None,
+            display_status: None,
+            audio_status: None,
+            wifi_networks: Vec::new(),
+            wifi_selected: None,
+            wifi_password: String::new(),
+            wifi_password_editing: false,
+            wifi_status: None,
+            wifi_disconnect_confirm: false,
         }
     }
 }
@@ -1093,6 +1112,17 @@ struct DesktopEntry {
 struct InstalledApp {
     name: String,
     command: String,
+}
+
+#[derive(Clone)]
+struct WifiNetwork {
+    ssid: String,
+}
+
+struct WifiConnection {
+    ssid: String,
+    device: String,
+    ip: Option<String>,
 }
 
 struct Aurora {
@@ -3061,7 +3091,7 @@ impl Aurora {
                 continue;
             };
             info.width = if pending.step == 0 {
-                pending.base_width.saturating_add(20)
+                pending.base_width.saturating_add(MEDIA_WINDOW_NUDGE_WIDTH)
             } else {
                 pending.base_width
             };
@@ -5130,6 +5160,16 @@ impl Aurora {
                 12.0,
                 if selected { MINT_DARK } else { INK },
             );
+            if mode.current {
+                c.draw_text_right(
+                    &self.regular,
+                    "current",
+                    i32::from(c.width) - 38,
+                    y,
+                    11.0,
+                    MINT_DARK,
+                );
+            }
         }
 
         draw_card(c, sx, 258, i32::from(c.width) - sx - 24, 86);
@@ -5148,6 +5188,16 @@ impl Aurora {
             MINT_DARK,
         );
         c.draw_text(&self.regular, "xrandr mode list", sx + 92, 310, 11.0, MUTED);
+        if let Some(status) = self.settings.display_status.as_deref() {
+            c.draw_text(
+                &self.regular,
+                &compact(status, 54),
+                sx + 16,
+                328,
+                11.0,
+                BLUE,
+            );
+        }
 
         draw_card(c, sx, 360, i32::from(c.width) - sx - 24, 94);
         c.draw_text(&self.bold, "Sleep after", sx + 16, 379, 15.0, INK);
@@ -5371,9 +5421,38 @@ impl Aurora {
         c.draw_text(&self.bold, "Audio", sx, 22, 24.0, INK);
         draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 112);
         c.draw_text(&self.bold, "Volume", sx + 16, 106, 15.0, INK);
-        c.draw_round_rect(sx + 16, 142, 230, 10, 5, Color::rgba(211, 225, 232, 170));
-        c.draw_round_rect(sx + 16, 142, 138, 10, 5, Color::rgba(116, 213, 198, 210));
-        c.draw_text(&self.regular, "60%", sx + 262, 136, 15.0, INK);
+        let volume = read_audio_volume_percent();
+        let volume_pct = volume.unwrap_or(0);
+        let bar_w = 230;
+        c.draw_round_rect(sx + 16, 142, bar_w, 10, 5, Color::rgba(211, 225, 232, 170));
+        c.draw_round_rect(
+            sx + 16,
+            142,
+            bar_w * i32::from(volume_pct) / 100,
+            10,
+            5,
+            Color::rgba(116, 213, 198, 210),
+        );
+        c.draw_text(
+            &self.regular,
+            &volume
+                .map(|pct| format!("{pct}%"))
+                .unwrap_or_else(|| "unavailable".to_string()),
+            sx + 262,
+            136,
+            15.0,
+            INK,
+        );
+        if let Some(status) = self.settings.audio_status.as_deref() {
+            c.draw_text(
+                &self.regular,
+                &compact(status, 52),
+                sx + 16,
+                166,
+                11.0,
+                BLUE,
+            );
+        }
         draw_card(c, sx, 220, i32::from(c.width) - sx - 24, 150);
         c.draw_text(&self.bold, "Output device", sx + 16, 240, 15.0, INK);
         for (idx, dev) in read_audio_devices("Sink").iter().take(3).enumerate() {
@@ -5402,6 +5481,7 @@ impl Aurora {
 
     fn draw_network_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
+        let card_w = i32::from(c.width) - sx - 24;
         c.draw_text(&self.bold, "Network", sx, 22, 24.0, INK);
         c.draw_text(
             &self.regular,
@@ -5411,21 +5491,227 @@ impl Aurora {
             13.0,
             MUTED,
         );
-        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 394);
+        draw_card(c, sx, 86, card_w, 154);
+        c.draw_text(&self.bold, "Current status", sx + 16, 106, 15.0, INK);
         let start = (self.settings.scroll / 29).max(0) as usize;
         for (idx, line) in read_network_details()
             .iter()
             .skip(start)
-            .take(12)
+            .take(4)
             .enumerate()
         {
             c.draw_text(
                 &self.regular,
                 &compact(line, 62),
                 sx + 16,
-                112 + idx as i32 * 29,
+                134 + idx as i32 * 24,
                 13.0,
                 if idx % 3 == 0 { INK } else { MUTED },
+            );
+        }
+
+        draw_card(c, sx, 258, card_w, 288);
+        c.draw_text(&self.bold, "Wi-Fi", sx + 16, 278, 15.0, INK);
+        let refresh_x = sx + card_w - 96;
+        c.draw_round_rect(refresh_x, 266, 76, 28, 7, Color::rgba(160, 238, 220, 150));
+        c.draw_text_center(&self.bold, "Refresh", refresh_x + 38, 284, 11.0, MINT_DARK);
+
+        if let Some(wifi) = read_connected_wifi().as_ref() {
+            c.draw_text(
+                &self.regular,
+                &compact(
+                    &format!("{}  {}", wifi.ssid, wifi.ip.as_deref().unwrap_or("no ip")),
+                    44,
+                ),
+                sx + 16,
+                306,
+                12.0,
+                INK,
+            );
+            let disconnect_x = sx + card_w - 128;
+            c.draw_round_rect(
+                disconnect_x,
+                294,
+                108,
+                28,
+                7,
+                Color::rgba(241, 126, 135, 112),
+            );
+            c.draw_text_center(
+                &self.bold,
+                "Disconnect",
+                disconnect_x + 54,
+                312,
+                11.0,
+                Color::rgb(160, 58, 68),
+            );
+        } else {
+            c.draw_text(&self.regular, "Not connected", sx + 16, 306, 12.0, MUTED);
+        }
+
+        if let Some(status) = self.settings.wifi_status.as_deref() {
+            c.draw_text(
+                &self.regular,
+                &compact(status, 54),
+                sx + 16,
+                328,
+                11.0,
+                BLUE,
+            );
+        } else {
+            c.draw_text(
+                &self.regular,
+                "Click Refresh to scan nearby Wi-Fi networks",
+                sx + 16,
+                328,
+                11.0,
+                MUTED,
+            );
+        }
+
+        if self.settings.wifi_disconnect_confirm {
+            c.draw_round_rect(
+                sx + 12,
+                340,
+                card_w - 24,
+                44,
+                8,
+                Color::rgba(255, 255, 255, 210),
+            );
+            c.draw_text(
+                &self.bold,
+                "Disconnect current Wi-Fi?",
+                sx + 24,
+                366,
+                13.0,
+                INK,
+            );
+            c.draw_round_rect(
+                sx + card_w - 194,
+                348,
+                76,
+                28,
+                7,
+                Color::rgba(211, 225, 232, 170),
+            );
+            c.draw_text_center(&self.bold, "Cancel", sx + card_w - 156, 366, 11.0, INK);
+            c.draw_round_rect(
+                sx + card_w - 108,
+                348,
+                88,
+                28,
+                7,
+                Color::rgba(241, 126, 135, 150),
+            );
+            c.draw_text_center(
+                &self.bold,
+                "Disconnect",
+                sx + card_w - 64,
+                366,
+                11.0,
+                Color::rgb(160, 58, 68),
+            );
+            return;
+        }
+
+        if self.settings.wifi_networks.is_empty() {
+            c.draw_text(
+                &self.regular,
+                "No Wi-Fi networks found",
+                sx + 16,
+                366,
+                13.0,
+                MUTED,
+            );
+        } else {
+            for (idx, network) in self.settings.wifi_networks.iter().take(5).enumerate() {
+                let y = 356 + idx as i32 * 24;
+                let selected = self
+                    .settings
+                    .wifi_selected
+                    .as_deref()
+                    .is_some_and(|ssid| ssid == network.ssid);
+                if selected {
+                    c.draw_round_rect(
+                        sx + 12,
+                        y - 14,
+                        card_w - 24,
+                        22,
+                        7,
+                        Color::rgba(160, 238, 220, 92),
+                    );
+                }
+                c.draw_text(
+                    &self.regular,
+                    &compact(&network.ssid, 48),
+                    sx + 18,
+                    y,
+                    13.0,
+                    if selected { MINT_DARK } else { INK },
+                );
+            }
+        }
+
+        if let Some(ssid) = self.settings.wifi_selected.as_deref() {
+            c.draw_text(
+                &self.bold,
+                &compact(&format!("Password for {ssid}"), 42),
+                sx + 16,
+                492,
+                13.0,
+                INK,
+            );
+            let input_x = sx + 16;
+            let button_w = 86;
+            let gap = 12;
+            let input_w = (card_w - 32 - button_w - gap).max(132);
+            let input_y = 508;
+            c.draw_round_rect(
+                input_x,
+                input_y,
+                input_w,
+                34,
+                7,
+                if self.settings.wifi_password_editing {
+                    Color::rgba(255, 255, 255, 220)
+                } else {
+                    Color::rgba(255, 255, 255, 145)
+                },
+            );
+            c.draw_rect(input_x + 8, input_y + 33, input_w - 16, 1, CARD_LINE);
+            let shown = if self.settings.wifi_password.is_empty() {
+                "enter password".to_string()
+            } else {
+                password_mask(self.settings.wifi_password.chars().count())
+            };
+            c.draw_text(
+                &self.regular,
+                &compact(&shown, 38),
+                input_x + 12,
+                input_y + 21,
+                13.0,
+                if self.settings.wifi_password.is_empty() {
+                    MUTED
+                } else {
+                    INK
+                },
+            );
+            let button_x = input_x + input_w + gap;
+            c.draw_round_rect(
+                button_x,
+                input_y,
+                button_w,
+                34,
+                7,
+                Color::rgba(160, 238, 220, 170),
+            );
+            c.draw_text_center(
+                &self.bold,
+                "Connect",
+                button_x + button_w / 2,
+                input_y + 21,
+                12.0,
+                MINT_DARK,
             );
         }
     }
@@ -5982,6 +6268,70 @@ impl Aurora {
         self.redraw_settings()
     }
 
+    fn refresh_wifi_networks(&mut self) {
+        self.settings.wifi_status = Some("Refreshing Wi-Fi networks...".to_string());
+        let _ = self.redraw_settings();
+        let _ = self.conn.flush();
+        match scan_wifi_networks() {
+            Ok(networks) => {
+                self.settings.wifi_networks = networks;
+                self.settings.wifi_status = Some(format!(
+                    "Found {} Wi-Fi network{}",
+                    self.settings.wifi_networks.len(),
+                    if self.settings.wifi_networks.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+                if let Some(selected) = self.settings.wifi_selected.as_deref() {
+                    if !self
+                        .settings
+                        .wifi_networks
+                        .iter()
+                        .any(|network| network.ssid == selected)
+                    {
+                        self.settings.wifi_selected = None;
+                        self.settings.wifi_password.clear();
+                        self.settings.wifi_password_editing = false;
+                    }
+                }
+            }
+            Err(err) => {
+                self.settings.wifi_networks.clear();
+                self.settings.wifi_status = Some(err);
+            }
+        }
+    }
+
+    fn connect_selected_wifi(&mut self) -> AnyResult<()> {
+        let Some(ssid) = self.settings.wifi_selected.clone() else {
+            return Ok(());
+        };
+        self.settings.wifi_status = Some(format!("Connecting to {ssid}..."));
+        self.redraw_settings()?;
+        self.settings.wifi_status = match connect_wifi_network(&ssid, &self.settings.wifi_password)
+        {
+            Ok(()) => Some(format!("Connection requested for {ssid}")),
+            Err(err) => Some(err),
+        };
+        self.settings.wifi_password_editing = false;
+        self.conn
+            .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+        self.redraw_settings()
+    }
+
+    fn disconnect_wifi(&mut self) -> AnyResult<()> {
+        self.settings.wifi_status = Some("Disconnecting Wi-Fi...".to_string());
+        self.settings.wifi_disconnect_confirm = false;
+        self.redraw_settings()?;
+        self.settings.wifi_status = match disconnect_current_wifi() {
+            Ok(()) => Some("Wi-Fi disconnect requested".to_string()),
+            Err(err) => Some(err),
+        };
+        self.redraw_settings()
+    }
+
     fn handle_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         if self.settings.tab == SettingsTab::Power && self.settings.auto_power_saver_editing {
             let input_x = i32::from(self.settings_geometry().2) - 170;
@@ -6020,14 +6370,13 @@ impl Aurora {
             SettingsTab::Display => self.handle_display_click(x, y)?,
             SettingsTab::Power => self.handle_power_click(x, y)?,
             SettingsTab::Wallpaper => self.handle_wallpaper_click(y)?,
+            SettingsTab::Audio => self.handle_audio_click(x, y)?,
             SettingsTab::Bluetooth if y >= 224 && y <= 300 => {
                 self.spawn_first_available(&["blueman-manager", "bluetoothctl"], &[]);
             }
             SettingsTab::Apps => self.handle_apps_click(x, y)?,
-            SettingsTab::Audio
-            | SettingsTab::Network
-            | SettingsTab::Bluetooth
-            | SettingsTab::Startup => {}
+            SettingsTab::Network => self.handle_network_click(x, y)?,
+            SettingsTab::Bluetooth | SettingsTab::Startup => {}
             SettingsTab::About => {}
         }
         Ok(())
@@ -6089,6 +6438,107 @@ impl Aurora {
                 self.settings.sleep_after_secs = (self.settings.sleep_after_secs + 60).min(7200);
                 self.apply_sleep_timeout();
                 save_app_commands(&self.settings)?;
+                self.redraw_settings()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_audio_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        let sx = SIDEBAR_WIDTH + 24;
+        let bar_x = sx + 16;
+        let bar_w = 230;
+        if x >= bar_x && x <= bar_x + bar_w && (132..=162).contains(&y) {
+            let percent = (((x - bar_x) * 100) / bar_w).clamp(0, 100) as u8;
+            self.settings.audio_status = match set_audio_volume_percent(percent) {
+                Ok(()) => Some(format!("Volume set to {percent}%")),
+                Err(err) => Some(err),
+            };
+            self.redraw_settings()?;
+        }
+        Ok(())
+    }
+
+    fn handle_network_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        let sx = SIDEBAR_WIDTH + 24;
+        let card_w = i32::from(self.settings_geometry().2) - sx - 24;
+        let refresh_x = sx + card_w - 96;
+        if y >= 266 && y <= 294 && x >= refresh_x && x <= refresh_x + 76 {
+            self.settings.wifi_disconnect_confirm = false;
+            self.refresh_wifi_networks();
+            self.redraw_settings()?;
+            return Ok(());
+        }
+
+        let disconnect_x = sx + card_w - 128;
+        if y >= 294 && y <= 322 && x >= disconnect_x && x <= disconnect_x + 108 {
+            if read_connected_wifi().is_some() {
+                self.settings.wifi_disconnect_confirm = true;
+                self.settings.wifi_password_editing = false;
+                self.redraw_settings()?;
+                return Ok(());
+            }
+        }
+
+        if self.settings.wifi_disconnect_confirm {
+            if y >= 348 && y <= 376 && x >= sx + card_w - 194 && x <= sx + card_w - 118 {
+                self.settings.wifi_disconnect_confirm = false;
+                self.redraw_settings()?;
+                return Ok(());
+            }
+            if y >= 348 && y <= 376 && x >= sx + card_w - 108 && x <= sx + card_w - 20 {
+                self.disconnect_wifi()?;
+                return Ok(());
+            }
+            self.settings.wifi_disconnect_confirm = false;
+            self.redraw_settings()?;
+            return Ok(());
+        }
+
+        if (342..=486).contains(&y) {
+            let idx = ((y - 342) / 24) as usize;
+            if let Some(network) = self.settings.wifi_networks.get(idx) {
+                self.settings.wifi_selected = Some(network.ssid.clone());
+                self.settings.wifi_password.clear();
+                self.settings.wifi_password_editing = true;
+                self.settings.wifi_disconnect_confirm = false;
+                self.settings.wifi_status = Some(format!("Selected {}", network.ssid));
+                self.conn.set_input_focus(
+                    InputFocus::POINTER_ROOT,
+                    self.ui.settings,
+                    CURRENT_TIME,
+                )?;
+                self.redraw_settings()?;
+                return Ok(());
+            }
+        }
+
+        if self.settings.wifi_selected.is_some() {
+            let input_x = sx + 16;
+            let button_w = 86;
+            let gap = 12;
+            let input_w = (card_w - 32 - button_w - gap).max(132);
+            let input_y = 508;
+            let inside_input =
+                y >= input_y && y <= input_y + 34 && x >= input_x && x <= input_x + input_w;
+            let button_x = input_x + input_w + gap;
+            let inside_button =
+                y >= input_y && y <= input_y + 34 && x >= button_x && x <= button_x + button_w;
+
+            if inside_input {
+                self.settings.wifi_password_editing = true;
+                self.conn.set_input_focus(
+                    InputFocus::POINTER_ROOT,
+                    self.ui.settings,
+                    CURRENT_TIME,
+                )?;
+                self.redraw_settings()?;
+            } else if inside_button {
+                self.connect_selected_wifi()?;
+            } else if self.settings.wifi_password_editing {
+                self.settings.wifi_password_editing = false;
+                self.conn
+                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
                 self.redraw_settings()?;
             }
         }
@@ -6227,6 +6677,31 @@ impl Aurora {
         let Some(&keysym) = mapping.keysyms.get(column) else {
             return Ok(());
         };
+        if self.settings.tab == SettingsTab::Network && self.settings.wifi_password_editing {
+            match keysym {
+                0xff08 => {
+                    self.settings.wifi_password.pop();
+                }
+                0xff0d => {
+                    self.connect_selected_wifi()?;
+                    return Ok(());
+                }
+                0xff1b => {
+                    self.settings.wifi_password.clear();
+                    self.settings.wifi_password_editing = false;
+                    self.conn
+                        .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+                }
+                0x20..=0x7e if self.settings.wifi_password.len() < 128 => {
+                    self.settings
+                        .wifi_password
+                        .push(char::from_u32(keysym).unwrap());
+                }
+                _ => return Ok(()),
+            }
+            self.redraw_settings()?;
+            return Ok(());
+        }
         if self.settings.tab == SettingsTab::Power && self.settings.auto_power_saver_editing {
             let mut changed = false;
             match keysym {
@@ -9787,15 +10262,27 @@ impl Aurora {
         Ok(())
     }
 
-    fn apply_display_mode(&self, idx: usize) {
-        if let Some(mode) = self.display_modes.get(idx) {
-            let size = format!("{}x{}", mode.width, mode.height);
-            let mut cmd = Command::new("xrandr");
-            cmd.env("DISPLAY", &self.display).arg("-s").arg(size);
-            if let Some(rate) = mode.refresh {
-                cmd.arg("-r").arg(format!("{rate:.0}"));
+    fn apply_display_mode(&mut self, idx: usize) {
+        let Some(mode) = self.display_modes.get(idx).cloned() else {
+            return;
+        };
+        let label = mode.label();
+        match apply_xrandr_mode(&self.display, &mode) {
+            Ok(()) => {
+                self.settings.display_status = Some(format!("Requested {label}"));
+                self.display_modes =
+                    read_display_modes(&self.display, self.screen_width, self.screen_height);
+                self.settings.selected_mode = self
+                    .display_modes
+                    .iter()
+                    .position(|candidate| {
+                        candidate.width == mode.width && candidate.height == mode.height
+                    })
+                    .unwrap_or(idx.min(self.display_modes.len().saturating_sub(1)));
             }
-            spawn_detached(cmd);
+            Err(err) => {
+                self.settings.display_status = Some(err);
+            }
         }
     }
 
@@ -9945,6 +10432,11 @@ impl Aurora {
         }
         self.screen_width = geom.width;
         self.screen_height = geom.height;
+        self.display_modes =
+            read_display_modes(&self.display, self.screen_width, self.screen_height);
+        if let Some(current) = self.display_modes.iter().position(|mode| mode.current) {
+            self.settings.selected_mode = current;
+        }
         self.wallpaper_cache = vec![None; WALLPAPERS.len()];
         self.wallpaper_pixels = render_wallpaper_pixels(
             WALLPAPERS[self.wallpaper_index].bytes,
@@ -11941,7 +12433,19 @@ fn read_display_modes(display: &str, current_width: u16, current_height: u16) ->
         .output()
     {
         let text = String::from_utf8_lossy(&output.stdout);
+        let mut current_output: Option<String> = None;
         for line in text.lines() {
+            if !line.chars().next().is_some_and(char::is_whitespace) {
+                let mut parts = line.split_whitespace();
+                let Some(name) = parts.next() else {
+                    continue;
+                };
+                current_output = parts
+                    .next()
+                    .is_some_and(|state| state == "connected")
+                    .then(|| name.to_string());
+                continue;
+            }
             let trimmed = line.trim_start();
             let Some(first) = trimmed.split_whitespace().next() else {
                 continue;
@@ -11952,46 +12456,100 @@ fn read_display_modes(display: &str, current_width: u16, current_height: u16) ->
             let (Ok(width), Ok(height)) = (w.parse::<u16>(), h.parse::<u16>()) else {
                 continue;
             };
-            let refresh = trimmed
-                .split_whitespace()
+            let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+            let current = tokens.iter().any(|token| token.contains('*'));
+            let refresh = tokens
+                .iter()
                 .skip(1)
                 .find_map(|token| token.trim_end_matches(['*', '+']).parse::<f32>().ok())
-                .map(|rate| if rate < 1.0 { 60.0 } else { rate });
-            if !modes
-                .iter()
-                .any(|m: &DisplayMode| m.width == width && m.height == height)
-            {
+                .filter(|rate| *rate >= 1.0);
+            let output_name = current_output.clone();
+            if !modes.iter().any(|m: &DisplayMode| {
+                m.output == output_name && m.width == width && m.height == height
+            }) {
                 modes.push(DisplayMode {
+                    output: output_name,
                     width,
                     height,
                     refresh,
+                    current,
                 });
             }
         }
     }
+    if !modes.iter().any(|mode| mode.current) {
+        for mode in &mut modes {
+            mode.current = mode.width == current_width && mode.height == current_height;
+        }
+    }
+    modes.sort_by(|a, b| {
+        b.current.cmp(&a.current).then_with(|| {
+            (u32::from(b.width) * u32::from(b.height))
+                .cmp(&(u32::from(a.width) * u32::from(a.height)))
+        })
+    });
     if modes.is_empty() {
         modes.push(DisplayMode {
+            output: None,
             width: current_width,
             height: current_height,
             refresh: Some(60.0),
+            current: true,
         });
         modes.push(DisplayMode {
+            output: None,
             width: 1366,
             height: 768,
             refresh: Some(60.0),
+            current: false,
         });
         modes.push(DisplayMode {
+            output: None,
             width: 1600,
             height: 900,
             refresh: Some(60.0),
+            current: false,
         });
         modes.push(DisplayMode {
+            output: None,
             width: 1920,
             height: 1080,
             refresh: Some(60.0),
+            current: false,
         });
     }
     modes
+}
+
+fn apply_xrandr_mode(display: &str, mode: &DisplayMode) -> Result<(), String> {
+    let size = format!("{}x{}", mode.width, mode.height);
+    if let Some(output) = mode.output.as_deref() {
+        let mut cmd = Command::new("xrandr");
+        cmd.env("DISPLAY", display)
+            .args(["--output", output, "--mode", &size]);
+        if let Some(rate) = mode.refresh {
+            cmd.args(["--rate", &format!("{rate:.2}")]);
+        }
+        if command_status_success(&mut cmd) {
+            return Ok(());
+        }
+
+        let mut without_rate = Command::new("xrandr");
+        without_rate
+            .env("DISPLAY", display)
+            .args(["--output", output, "--mode", &size]);
+        if command_status_success(&mut without_rate) {
+            return Ok(());
+        }
+    }
+
+    let mut by_size = Command::new("xrandr");
+    by_size.env("DISPLAY", display).args(["-s", &size]);
+    if command_status_success(&mut by_size) {
+        return Ok(());
+    }
+
+    Err(format!("Could not switch to {size} with xrandr"))
 }
 
 fn read_cpu_model() -> String {
@@ -12182,6 +12740,76 @@ fn read_audio_devices(kind: &str) -> Vec<String> {
         .collect()
 }
 
+fn read_audio_volume_percent() -> Option<u8> {
+    if let Ok(output) = Command::new("pactl")
+        .args(["get-sink-volume", "@DEFAULT_SINK@"])
+        .output()
+    {
+        if output.status.success() {
+            if let Some(percent) = parse_first_percent(&String::from_utf8_lossy(&output.stdout)) {
+                return Some(percent);
+            }
+        }
+    }
+    if let Ok(output) = Command::new("wpctl")
+        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(value) = text
+                .split_whitespace()
+                .find_map(|token| token.parse::<f32>().ok())
+            {
+                return Some((value * 100.0).round().clamp(0.0, 100.0) as u8);
+            }
+        }
+    }
+    None
+}
+
+fn parse_first_percent(text: &str) -> Option<u8> {
+    text.split_whitespace().find_map(|token| {
+        token
+            .trim_end_matches(',')
+            .strip_suffix('%')?
+            .parse::<u16>()
+            .ok()
+            .map(|value| value.min(100) as u8)
+    })
+}
+
+fn set_audio_volume_percent(percent: u8) -> Result<(), String> {
+    let percent = percent.min(100);
+    let pactl_percent = format!("{percent}%");
+    let mut pactl = Command::new("pactl");
+    pactl.args(["set-sink-volume", "@DEFAULT_SINK@", &pactl_percent]);
+    if command_status_success(&mut pactl) {
+        let mut unmute = Command::new("pactl");
+        unmute.args(["set-sink-mute", "@DEFAULT_SINK@", "0"]);
+        let _ = command_status_success(&mut unmute);
+        return Ok(());
+    }
+
+    let wpctl_value = format!("{:.2}", f32::from(percent) / 100.0);
+    let mut wpctl = Command::new("wpctl");
+    wpctl.args(["set-volume", "@DEFAULT_AUDIO_SINK@", &wpctl_value]);
+    if command_status_success(&mut wpctl) {
+        let mut unmute = Command::new("wpctl");
+        unmute.args(["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]);
+        let _ = command_status_success(&mut unmute);
+        return Ok(());
+    }
+
+    let mut amixer = Command::new("amixer");
+    amixer.args(["-D", "pulse", "sset", "Master", &pactl_percent]);
+    if command_status_success(&mut amixer) {
+        return Ok(());
+    }
+
+    Err("Could not set audio volume".to_string())
+}
+
 fn read_network_details() -> Vec<String> {
     let mut out = Vec::new();
     for nic in read_nics() {
@@ -12206,6 +12834,148 @@ fn read_network_details() -> Vec<String> {
         out.push("No network devices found".to_string());
     }
     out
+}
+
+fn scan_wifi_networks() -> Result<Vec<WifiNetwork>, String> {
+    let output = Command::new("nmcli")
+        .args(["-t", "-f", "SSID", "dev", "wifi", "list", "--rescan", "yes"])
+        .output()
+        .map_err(|err| format!("Could not run nmcli Wi-Fi scan: {err}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(compact(&format!("Wi-Fi scan failed: {}", err.trim()), 70));
+    }
+
+    let mut networks = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let ssid = unescape_nmcli_field(line.trim());
+        if ssid.is_empty()
+            || networks
+                .iter()
+                .any(|network: &WifiNetwork| network.ssid == ssid)
+        {
+            continue;
+        }
+        networks.push(WifiNetwork { ssid });
+    }
+    Ok(networks)
+}
+
+fn connect_wifi_network(ssid: &str, password: &str) -> Result<(), String> {
+    let mut cmd = Command::new("nmcli");
+    cmd.args(["dev", "wifi", "connect", ssid]);
+    if !password.is_empty() {
+        cmd.args(["password", password]);
+    }
+    let output = cmd
+        .output()
+        .map_err(|err| format!("Could not run nmcli connect: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        Err(compact(&format!("Wi-Fi connect failed: {message}"), 70))
+    }
+}
+
+fn disconnect_current_wifi() -> Result<(), String> {
+    let Some(wifi) = read_connected_wifi() else {
+        return Err("No connected Wi-Fi to disconnect".to_string());
+    };
+    let output = Command::new("nmcli")
+        .args(["dev", "disconnect", &wifi.device])
+        .output()
+        .map_err(|err| format!("Could not run nmcli disconnect: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        Err(compact(&format!("Wi-Fi disconnect failed: {message}"), 70))
+    }
+}
+
+fn read_connected_wifi() -> Option<WifiConnection> {
+    let output = Command::new("nmcli")
+        .args(["-t", "-f", "DEVICE,TYPE,STATE", "dev", "status"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let device = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let parts = split_nmcli_line(line);
+            (parts.len() >= 3 && parts[1] == "wifi" && parts[2] == "connected")
+                .then(|| parts[0].clone())
+        })?;
+
+    let ssid = Command::new("nmcli")
+        .args(["-t", "-f", "ACTIVE,SSID", "dev", "wifi"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| {
+                    let parts = split_nmcli_line(line);
+                    (parts.len() >= 2 && parts[0] == "yes").then(|| parts[1].clone())
+                })
+        })
+        .unwrap_or_else(|| device.clone());
+    let ip = Command::new("ip")
+        .args(["-o", "-4", "addr", "show", "dev", &device])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|parts| (parts[0] == "inet").then(|| parts[1].to_string()))
+        });
+    Some(WifiConnection { ssid, device, ip })
+}
+
+fn unescape_nmcli_field(value: &str) -> String {
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escaped {
+        out.push('\\');
+    }
+    out
+}
+
+fn split_nmcli_line(line: &str) -> Vec<String> {
+    line.split(':').map(unescape_nmcli_field).collect()
+}
+
+fn password_mask(len: usize) -> String {
+    "*".repeat(len.min(32))
 }
 
 fn read_bluetooth_devices() -> Vec<String> {
@@ -13062,6 +13832,10 @@ fn command_exists(name: &str) -> bool {
                 .find(|path| path.exists())
         })
         .is_some()
+}
+
+fn command_status_success(cmd: &mut Command) -> bool {
+    cmd.status().is_ok_and(|status| status.success())
 }
 
 fn shell_quote_text(text: &str) -> String {
