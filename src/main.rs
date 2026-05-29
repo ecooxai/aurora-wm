@@ -520,6 +520,8 @@ struct SettingsState {
     wifi_password_editing: bool,
     wifi_status: Option<String>,
     wifi_disconnect_confirm: bool,
+    wifi_radio_enabled: Option<bool>,
+    wifi_connected: Option<Option<WifiConnection>>,
 }
 
 impl Default for SettingsState {
@@ -549,6 +551,8 @@ impl Default for SettingsState {
             wifi_password_editing: false,
             wifi_status: None,
             wifi_disconnect_confirm: false,
+            wifi_radio_enabled: None,
+            wifi_connected: None,
         }
     }
 }
@@ -1119,6 +1123,7 @@ struct WifiNetwork {
     ssid: String,
 }
 
+#[derive(Clone)]
 struct WifiConnection {
     ssid: String,
     device: String,
@@ -1780,10 +1785,13 @@ impl Aurora {
                     self.last_clock_label = clock_label;
                     self.redraw_topbar()?;
                 }
-                if self.settings_visible
-                    && matches!(self.settings.tab, SettingsTab::Power | SettingsTab::About)
-                {
-                    self.redraw_settings()?;
+                if self.settings_visible {
+                    if self.settings.tab == SettingsTab::Network {
+                        self.update_cached_wifi_status();
+                        self.redraw_settings()?;
+                    } else if matches!(self.settings.tab, SettingsTab::Power | SettingsTab::About) {
+                        self.redraw_settings()?;
+                    }
                 }
                 self.conn.flush()?;
             }
@@ -5776,35 +5784,58 @@ impl Aurora {
         draw_card(c, sx, 258, card_w, 288);
         c.draw_text(&self.bold, "Wi-Fi", sx + 16, 278, 15.0, INK);
 
-        // Beautiful Premium 24x24 Refresh Icon Button
-        c.draw_round_rect(sx + 75, 262, 24, 24, 6, Color::rgba(160, 238, 220, 150));
-        c.draw_circle(sx + 87, 274, 6, MINT_DARK);
-        c.draw_circle(sx + 87, 274, 4, Color::rgb(255, 255, 255));
-        c.draw_rect(sx + 87, 268, 5, 4, Color::rgb(255, 255, 255));
-        c.draw_line(sx + 89, 267, sx + 89, 271, 2, MINT_DARK);
-        c.draw_line(sx + 89, 271, sx + 85, 271, 2, MINT_DARK);
-
-        let connected_wifi = read_connected_wifi();
-        
-        // Beautiful Premium 24x24 Disconnect Icon Button
-        if connected_wifi.is_some() {
-            c.draw_round_rect(sx + 105, 262, 24, 24, 6, Color::rgba(241, 126, 135, 112));
-            c.draw_line(sx + 105 + 7, 262 + 7, sx + 105 + 17, 262 + 17, 2, Color::rgb(160, 58, 68));
-            c.draw_line(sx + 105 + 17, 262 + 7, sx + 105 + 7, 262 + 17, 2, Color::rgb(160, 58, 68));
-        } else {
-            c.draw_round_rect(sx + 105, 262, 24, 24, 6, Color::rgba(200, 200, 200, 80));
-            c.draw_line(sx + 105 + 7, 262 + 7, sx + 105 + 17, 262 + 17, 2, Color::rgba(120, 120, 120, 150));
-            c.draw_line(sx + 105 + 17, 262 + 7, sx + 105 + 7, 262 + 17, 2, Color::rgba(120, 120, 120, 150));
+        // Beautiful Premium 24x24 Refresh Icon Button (Chrome-style, same bg as parent card)
+        let rx = sx + 75;
+        let ry = 273;
+        let rcx = rx + 12;
+        let rcy = ry + 12;
+        for i in 0..12 {
+            let a1 = (i as f32 * 30.0 - 60.0).to_radians();
+            let a2 = ((i + 1) as f32 * 30.0 - 60.0).to_radians();
+            let x1 = rcx + (6.0 * a1.cos()) as i32;
+            let y1 = rcy + (6.0 * a1.sin()) as i32;
+            let x2 = rcx + (6.0 * a2.cos()) as i32;
+            let y2 = rcy + (6.0 * a2.sin()) as i32;
+            c.draw_line(x1, y1, x2, y2, 2, MINT_DARK);
         }
+        let ax = rcx + (6.0 * (-60.0f32).to_radians().cos()) as i32;
+        let ay = rcy + (6.0 * (-60.0f32).to_radians().sin()) as i32;
+        c.draw_line(ax, ay, ax - 4, ay + 1, 2, MINT_DARK);
+        c.draw_line(ax, ay, ax + 1, ay + 4, 2, MINT_DARK);
+
+        let connected_wifi = self.settings.wifi_connected.clone().unwrap_or_else(|| read_connected_wifi());
+        let wifi_enabled = self.settings.wifi_radio_enabled.unwrap_or_else(|| read_wifi_radio_enabled());
+
+        // Beautiful Premium 24x24 Disconnect Icon Button (Wi-Fi slash, same bg as parent card)
+        let dx = sx + 107;
+        let dy = 273;
+        let dcx = dx + 12;
+        let dcy = dy + 12;
+        let disc_color = if connected_wifi.is_some() { Color::rgb(160, 58, 68) } else { Color::rgba(120, 120, 120, 150) };
+        c.draw_circle(dcx, dcy + 6, 2, disc_color);
+        for i in -4..=4 {
+            let a = (225.0f32 + i as f32 * 10.0).to_radians();
+            let x = dcx + (6.0 * a.cos()) as i32;
+            let y = dcy + 6 + (6.0 * a.sin()) as i32;
+            c.draw_circle(x, y, 1, disc_color);
+        }
+        for i in -4..=4 {
+            let a = (225.0f32 + i as f32 * 10.0).to_radians();
+            let x = dcx + (11.0 * a.cos()) as i32;
+            let y = dcy + 6 + (11.0 * a.sin()) as i32;
+            c.draw_circle(x, y, 1, disc_color);
+        }
+        c.draw_line(dcx - 7, dcy - 7, dcx + 7, dcy + 7, 2, disc_color);
 
         // Beautiful Premium 40x24 Sliding On/Off Switch
-        let wifi_enabled = read_wifi_radio_enabled();
+        let tx = sx + 139;
+        let ty = 273;
         if wifi_enabled {
-            c.draw_round_rect(sx + 135, 262, 40, 24, 12, Color::rgba(160, 238, 220, 200));
-            c.draw_circle(sx + 163, 274, 8, Color::rgb(255, 255, 255));
+            c.draw_round_rect(tx, ty, 40, 24, 12, Color::rgba(160, 238, 220, 200));
+            c.draw_circle(tx + 28, ty + 12, 8, Color::rgb(255, 255, 255));
         } else {
-            c.draw_round_rect(sx + 135, 262, 40, 24, 12, Color::rgba(200, 200, 200, 180));
-            c.draw_circle(sx + 147, 274, 8, Color::rgb(255, 255, 255));
+            c.draw_round_rect(tx, ty, 40, 24, 12, Color::rgba(200, 200, 200, 180));
+            c.draw_circle(tx + 12, ty + 12, 8, Color::rgb(255, 255, 255));
         }
 
         let mut list_start_y = 344;
@@ -5910,7 +5941,7 @@ impl Aurora {
                 if selected {
                     c.draw_round_rect(
                         sx + 12,
-                        y - 11, // Moved overlay down to y - 11 to perfectly center text
+                        y - 4, // Perfectly centers text inside the 22px high overlay
                         card_w - 24,
                         22,
                         7,
@@ -5961,12 +5992,12 @@ impl Aurora {
                 password_mask(self.settings.wifi_password.chars().count())
             };
             
-            // Text y = input_y + 21 is perfectly vertically centered
+            // Text y = input_y + 10 is perfectly vertically centered (top of bounding box)
             c.draw_text(
                 &self.regular,
                 &compact(&shown, 38),
                 input_x + 12,
-                input_y + 21,
+                input_y + 10,
                 13.0,
                 if self.settings.wifi_password.is_empty() {
                     MUTED
@@ -6547,6 +6578,12 @@ impl Aurora {
         self.media_front = false;
         self.conn.map_window(self.ui.settings)?;
         self.raise_ui()?;
+        if tab == SettingsTab::Network {
+            self.update_cached_wifi_status();
+            if self.settings.wifi_networks.is_empty() {
+                self.refresh_wifi_networks_lazy();
+            }
+        }
         self.redraw_settings()
     }
 
@@ -6554,7 +6591,7 @@ impl Aurora {
         self.settings.wifi_status = Some("Refreshing Wi-Fi networks...".to_string());
         let _ = self.redraw_settings();
         let _ = self.conn.flush();
-        match scan_wifi_networks() {
+        match scan_wifi_networks(true) {
             Ok(networks) => {
                 self.settings.wifi_networks = networks;
                 self.settings.wifi_status = Some(format!(
@@ -6584,6 +6621,35 @@ impl Aurora {
                 self.settings.wifi_status = Some(err);
             }
         }
+    }
+
+    fn refresh_wifi_networks_lazy(&mut self) {
+        self.settings.wifi_status = Some("Loading Wi-Fi networks...".to_string());
+        let _ = self.redraw_settings();
+        let _ = self.conn.flush();
+        match scan_wifi_networks(false) {
+            Ok(networks) => {
+                self.settings.wifi_networks = networks;
+                self.settings.wifi_status = Some(format!(
+                    "Found {} Wi-Fi network{}",
+                    self.settings.wifi_networks.len(),
+                    if self.settings.wifi_networks.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+            }
+            Err(err) => {
+                self.settings.wifi_networks.clear();
+                self.settings.wifi_status = Some(err);
+            }
+        }
+    }
+
+    fn update_cached_wifi_status(&mut self) {
+        self.settings.wifi_radio_enabled = Some(read_wifi_radio_enabled());
+        self.settings.wifi_connected = Some(read_connected_wifi());
     }
 
     fn connect_selected_wifi(&mut self) -> AnyResult<()> {
@@ -6643,6 +6709,12 @@ impl Aurora {
             if let Some(tab) = tab {
                 self.settings.tab = tab;
                 self.settings.scroll = 0;
+                if tab == SettingsTab::Network {
+                    self.update_cached_wifi_status();
+                    if self.settings.wifi_networks.is_empty() {
+                        self.refresh_wifi_networks_lazy();
+                    }
+                }
                 self.redraw_settings()?;
             }
             return Ok(());
@@ -6752,7 +6824,7 @@ impl Aurora {
         let card_w = i32::from(self.settings_geometry().2) - sx - 24;
         
         // Clicks on the new Refresh icon button next to Wi-Fi title
-        if y >= 262 && y <= 286 && x >= sx + 75 && x <= sx + 99 {
+        if y >= 273 && y <= 297 && x >= sx + 75 && x <= sx + 99 {
             self.settings.wifi_disconnect_confirm = false;
             self.refresh_wifi_networks();
             self.redraw_settings()?;
@@ -6760,7 +6832,7 @@ impl Aurora {
         }
 
         // Clicks on the new Disconnect icon button next to Wi-Fi title
-        if y >= 262 && y <= 286 && x >= sx + 105 && x <= sx + 129 {
+        if y >= 273 && y <= 297 && x >= sx + 107 && x <= sx + 131 {
             if read_connected_wifi().is_some() {
                 self.settings.wifi_disconnect_confirm = true;
                 self.settings.wifi_password_editing = false;
@@ -6770,7 +6842,7 @@ impl Aurora {
         }
 
         // Clicks on the new On/Off toggle switch next to Wi-Fi title
-        if y >= 262 && y <= 286 && x >= sx + 135 && x <= sx + 175 {
+        if y >= 273 && y <= 297 && x >= sx + 139 && x <= sx + 179 {
             let current_enabled = read_wifi_radio_enabled();
             if let Err(e) = set_wifi_radio_enabled(!current_enabled) {
                 self.settings.wifi_status = Some(format!("Error setting Wi-Fi radio: {e}"));
@@ -13208,9 +13280,10 @@ fn read_network_details() -> Vec<String> {
     out
 }
 
-fn scan_wifi_networks() -> Result<Vec<WifiNetwork>, String> {
+fn scan_wifi_networks(rescan: bool) -> Result<Vec<WifiNetwork>, String> {
+    let rescan_val = if rescan { "yes" } else { "no" };
     let output = Command::new("nmcli")
-        .args(["-t", "-f", "SSID", "dev", "wifi", "list", "--rescan", "yes"])
+        .args(["-t", "-f", "SSID", "dev", "wifi", "list", "--rescan", rescan_val])
         .output()
         .map_err(|err| format!("Could not run nmcli Wi-Fi scan: {err}"))?;
     if !output.status.success() {
