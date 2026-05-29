@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,10 +56,10 @@ const TERMINAL_FALLBACKS: [&str; 5] = [
     "konsole",
     "xterm",
 ];
-const FONT_REGULAR: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Regular.ttf");
-const FONT_BOLD: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSans-Bold.ttf");
-const FONT_TERMINAL_REGULAR: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSansMono-Regular.ttf");
-const FONT_TERMINAL_BOLD: &[u8] = include_bytes!("/usr/share/fonts/noto/NotoSansMono-Bold.ttf");
+const FONT_REGULAR: &[u8] = include_bytes!("../fonts/NotoSans-Regular.ttf");
+const FONT_BOLD: &[u8] = include_bytes!("../fonts/NotoSans-Bold.ttf");
+const FONT_TERMINAL_REGULAR: &[u8] = include_bytes!("../fonts/NotoSansMono-Regular.ttf");
+const FONT_TERMINAL_BOLD: &[u8] = include_bytes!("../fonts/NotoSansMono-Bold.ttf");
 
 static WALLPAPERS: &[WallpaperAsset] = &[
     WallpaperAsset {
@@ -117,7 +118,7 @@ const FOLDER_MIN_WIDTH: u16 = 260;
 const FOLDER_MIN_HEIGHT: u16 = 160;
 const TERMINAL_MIN_WIDTH: u16 = 260;
 const TERMINAL_MIN_HEIGHT: u16 = 120;
-const TERMINAL_DEFAULT_WIDTH: u16 = 760;
+const TERMINAL_DEFAULT_WIDTH: u16 = FOLDER_DEFAULT_WIDTH;
 
 #[derive(Clone)]
 struct Canvas {
@@ -496,6 +497,9 @@ struct SettingsState {
     tab: SettingsTab,
     sleep_after_secs: u32,
     power_mode: PowerMode,
+    auto_power_saver_minutes: u32,
+    auto_power_saver_input: String,
+    auto_power_saver_editing: bool,
     selected_mode: usize,
     scroll: i32,
     app_kind: DefaultAppKind,
@@ -509,10 +513,14 @@ struct SettingsState {
 
 impl Default for SettingsState {
     fn default() -> Self {
+        let auto_power_saver_minutes = read_u32_setting("auto_power_saver_minutes", 10).min(240);
         Self {
             tab: SettingsTab::Display,
-            sleep_after_secs: 600,
+            sleep_after_secs: read_u32_setting("sleep_after_secs", 600).min(7200),
             power_mode: PowerMode::Balanced,
+            auto_power_saver_minutes,
+            auto_power_saver_input: auto_power_saver_minutes.to_string(),
+            auto_power_saver_editing: false,
             selected_mode: 0,
             scroll: 0,
             app_kind: DefaultAppKind::Terminal,
@@ -531,6 +539,7 @@ struct Metrics {
     cpu_model: String,
     cpu_usage: f32,
     cpu_status: String,
+    cpu_frequencies: Vec<String>,
     ram_total_kb: u64,
     ram_used_kb: u64,
     swap_total_kb: u64,
@@ -607,6 +616,7 @@ impl SystemSampler {
             cpu_model: self.cpu_model.clone(),
             cpu_usage,
             cpu_status: read_cpu_status(cpu_usage),
+            cpu_frequencies: read_cpu_frequencies(),
             ram_total_kb,
             ram_used_kb,
             swap_total_kb,
@@ -629,6 +639,7 @@ struct UiWindows {
     folder_terminal: Window,
     screenshot_overlay: Window,
     app_menu: Window,
+    aurora_menu: Window,
     media: [Window; MEDIA_SLOT_COUNT],
 }
 
@@ -922,7 +933,10 @@ impl FolderTerminal {
             screen: vec![vec![' '; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
             screen_fg: vec![vec![255; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
             screen_bg: vec![vec![255; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
-            screen_bold: vec![vec![false; FOLDER_TERMINAL_DEFAULT_COLS]; FOLDER_TERMINAL_DEFAULT_ROWS],
+            screen_bold: vec![
+                vec![false; FOLDER_TERMINAL_DEFAULT_COLS];
+                FOLDER_TERMINAL_DEFAULT_ROWS
+            ],
             cols: FOLDER_TERMINAL_DEFAULT_COLS,
             rows: FOLDER_TERMINAL_DEFAULT_ROWS,
             cursor_x: 0,
@@ -1142,6 +1156,8 @@ struct Aurora {
     app_menu_visible: bool,
     app_menu_more: bool,
     app_menu_scroll: usize,
+    aurora_menu_visible: bool,
+    aurora_menu_about: bool,
     folder_context_open: bool,
     folder_context_pos: (i32, i32),
     folder_clipboard: Option<(PathBuf, bool)>,
@@ -1157,6 +1173,10 @@ struct Aurora {
     last_clock_label: String,
     last_tick: Instant,
     last_media_tick: Instant,
+    last_power_saver_check: Instant,
+    last_pointer_pos: Option<(i16, i16)>,
+    last_pointer_activity: Instant,
+    pending_auto_power_saver_apply: Option<Instant>,
     screenshot_mode: bool,
     screenshot_selection: Option<ScreenshotSelection>,
     screenshot_base: Option<ImagePreview>,
@@ -1253,8 +1273,10 @@ impl Aurora {
 
         let regular = Font::try_from_bytes(FONT_REGULAR).ok_or("failed to load regular font")?;
         let bold = Font::try_from_bytes(FONT_BOLD).ok_or("failed to load bold font")?;
-        let terminal_regular = Font::try_from_bytes(FONT_TERMINAL_REGULAR).ok_or("failed to load terminal regular font")?;
-        let terminal_bold = Font::try_from_bytes(FONT_TERMINAL_BOLD).ok_or("failed to load terminal bold font")?;
+        let terminal_regular = Font::try_from_bytes(FONT_TERMINAL_REGULAR)
+            .ok_or("failed to load terminal regular font")?;
+        let terminal_bold =
+            Font::try_from_bytes(FONT_TERMINAL_BOLD).ok_or("failed to load terminal bold font")?;
         let wallpaper_pixels = render_wallpaper_pixels(
             WALLPAPERS[0].bytes,
             screen.width_in_pixels,
@@ -1278,6 +1300,7 @@ impl Aurora {
             folder_terminal: conn.generate_id()?,
             screenshot_overlay: conn.generate_id()?,
             app_menu: conn.generate_id()?,
+            aurora_menu: conn.generate_id()?,
             media: [
                 conn.generate_id()?,
                 conn.generate_id()?,
@@ -1365,6 +1388,8 @@ impl Aurora {
             app_menu_visible: false,
             app_menu_more: false,
             app_menu_scroll: 0,
+            aurora_menu_visible: false,
+            aurora_menu_about: false,
             folder_context_open: false,
             folder_context_pos: (0, 0),
             folder_clipboard: None,
@@ -1380,6 +1405,10 @@ impl Aurora {
             last_clock_label: format_clock(),
             last_tick: Instant::now(),
             last_media_tick: Instant::now(),
+            last_power_saver_check: Instant::now(),
+            last_pointer_pos: None,
+            last_pointer_activity: Instant::now(),
+            pending_auto_power_saver_apply: None,
             screenshot_mode: false,
             screenshot_selection: None,
             screenshot_base: None,
@@ -1387,6 +1416,11 @@ impl Aurora {
             pending_screenshot_button: None,
             topbar_notice: None,
         };
+        app.apply_sleep_timeout();
+        if app.settings.auto_power_saver_minutes > 0 {
+            let _ = app.set_power_mode(PowerMode::Performance);
+        }
+        let _ = save_app_commands(&app.settings);
         app.create_ui_windows()?;
         Ok(app)
     }
@@ -1511,7 +1545,26 @@ impl Aurora {
                 }
             }
 
-            if self.last_tick.elapsed() >= Duration::from_millis(2000) {
+            if self
+                .pending_auto_power_saver_apply
+                .is_some_and(|at| Instant::now() >= at)
+            {
+                self.pending_auto_power_saver_apply = None;
+                if self.apply_auto_power_saver_setting()? {
+                    self.conn.flush()?;
+                }
+            }
+
+            if self.settings.auto_power_saver_minutes > 0
+                && self.last_power_saver_check.elapsed() >= Duration::from_secs(5)
+            {
+                self.last_power_saver_check = Instant::now();
+                if self.update_auto_power_saver()? {
+                    self.conn.flush()?;
+                }
+            }
+
+            if self.last_tick.elapsed() >= Duration::from_millis(3000) {
                 self.last_tick = Instant::now();
                 self.metrics = self.sampler.sample();
                 let clock_label = format_clock();
@@ -1539,8 +1592,60 @@ impl Aurora {
         }
     }
 
+    fn update_auto_power_saver(&mut self) -> AnyResult<bool> {
+        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+        let pos = (pointer.root_x, pointer.root_y);
+        let moved = self.last_pointer_pos.is_some_and(|last| last != pos);
+        self.last_pointer_pos = Some(pos);
+        if moved {
+            self.last_pointer_activity = Instant::now();
+            if self.settings.power_mode != PowerMode::Performance {
+                self.set_power_mode(PowerMode::Performance)?;
+                if self.settings_visible && self.settings.tab == SettingsTab::Power {
+                    self.redraw_settings()?;
+                }
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let idle_for = self.last_pointer_activity.elapsed();
+        let threshold =
+            Duration::from_secs(u64::from(self.settings.auto_power_saver_minutes.max(1)) * 60);
+        if idle_for >= threshold && self.settings.power_mode != PowerMode::Saver {
+            self.set_power_mode(PowerMode::Saver)?;
+            if self.settings_visible && self.settings.tab == SettingsTab::Power {
+                self.redraw_settings()?;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn apply_auto_power_saver_setting(&mut self) -> AnyResult<bool> {
+        self.settings.auto_power_saver_minutes = self
+            .settings
+            .auto_power_saver_input
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(0)
+            .min(240);
+        if self.settings.auto_power_saver_minutes == 0 {
+            self.settings.auto_power_saver_input = "0".to_string();
+            self.last_pointer_pos = None;
+            save_app_commands(&self.settings)?;
+            return Ok(false);
+        }
+        self.settings.auto_power_saver_input = self.settings.auto_power_saver_minutes.to_string();
+        self.last_pointer_activity = Instant::now();
+        self.last_pointer_pos = None;
+        self.set_power_mode(PowerMode::Performance)?;
+        save_app_commands(&self.settings)?;
+        Ok(true)
+    }
+
     fn create_ui_windows(&mut self) -> AnyResult<()> {
         self.grab_root_button1()?;
+        self.grab_alt_tab()?;
         let top_aux = CreateWindowAux::new()
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE)
@@ -1701,6 +1806,26 @@ impl Aurora {
             &menu_aux,
         )?;
 
+        let aurora_menu = self.aurora_menu_geometry();
+        let aurora_menu_aux = CreateWindowAux::new()
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
+            .cursor(self.cursor)
+            .background_pixel(0);
+        self.conn.create_window(
+            self.depth,
+            self.ui.aurora_menu,
+            self.root,
+            aurora_menu.0,
+            aurora_menu.1,
+            aurora_menu.2,
+            aurora_menu.3,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual,
+            &aurora_menu_aux,
+        )?;
+
         let media_aux = CreateWindowAux::new()
             .override_redirect(1)
             .event_mask(
@@ -1773,6 +1898,7 @@ impl Aurora {
             self.ui.folder,
             self.ui.folder_terminal,
             self.ui.app_menu,
+            self.ui.aurora_menu,
         ];
         windows.extend(self.ui.media);
         windows.extend(self.clients.values().map(|info| info.frame));
@@ -1906,6 +2032,8 @@ impl Aurora {
             self.redraw_screenshot_overlay()?;
         } else if ev.window == self.ui.app_menu && self.app_menu_visible {
             self.redraw_app_menu()?;
+        } else if ev.window == self.ui.aurora_menu && self.aurora_menu_visible {
+            self.redraw_aurora_menu()?;
         } else if let Some(slot) = self.media_slot_for_window(ev.window) {
             if self
                 .media_slots
@@ -1929,6 +2057,22 @@ impl Aurora {
     }
 
     fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
+        if self.aurora_menu_visible && ev.event != self.ui.topbar && ev.event != self.ui.aurora_menu
+        {
+            let (mx, my, mw, mh) = self.aurora_menu_geometry();
+            let rx = i32::from(ev.root_x);
+            let ry = i32::from(ev.root_y);
+            if rx >= i32::from(mx)
+                && rx <= i32::from(mx) + i32::from(mw)
+                && ry >= i32::from(my)
+                && ry <= i32::from(my) + i32::from(mh)
+            {
+                self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+                self.handle_aurora_menu_click(rx - i32::from(mx), ry - i32::from(my))?;
+                return Ok(());
+            }
+            self.hide_aurora_menu()?;
+        }
         if self.screenshot_mode && ev.detail == 1 {
             self.start_screenshot_selection(ev.root_x, ev.root_y)?;
             if ev.event == self.root {
@@ -2008,6 +2152,8 @@ impl Aurora {
             self.redraw_folder_terminal()?;
         } else if ev.event == self.ui.app_menu {
             self.handle_app_menu_click(ev.detail, i32::from(ev.event_x), i32::from(ev.event_y))?;
+        } else if ev.event == self.ui.aurora_menu {
+            self.handle_aurora_menu_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if let Some(slot) = self.media_slot_for_window(ev.event) {
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_media_scroll(slot, ev.detail)?;
@@ -2030,6 +2176,7 @@ impl Aurora {
             let x = i32::from(ev.event_x);
             let _ = self.handle_topbar_press_x(x)?;
         } else if ev.event == self.root {
+            self.hide_aurora_menu()?;
             self.handle_root_button_press(ev)?;
         } else if let Some(client) = self.client_or_ancestor_key_for(ev.event) {
             if self
@@ -2565,14 +2712,21 @@ impl Aurora {
 
     fn handle_topbar_press_x(&mut self, x: i32) -> AnyResult<bool> {
         let controls = self.topbar_controls();
+        if (0..=126).contains(&x) {
+            self.toggle_aurora_menu()?;
+            return Ok(true);
+        }
         let workspace = (0..self.workspace_count).find(|&index| {
             (self.workspace_x(index)..=self.workspace_x(index) + WORKSPACE_SIZE).contains(&x)
         });
         if let Some(workspace) = workspace {
+            self.hide_aurora_menu()?;
             self.switch_workspace(workspace)?;
         } else if (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE).contains(&x) {
+            self.hide_aurora_menu()?;
             self.add_workspace()?;
         } else if (controls.screenshot_x - 16..=controls.screenshot_x + 16).contains(&x) {
+            self.hide_aurora_menu()?;
             if self.screenshot_mode {
                 self.capture_screenshot(None)?;
             } else {
@@ -2582,14 +2736,19 @@ impl Aurora {
                 self.toggle_screenshot_mode()?;
             }
         } else if (controls.display_x - 16..=controls.display_x + 16).contains(&x) {
+            self.hide_aurora_menu()?;
             self.open_settings_tab(SettingsTab::Display)?;
         } else if (controls.audio_x - 16..=controls.audio_x + 16).contains(&x) {
+            self.hide_aurora_menu()?;
             self.open_settings_tab(SettingsTab::Audio)?;
         } else if (controls.network_x - 16..=controls.network_x + 16).contains(&x) {
+            self.hide_aurora_menu()?;
             self.open_settings_tab(SettingsTab::Network)?;
         } else if (controls.battery_left..=controls.battery_right).contains(&x) {
+            self.hide_aurora_menu()?;
             self.open_settings_tab(SettingsTab::Power)?;
         } else {
+            self.hide_aurora_menu()?;
             return Ok(false);
         }
         Ok(true)
@@ -2617,6 +2776,57 @@ impl Aurora {
         }
         res?;
         Ok(())
+    }
+
+    fn grab_alt_tab(&self) -> AnyResult<()> {
+        let Some(tab_keycode) = self.keycode_for_keysym(0xff09)? else {
+            return Ok(());
+        };
+        let lock = ModMask::LOCK;
+        let num_lock = ModMask::M2;
+        for modifiers in [
+            ModMask::M1,
+            ModMask::M1 | lock,
+            ModMask::M1 | num_lock,
+            ModMask::M1 | lock | num_lock,
+        ] {
+            let res = self
+                .conn
+                .grab_key(
+                    false,
+                    self.root,
+                    modifiers,
+                    tab_keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )?
+                .check();
+            if let Err(ReplyError::X11Error(ref err)) = res {
+                if err.error_kind == ErrorKind::Access {
+                    continue;
+                }
+            }
+            res?;
+        }
+        Ok(())
+    }
+
+    fn keycode_for_keysym(&self, target: u32) -> AnyResult<Option<u8>> {
+        let setup = self.conn.setup();
+        let min = setup.min_keycode;
+        let max = setup.max_keycode;
+        let count = max.saturating_sub(min).saturating_add(1);
+        let mapping = self.conn.get_keyboard_mapping(min, count)?.reply()?;
+        for (idx, keysyms) in mapping
+            .keysyms
+            .chunks(mapping.keysyms_per_keycode as usize)
+            .enumerate()
+        {
+            if keysyms.contains(&target) {
+                return Ok(Some(min.saturating_add(idx as u8)));
+            }
+        }
+        Ok(None)
     }
 
     fn start_drag(&mut self, client: Window, root_x: i16, root_y: i16) -> AnyResult<()> {
@@ -3187,12 +3397,17 @@ impl Aurora {
         if self.titlebar_height(info) == 0 {
             return Ok(());
         }
+        let active = self.active_client == Some(client);
         c.draw_rect(
             0,
             0,
             i32::from(info.width),
             i32::from(TITLEBAR_HEIGHT),
-            Color::rgba(250, 254, 255, 225),
+            if active {
+                Color::rgba(221, 238, 252, 232)
+            } else {
+                Color::rgba(250, 254, 255, 225)
+            },
         );
         c.draw_circle(19, 17, 8, Color::rgba(241, 96, 105, 235));
         c.draw_circle(42, 17, 8, Color::rgba(246, 190, 82, 235));
@@ -3477,25 +3692,35 @@ impl Aurora {
                 14,
                 Color::rgba(44, 77, 91, 38),
             );
-            c.draw_round_rect(icon_x, icon_y, 44, 44, 12, Color::rgba(255, 255, 255, 215));
-            c.draw_round_rect(
-                icon_x + 1,
-                icon_y + 1,
-                42,
-                42,
-                11,
-                Color::rgba(196, 219, 229, 95),
-            );
             if i < 5 {
+                c.draw_round_rect(icon_x, icon_y, 44, 44, 12, Color::rgba(255, 255, 255, 215));
+                c.draw_round_rect(
+                    icon_x + 1,
+                    icon_y + 1,
+                    42,
+                    42,
+                    11,
+                    Color::rgba(196, 219, 229, 95),
+                );
                 draw_dock_icon(&mut c, i, icon_x + 22, icon_y + 22);
             } else if let Some(client) = task_windows
                 .get(i - 5)
                 .and_then(|window| self.clients.get(window))
                 .copied()
             {
-                if self.active_client == Some(client.window) {
-                    c.draw_round_rect(icon_x, icon_y, 44, 44, 12, Color::rgba(32, 58, 68, 168));
-                }
+                let active = self.active_client == Some(client.window);
+                c.draw_round_rect(
+                    icon_x,
+                    icon_y,
+                    44,
+                    44,
+                    12,
+                    if active {
+                        Color::rgba(172, 218, 255, 235)
+                    } else {
+                        Color::rgba(255, 255, 255, 235)
+                    },
+                );
                 let title = self.window_title(client.window);
                 if !self.paint_window_icon(&mut c, client.window, icon_x + 8, icon_y + 8, 28)
                     && !self.paint_desktop_icon(&mut c, client.window, icon_x + 8, icon_y + 8, 28)
@@ -3882,6 +4107,121 @@ impl Aurora {
             }
         }
         self.upload_canvas(self.ui.app_menu, &c)
+    }
+
+    fn redraw_aurora_menu(&self) -> AnyResult<()> {
+        let (x, y, w, h) = self.aurora_menu_geometry();
+        self.conn.configure_window(
+            self.ui.aurora_menu,
+            &ConfigureWindowAux::new()
+                .x(i32::from(x))
+                .y(i32::from(y))
+                .width(u32::from(w))
+                .height(u32::from(h)),
+        )?;
+        let mut c = Canvas::from_wallpaper_crop(
+            &self.wallpaper_pixels,
+            self.screen_width,
+            i32::from(x),
+            i32::from(y),
+            w,
+            h,
+        );
+        c.draw_round_rect(
+            0,
+            0,
+            i32::from(w),
+            i32::from(h),
+            12,
+            Color::rgba(248, 253, 255, 235),
+        );
+        c.draw_round_rect(
+            1,
+            1,
+            i32::from(w) - 2,
+            i32::from(h) - 2,
+            11,
+            Color::rgba(210, 229, 238, 130),
+        );
+        c.draw_circle(28, 28, 12, Color::rgba(116, 213, 198, 170));
+        c.draw_circle(28, 28, 6, MINT_DARK);
+        c.draw_text(&self.bold, "Aurora WM", 50, 17, 17.0, INK);
+        c.draw_text(
+            &self.regular,
+            env!("CARGO_PKG_VERSION"),
+            146,
+            21,
+            11.0,
+            MUTED,
+        );
+
+        if self.aurora_menu_about {
+            c.draw_text(&self.bold, "About", 18, 62, 14.0, INK);
+            c.draw_text(
+                &self.regular,
+                "A small X11 desktop shell with dock, folders, media viewer,",
+                18,
+                88,
+                11.0,
+                INK,
+            );
+            c.draw_text(
+                &self.regular,
+                "settings, screenshots, and lightweight window controls.",
+                18,
+                106,
+                11.0,
+                INK,
+            );
+            c.draw_text(&self.bold, "Help", 18, 140, 13.0, INK);
+            c.draw_text(
+                &self.regular,
+                "Alt+Tab switches running apps.",
+                18,
+                164,
+                11.0,
+                MUTED,
+            );
+            c.draw_text(
+                &self.regular,
+                "Use the dock for apps and settings; drag titlebars to move windows.",
+                18,
+                182,
+                11.0,
+                MUTED,
+            );
+            c.draw_text(
+                &self.regular,
+                "Bottom corners resize windows; settings are saved in ~/.config/aurora-wm.",
+                18,
+                200,
+                11.0,
+                MUTED,
+            );
+            c.draw_round_rect(16, 230, 76, 28, 8, Color::rgba(234, 244, 248, 220));
+            c.draw_text_center(&self.bold, "Back", 54, 238, 12.0, MINT_DARK);
+        } else {
+            for (idx, (label, hint)) in [
+                ("Restart WM", "Reload Aurora and keep saved settings"),
+                ("About Aurora", "Version, description, and quick help"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let row_y = 64 + idx as i32 * 50;
+                c.draw_round_rect(
+                    14,
+                    row_y - 8,
+                    i32::from(w) - 28,
+                    38,
+                    9,
+                    Color::rgba(255, 255, 255, 150),
+                );
+                c.draw_text(&self.bold, label, 28, row_y, 13.0, INK);
+                c.draw_text(&self.regular, hint, 28, row_y + 17, 10.0, MUTED);
+            }
+        }
+        self.upload_canvas(self.ui.aurora_menu, &c)
     }
 
     fn redraw_media_slot(&self, slot: usize) -> AnyResult<()> {
@@ -4488,15 +4828,63 @@ impl Aurora {
             13.0,
             MUTED,
         );
-        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 126);
-        c.draw_text(&self.bold, "Power profile", sx + 16, 106, 15.0, INK);
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 196);
+        c.draw_text(&self.bold, "Auto power saver", sx + 16, 106, 15.0, INK);
+        let input_x = i32::from(c.width) - 170;
+        c.draw_round_rect(
+            input_x,
+            96,
+            118,
+            30,
+            9,
+            if self.settings.auto_power_saver_editing {
+                Color::rgba(188, 224, 255, 245)
+            } else {
+                Color::rgba(255, 255, 255, 190)
+            },
+        );
+        if self.settings.auto_power_saver_editing {
+            c.draw_round_rect(input_x, 96, 118, 30, 9, Color::rgba(73, 156, 231, 45));
+        }
+        let minutes = if self.settings.auto_power_saver_editing {
+            self.settings.auto_power_saver_input.as_str()
+        } else {
+            self.settings.auto_power_saver_input.as_str()
+        };
+        c.draw_text(
+            &self.regular,
+            if minutes.is_empty() { "0" } else { minutes },
+            input_x + 14,
+            104,
+            14.0,
+            INK,
+        );
+        c.draw_text(&self.regular, "min", input_x + 72, 104, 13.0, MUTED);
+        c.draw_text(
+            &self.regular,
+            "idle minutes before battery saver",
+            sx + 16,
+            138,
+            12.0,
+            MUTED,
+        );
+        c.draw_text_right(
+            &self.regular,
+            "Use 0 to disable",
+            input_x + 118,
+            138,
+            12.0,
+            BLUE,
+        );
+
+        c.draw_text(&self.bold, "Power profile", sx + 16, 174, 15.0, INK);
         let modes = [
             PowerMode::Saver,
             PowerMode::Balanced,
             PowerMode::Performance,
         ];
         for (idx, mode) in modes.iter().enumerate() {
-            let y = 134 + idx as i32 * 24;
+            let y = 202 + idx as i32 * 24;
             let active = *mode == self.settings.power_mode;
             c.draw_round_rect(
                 sx + 16,
@@ -4520,24 +4908,32 @@ impl Aurora {
             );
         }
 
-        draw_card(c, sx, 230, i32::from(c.width) - sx - 24, 156);
-        c.draw_text(&self.bold, "System", sx + 16, 250, 15.0, INK);
+        draw_card(c, sx, 304, i32::from(c.width) - sx - 24, 154);
+        c.draw_text(&self.bold, "System", sx + 16, 324, 15.0, INK);
         draw_metric_bar(
             c,
             &self.regular,
             sx + 16,
-            280,
+            354,
             "CPU",
             self.metrics.cpu_usage,
             "%",
         );
-        let ram_pct = percent(self.metrics.ram_used_kb, self.metrics.ram_total_kb);
-        draw_metric_bar(c, &self.regular, sx + 16, 318, "Memory", ram_pct, "%");
-        let swap_pct = percent(self.metrics.swap_used_kb, self.metrics.swap_total_kb);
-        draw_metric_bar(c, &self.regular, sx + 16, 356, "Swap", swap_pct, "%");
+        c.draw_text(&self.regular, "CPU frequency", sx + 16, 390, 12.0, MUTED);
+        let freq_lines = cpu_frequency_lines(&self.metrics.cpu_frequencies, 46);
+        for (idx, line) in freq_lines.iter().take(3).enumerate() {
+            c.draw_text(
+                &self.regular,
+                line,
+                sx + 16,
+                412 + idx as i32 * 16,
+                11.0,
+                INK,
+            );
+        }
 
-        draw_card(c, sx, 404, i32::from(c.width) - sx - 24, 76);
-        c.draw_text(&self.bold, "Battery", sx + 16, 424, 15.0, INK);
+        draw_card(c, sx, 476, i32::from(c.width) - sx - 24, 76);
+        c.draw_text(&self.bold, "Battery", sx + 16, 496, 15.0, INK);
         c.draw_text(
             &self.regular,
             self.metrics
@@ -4545,7 +4941,7 @@ impl Aurora {
                 .as_deref()
                 .unwrap_or("No battery exposed"),
             sx + 16,
-            452,
+            524,
             14.0,
             MINT_DARK,
         );
@@ -4811,13 +5207,14 @@ impl Aurora {
         }
 
         draw_card(c, sx, 132, card_w, 234);
+        c.draw_text(&self.bold, "Default apps", sx + 16, 151, 14.0, INK);
         c.draw_text(
-            &self.bold,
-            &format!("Installed {} apps", self.settings.app_kind.label()),
-            sx + 16,
-            151,
-            14.0,
-            INK,
+            &self.regular,
+            &format!("Choose default {}", self.settings.app_kind.label()),
+            sx + 112,
+            152,
+            11.0,
+            MUTED,
         );
         let selected = self.selected_app_command(self.settings.app_kind);
         let apps = self.available_apps(self.settings.app_kind);
@@ -4859,7 +5256,7 @@ impl Aurora {
         if apps.len() > 6 {
             c.draw_text(
                 &self.regular,
-                "Scroll to see more installed apps",
+                "Scroll to see more default apps",
                 sx + card_w - 192,
                 151,
                 10.0,
@@ -5141,7 +5538,8 @@ impl Aurora {
         }
         let workspace = self.workspace_count;
         self.workspace_count += 1;
-        self.workspace_ui.push(WorkspaceUiState::new(self.screen_height));
+        self.workspace_ui
+            .push(WorkspaceUiState::new(self.screen_height));
 
         // Update EWMH _NET_NUMBER_OF_DESKTOPS
         if let Ok(num_atom) = self.atom(b"_NET_NUMBER_OF_DESKTOPS") {
@@ -5182,13 +5580,17 @@ impl Aurora {
             self.conn.unmap_window(frame)?;
         }
         while self.workspace_ui.len() <= workspace {
-            self.workspace_ui.push(WorkspaceUiState::new(self.screen_height));
+            self.workspace_ui
+                .push(WorkspaceUiState::new(self.screen_height));
         }
         let previous_ui = self.take_workspace_ui_state();
         if let Some(slot) = self.workspace_ui.get_mut(previous) {
             *slot = previous_ui;
         }
-        let next_ui = std::mem::replace(&mut self.workspace_ui[workspace], WorkspaceUiState::new(self.screen_height));
+        let next_ui = std::mem::replace(
+            &mut self.workspace_ui[workspace],
+            WorkspaceUiState::new(self.screen_height),
+        );
         self.apply_workspace_ui_state(next_ui);
         self.active_workspace = workspace;
 
@@ -5231,6 +5633,15 @@ impl Aurora {
     }
 
     fn handle_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        if self.settings.tab == SettingsTab::Power && self.settings.auto_power_saver_editing {
+            let input_x = i32::from(self.settings_geometry().2) - 170;
+            let inside_input = y >= 96 && y <= 126 && x >= input_x && x <= input_x + 118;
+            if !inside_input {
+                self.settings.auto_power_saver_editing = false;
+                self.conn
+                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+            }
+        }
         if x < SIDEBAR_WIDTH {
             if y < SETTINGS_SIDEBAR_TOP - 4 {
                 return Ok(());
@@ -5322,27 +5733,40 @@ impl Aurora {
                 self.settings.sleep_after_secs =
                     self.settings.sleep_after_secs.saturating_sub(60).max(0);
                 self.apply_sleep_timeout();
+                save_app_commands(&self.settings)?;
                 self.redraw_settings()?;
             } else if x >= sx + 174 && x <= sx + 212 {
                 self.settings.sleep_after_secs = (self.settings.sleep_after_secs + 60).min(7200);
                 self.apply_sleep_timeout();
+                save_app_commands(&self.settings)?;
                 self.redraw_settings()?;
             }
         }
         Ok(())
     }
 
-    fn handle_power_click(&mut self, _x: i32, y: i32) -> AnyResult<()> {
+    fn handle_power_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        let width = i32::from(self.settings_geometry().2);
+        let input_x = width - 170;
+        if y >= 96 && y <= 126 && x >= input_x && x <= input_x + 118 {
+            self.settings.auto_power_saver_editing = true;
+            self.settings.auto_power_saver_input.clear();
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.ui.settings, CURRENT_TIME)?;
+            self.redraw_settings()?;
+            return Ok(());
+        }
         let modes = [
             PowerMode::Saver,
             PowerMode::Balanced,
             PowerMode::Performance,
         ];
         for (idx, mode) in modes.iter().enumerate() {
-            let row_y = 134 + idx as i32 * 24;
+            let row_y = 202 + idx as i32 * 24;
             if y >= row_y - 7 && y <= row_y + 18 {
-                self.settings.power_mode = *mode;
-                self.apply_power_mode(*mode);
+                self.settings.auto_power_saver_editing = false;
+                self.pending_auto_power_saver_apply = None;
+                self.set_power_mode(*mode)?;
                 self.redraw_settings()?;
                 return Ok(());
             }
@@ -5428,6 +5852,10 @@ impl Aurora {
     }
 
     fn handle_key_press(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
+        if self.is_alt_tab_key(&ev)? {
+            self.switch_to_next_running_app()?;
+            return Ok(());
+        }
         if ev.event == self.ui.folder_terminal && self.folder_terminal.visible {
             self.handle_folder_terminal_key(ev)?;
             return Ok(());
@@ -5436,11 +5864,7 @@ impl Aurora {
             self.handle_media_key(slot, ev)?;
             return Ok(());
         }
-        if ev.event != self.ui.settings
-            || self.settings.tab != SettingsTab::Apps
-            || self.settings.app_kind != DefaultAppKind::Terminal
-            || !self.settings.terminal_editing
-        {
+        if ev.event != self.ui.settings {
             return Ok(());
         }
         let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
@@ -5453,6 +5877,58 @@ impl Aurora {
         let Some(&keysym) = mapping.keysyms.get(column) else {
             return Ok(());
         };
+        if self.settings.tab == SettingsTab::Power && self.settings.auto_power_saver_editing {
+            let mut changed = false;
+            match keysym {
+                0xff08 => {
+                    self.settings.auto_power_saver_input.pop();
+                    changed = true;
+                }
+                0xff0d => {
+                    self.settings.auto_power_saver_editing = false;
+                    self.conn
+                        .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+                }
+                0xff1b => {
+                    self.settings.auto_power_saver_input =
+                        self.settings.auto_power_saver_minutes.to_string();
+                    self.settings.auto_power_saver_editing = false;
+                    self.pending_auto_power_saver_apply = None;
+                    self.conn
+                        .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+                }
+                0x30..=0x39 if self.settings.auto_power_saver_input.len() < 3 => {
+                    let digit = char::from_u32(keysym).unwrap();
+                    if self.settings.auto_power_saver_input == "0" {
+                        self.settings.auto_power_saver_input.clear();
+                    }
+                    self.settings.auto_power_saver_input.push(digit);
+                    changed = true;
+                }
+                _ => return Ok(()),
+            }
+            if changed {
+                self.settings.auto_power_saver_minutes = self
+                    .settings
+                    .auto_power_saver_input
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(0)
+                    .min(240);
+                if self.settings.auto_power_saver_input.is_empty() {
+                    self.settings.auto_power_saver_minutes = 0;
+                }
+                self.pending_auto_power_saver_apply = Some(Instant::now() + Duration::from_secs(3));
+            }
+            self.redraw_settings()?;
+            return Ok(());
+        }
+        if self.settings.tab != SettingsTab::Apps
+            || self.settings.app_kind != DefaultAppKind::Terminal
+            || !self.settings.terminal_editing
+        {
+            return Ok(());
+        }
         match keysym {
             0xff08 => {
                 self.settings.terminal_command.pop();
@@ -5479,6 +5955,31 @@ impl Aurora {
             _ => return Ok(()),
         }
         self.redraw_settings()?;
+        Ok(())
+    }
+
+    fn is_alt_tab_key(&self, ev: &KeyPressEvent) -> AnyResult<bool> {
+        if u16::from(ev.state) & u16::from(KeyButMask::MOD1) == 0 {
+            return Ok(false);
+        }
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        Ok(mapping.keysyms.contains(&0xff09))
+    }
+
+    fn switch_to_next_running_app(&mut self) -> AnyResult<()> {
+        let windows = self.task_client_windows();
+        if windows.is_empty() {
+            return Ok(());
+        }
+        let next = if let Some(active) = self.active_client {
+            let pos = windows.iter().position(|&window| window == active);
+            windows[(pos.map_or(0, |idx| idx + 1)) % windows.len()]
+        } else {
+            windows[0]
+        };
+        self.focus_window(next)?;
+        self.redraw_dock()?;
+        self.conn.flush()?;
         Ok(())
     }
 
@@ -5592,6 +6093,82 @@ impl Aurora {
             self.conn.unmap_window(self.ui.app_menu)?;
         }
         Ok(())
+    }
+
+    fn toggle_aurora_menu(&mut self) -> AnyResult<()> {
+        self.aurora_menu_visible = !self.aurora_menu_visible;
+        if self.aurora_menu_visible {
+            self.app_menu_visible = false;
+            self.app_menu_more = false;
+            self.app_menu_scroll = 0;
+            let _ = self.conn.unmap_window(self.ui.app_menu);
+            self.aurora_menu_about = false;
+            let menu = self.aurora_menu_geometry();
+            self.conn.configure_window(
+                self.ui.aurora_menu,
+                &ConfigureWindowAux::new()
+                    .x(i32::from(menu.0))
+                    .y(i32::from(menu.1))
+                    .width(u32::from(menu.2))
+                    .height(u32::from(menu.3))
+                    .stack_mode(StackMode::ABOVE),
+            )?;
+            self.conn.map_window(self.ui.aurora_menu)?;
+            self.redraw_aurora_menu()?;
+        } else {
+            self.conn.unmap_window(self.ui.aurora_menu)?;
+        }
+        self.raise_ui()?;
+        Ok(())
+    }
+
+    fn hide_aurora_menu(&mut self) -> AnyResult<()> {
+        if self.aurora_menu_visible {
+            self.aurora_menu_visible = false;
+            self.aurora_menu_about = false;
+            self.conn.unmap_window(self.ui.aurora_menu)?;
+        }
+        Ok(())
+    }
+
+    fn handle_aurora_menu_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        if self.aurora_menu_about {
+            if (16..=92).contains(&x) && (230..=258).contains(&y) {
+                self.aurora_menu_about = false;
+                self.redraw_aurora_menu()?;
+            }
+            return Ok(());
+        }
+        if (56..=94).contains(&y) {
+            self.restart_aurora()?;
+        } else if (106..=144).contains(&y) {
+            self.aurora_menu_about = true;
+            self.redraw_aurora_menu()?;
+        }
+        Ok(())
+    }
+
+    fn restart_aurora(&mut self) -> AnyResult<()> {
+        save_app_commands(&self.settings)?;
+        let exe = env::current_exe()?;
+        let display = self.display.clone();
+        let display_id = display.trim_start_matches(':').replace(['/', '.'], "_");
+        let log_path = format!("/tmp/aurora-wm-display{display_id}.log");
+        let script = format!(
+            "sleep 0.35; exec {} > {} 2>&1",
+            shell_quote(&exe),
+            shell_quote_text(&log_path),
+        );
+        Command::new("setsid")
+            .arg("sh")
+            .arg("-c")
+            .arg(script)
+            .env("DISPLAY", display)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        process::exit(0);
     }
 
     fn show_folder(&mut self, mode: FolderMode, front: bool) -> AnyResult<()> {
@@ -6295,12 +6872,12 @@ impl Aurora {
                 terminal_selection_rects(selection, &rows, self.folder_terminal_cell_w(), cell_h)
             {
                 c.draw_round_rect(
-                     i32::from(rect.x),
-                     i32::from(rect.y),
-                     i32::from(rect.width),
-                     i32::from(rect.height),
-                     3,
-                     Color::rgba(175, 229, 245, 92),
+                    i32::from(rect.x),
+                    i32::from(rect.y),
+                    i32::from(rect.width),
+                    i32::from(rect.height),
+                    3,
+                    Color::rgba(175, 229, 245, 92),
                 );
             }
         }
@@ -6309,36 +6886,83 @@ impl Aurora {
             let row_chars: Vec<char> = row.chars().take(cols).collect();
             let mut col_idx = 0;
             while col_idx < row_chars.len() {
-                let fg_color_idx = self.folder_terminal.screen_fg.get(idx).and_then(|r| r.get(col_idx)).copied().unwrap_or(255);
-                let bg_color_idx = self.folder_terminal.screen_bg.get(idx).and_then(|r| r.get(col_idx)).copied().unwrap_or(255);
-                let is_bold = self.folder_terminal.screen_bold.get(idx).and_then(|r| r.get(col_idx)).copied().unwrap_or(false);
-                
+                let fg_color_idx = self
+                    .folder_terminal
+                    .screen_fg
+                    .get(idx)
+                    .and_then(|r| r.get(col_idx))
+                    .copied()
+                    .unwrap_or(255);
+                let bg_color_idx = self
+                    .folder_terminal
+                    .screen_bg
+                    .get(idx)
+                    .and_then(|r| r.get(col_idx))
+                    .copied()
+                    .unwrap_or(255);
+                let is_bold = self
+                    .folder_terminal
+                    .screen_bold
+                    .get(idx)
+                    .and_then(|r| r.get(col_idx))
+                    .copied()
+                    .unwrap_or(false);
+
                 let mut run_len = 1;
-                while col_idx + run_len < row_chars.len() 
-                    && self.folder_terminal.screen_fg.get(idx).and_then(|r| r.get(col_idx + run_len)).copied().unwrap_or(255) == fg_color_idx
-                    && self.folder_terminal.screen_bg.get(idx).and_then(|r| r.get(col_idx + run_len)).copied().unwrap_or(255) == bg_color_idx
-                    && self.folder_terminal.screen_bold.get(idx).and_then(|r| r.get(col_idx + run_len)).copied().unwrap_or(false) == is_bold
+                while col_idx + run_len < row_chars.len()
+                    && self
+                        .folder_terminal
+                        .screen_fg
+                        .get(idx)
+                        .and_then(|r| r.get(col_idx + run_len))
+                        .copied()
+                        .unwrap_or(255)
+                        == fg_color_idx
+                    && self
+                        .folder_terminal
+                        .screen_bg
+                        .get(idx)
+                        .and_then(|r| r.get(col_idx + run_len))
+                        .copied()
+                        .unwrap_or(255)
+                        == bg_color_idx
+                    && self
+                        .folder_terminal
+                        .screen_bold
+                        .get(idx)
+                        .and_then(|r| r.get(col_idx + run_len))
+                        .copied()
+                        .unwrap_or(false)
+                        == is_bold
                 {
                     run_len += 1;
                 }
-                
+
                 let run_chars = &row_chars[col_idx..col_idx + run_len];
                 let x_pos = 18 + col_idx as i32 * cell_w;
                 let width_px = run_len as i32 * cell_w;
-                
+
                 if bg_color_idx != 255 {
                     let bg_color = ansi_color(bg_color_idx);
                     c.draw_rect(x_pos, y, width_px, cell_h, bg_color);
                 }
-                
+
                 let run_str: String = run_chars.iter().collect();
                 let trimmed_len = run_str.trim_end().len();
                 if trimmed_len > 0 {
-                    let fg_color = if fg_color_idx == 255 { INK } else { ansi_color(fg_color_idx) };
-                    let font = if is_bold { &self.terminal_bold } else { &self.terminal_regular };
+                    let fg_color = if fg_color_idx == 255 {
+                        INK
+                    } else {
+                        ansi_color(fg_color_idx)
+                    };
+                    let font = if is_bold {
+                        &self.terminal_bold
+                    } else {
+                        &self.terminal_regular
+                    };
                     c.draw_text(font, &run_str[..trimmed_len], x_pos, y, font_size, fg_color);
                 }
-                
+
                 col_idx += run_len;
             }
         }
@@ -6385,7 +7009,12 @@ impl Aurora {
     }
 
     fn folder_terminal_cell_w(&self) -> i32 {
-        measure_text(&self.terminal_regular, "A", self.folder_terminal_font_size()).max(6)
+        measure_text(
+            &self.terminal_regular,
+            "A",
+            self.folder_terminal_font_size(),
+        )
+        .max(6)
     }
 
     fn folder_terminal_cell_h(&self) -> i32 {
@@ -7037,53 +7666,105 @@ impl Aurora {
         }
         match command {
             'H' | 'f' => {
-                let row = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
-                let col = values.get(1).copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
+                let row = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                let col = values
+                    .get(1)
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1)
+                    .saturating_sub(1);
                 self.folder_terminal.cursor_y = row.min(rows - 1);
                 self.folder_terminal.cursor_x = col.min(cols - 1);
             }
             'A' => {
-                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let amt = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.saturating_sub(amt);
             }
             'B' => {
-                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let amt = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y + amt).min(rows - 1);
             }
             'C' => {
-                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let amt = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.folder_terminal.cursor_x = (self.folder_terminal.cursor_x + amt).min(cols - 1);
             }
             'D' => {
-                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let amt = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.folder_terminal.cursor_x = self.folder_terminal.cursor_x.saturating_sub(amt);
             }
             'E' => {
-                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let amt = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.folder_terminal.cursor_y = (self.folder_terminal.cursor_y + amt).min(rows - 1);
                 self.folder_terminal.cursor_x = 0;
             }
             'F' => {
-                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let amt = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.folder_terminal.cursor_y = self.folder_terminal.cursor_y.saturating_sub(amt);
                 self.folder_terminal.cursor_x = 0;
             }
             'G' => {
-                let col = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
+                let col = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1)
+                    .saturating_sub(1);
                 self.folder_terminal.cursor_x = col.min(cols - 1);
             }
             'I' => {
-                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let amt = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 let next = ((self.folder_terminal.cursor_x / 8) + amt) * 8;
                 self.folder_terminal.cursor_x = next.min(cols - 1);
             }
             'Z' => {
-                let amt = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let amt = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 let previous = (self.folder_terminal.cursor_x / 8).saturating_sub(amt) * 8;
                 self.folder_terminal.cursor_x = previous.min(cols - 1);
             }
             'd' => {
-                let row = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
+                let row = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1)
+                    .saturating_sub(1);
                 self.folder_terminal.cursor_y = row.min(rows - 1);
             }
             'J' => match values.first().copied().unwrap_or(0) {
@@ -7154,9 +7835,15 @@ impl Aurora {
                 }
             }
             'X' => {
-                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let count = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 let y = self.folder_terminal.cursor_y.min(rows - 1);
-                for x in self.folder_terminal.cursor_x..(self.folder_terminal.cursor_x + count).min(cols) {
+                for x in
+                    self.folder_terminal.cursor_x..(self.folder_terminal.cursor_x + count).min(cols)
+                {
                     self.folder_terminal.screen[y][x] = ' ';
                     self.folder_terminal.screen_fg[y][x] = 255;
                     self.folder_terminal.screen_bg[y][x] = 255;
@@ -7164,15 +7851,23 @@ impl Aurora {
                 }
             }
             'P' => {
-                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).min(cols);
+                let count = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1)
+                    .min(cols);
                 let y = self.folder_terminal.cursor_y.min(rows - 1);
                 for x in self.folder_terminal.cursor_x..cols {
                     let src = x + count;
                     if src < cols {
                         self.folder_terminal.screen[y][x] = self.folder_terminal.screen[y][src];
-                        self.folder_terminal.screen_fg[y][x] = self.folder_terminal.screen_fg[y][src];
-                        self.folder_terminal.screen_bg[y][x] = self.folder_terminal.screen_bg[y][src];
-                        self.folder_terminal.screen_bold[y][x] = self.folder_terminal.screen_bold[y][src];
+                        self.folder_terminal.screen_fg[y][x] =
+                            self.folder_terminal.screen_fg[y][src];
+                        self.folder_terminal.screen_bg[y][x] =
+                            self.folder_terminal.screen_bg[y][src];
+                        self.folder_terminal.screen_bold[y][x] =
+                            self.folder_terminal.screen_bold[y][src];
                     } else {
                         self.folder_terminal.screen[y][x] = ' ';
                         self.folder_terminal.screen_fg[y][x] = 255;
@@ -7243,28 +7938,58 @@ impl Aurora {
                 }
             }
             '@' => {
-                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let count = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.terminal_insert_blanks(count);
             }
             'L' => {
-                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let count = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.terminal_insert_lines(count);
             }
             'M' => {
-                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let count = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.terminal_delete_lines(count);
             }
             'S' => {
-                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let count = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.terminal_scroll_up(count);
             }
             'T' => {
-                let count = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1);
+                let count = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1);
                 self.terminal_scroll_down(count);
             }
             'r' => {
-                let top = values.first().copied().map(|v| if v == 0 { 1 } else { v }).unwrap_or(1).saturating_sub(1);
-                let bottom = values.get(1).copied().map(|v| if v == 0 { rows } else { v }).unwrap_or(rows).saturating_sub(1);
+                let top = values
+                    .first()
+                    .copied()
+                    .map(|v| if v == 0 { 1 } else { v })
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                let bottom = values
+                    .get(1)
+                    .copied()
+                    .map(|v| if v == 0 { rows } else { v })
+                    .unwrap_or(rows)
+                    .saturating_sub(1);
                 if top < bottom && bottom < rows {
                     self.folder_terminal.scroll_top = top;
                     self.folder_terminal.scroll_bottom = bottom;
@@ -7361,13 +8086,16 @@ impl Aurora {
                 self.folder_terminal.normal_screen = Some(self.folder_terminal.screen.clone());
             }
             if self.folder_terminal.normal_screen_fg.is_none() {
-                self.folder_terminal.normal_screen_fg = Some(self.folder_terminal.screen_fg.clone());
+                self.folder_terminal.normal_screen_fg =
+                    Some(self.folder_terminal.screen_fg.clone());
             }
             if self.folder_terminal.normal_screen_bg.is_none() {
-                self.folder_terminal.normal_screen_bg = Some(self.folder_terminal.screen_bg.clone());
+                self.folder_terminal.normal_screen_bg =
+                    Some(self.folder_terminal.screen_bg.clone());
             }
             if self.folder_terminal.normal_screen_bold.is_none() {
-                self.folder_terminal.normal_screen_bold = Some(self.folder_terminal.screen_bold.clone());
+                self.folder_terminal.normal_screen_bold =
+                    Some(self.folder_terminal.screen_bold.clone());
             }
             self.folder_terminal.screen = vec![vec![' '; cols]; rows];
             self.folder_terminal.screen_fg = vec![vec![255; cols]; rows];
@@ -7404,11 +8132,21 @@ impl Aurora {
         let y = self.folder_terminal.cursor_y;
         let count = count.min(cols);
         for x in (self.folder_terminal.cursor_x..cols).rev() {
-            let src_opt = x.checked_sub(count).filter(|src| *src >= self.folder_terminal.cursor_x);
-            self.folder_terminal.screen[y][x] = src_opt.map(|src| self.folder_terminal.screen[y][src]).unwrap_or(' ');
-            self.folder_terminal.screen_fg[y][x] = src_opt.map(|src| self.folder_terminal.screen_fg[y][src]).unwrap_or(255);
-            self.folder_terminal.screen_bg[y][x] = src_opt.map(|src| self.folder_terminal.screen_bg[y][src]).unwrap_or(255);
-            self.folder_terminal.screen_bold[y][x] = src_opt.map(|src| self.folder_terminal.screen_bold[y][src]).unwrap_or(false);
+            let src_opt = x
+                .checked_sub(count)
+                .filter(|src| *src >= self.folder_terminal.cursor_x);
+            self.folder_terminal.screen[y][x] = src_opt
+                .map(|src| self.folder_terminal.screen[y][src])
+                .unwrap_or(' ');
+            self.folder_terminal.screen_fg[y][x] = src_opt
+                .map(|src| self.folder_terminal.screen_fg[y][src])
+                .unwrap_or(255);
+            self.folder_terminal.screen_bg[y][x] = src_opt
+                .map(|src| self.folder_terminal.screen_bg[y][src])
+                .unwrap_or(255);
+            self.folder_terminal.screen_bold[y][x] = src_opt
+                .map(|src| self.folder_terminal.screen_bold[y][src])
+                .unwrap_or(false);
         }
     }
 
@@ -7458,15 +8196,21 @@ impl Aurora {
             self.folder_terminal
                 .screen_fg
                 .remove(self.folder_terminal.cursor_y);
-            self.folder_terminal.screen_fg.insert(bottom, vec![255; cols]);
+            self.folder_terminal
+                .screen_fg
+                .insert(bottom, vec![255; cols]);
             self.folder_terminal
                 .screen_bg
                 .remove(self.folder_terminal.cursor_y);
-            self.folder_terminal.screen_bg.insert(bottom, vec![255; cols]);
+            self.folder_terminal
+                .screen_bg
+                .insert(bottom, vec![255; cols]);
             self.folder_terminal
                 .screen_bold
                 .remove(self.folder_terminal.cursor_y);
-            self.folder_terminal.screen_bold.insert(bottom, vec![false; cols]);
+            self.folder_terminal
+                .screen_bold
+                .insert(bottom, vec![false; cols]);
         }
     }
 
@@ -7492,9 +8236,15 @@ impl Aurora {
                 }
             }
             self.folder_terminal.screen.insert(bottom, vec![' '; cols]);
-            self.folder_terminal.screen_fg.insert(bottom, vec![255; cols]);
-            self.folder_terminal.screen_bg.insert(bottom, vec![255; cols]);
-            self.folder_terminal.screen_bold.insert(bottom, vec![false; cols]);
+            self.folder_terminal
+                .screen_fg
+                .insert(bottom, vec![255; cols]);
+            self.folder_terminal
+                .screen_bg
+                .insert(bottom, vec![255; cols]);
+            self.folder_terminal
+                .screen_bold
+                .insert(bottom, vec![false; cols]);
         }
     }
 
@@ -7513,7 +8263,9 @@ impl Aurora {
             self.folder_terminal.screen.insert(top, vec![' '; cols]);
             self.folder_terminal.screen_fg.insert(top, vec![255; cols]);
             self.folder_terminal.screen_bg.insert(top, vec![255; cols]);
-            self.folder_terminal.screen_bold.insert(top, vec![false; cols]);
+            self.folder_terminal
+                .screen_bold
+                .insert(top, vec![false; cols]);
         }
     }
 
@@ -8467,10 +9219,19 @@ impl Aurora {
         spawn_detached(cmd);
     }
 
-    fn apply_power_mode(&self, mode: PowerMode) {
+    fn set_power_mode(&mut self, mode: PowerMode) -> AnyResult<()> {
+        let status = Command::new("powerprofilesctl")
+            .args(["set", mode.command_value()])
+            .status();
+        if status.as_ref().is_ok_and(|status| status.success()) {
+            self.settings.power_mode = mode;
+            return Ok(());
+        }
         let mut cmd = Command::new("powerprofilesctl");
         cmd.args(["set", mode.command_value()]);
         spawn_detached(cmd);
+        self.settings.power_mode = mode;
+        Ok(())
     }
 
     fn selected_app_command(&self, kind: DefaultAppKind) -> &str {
@@ -8653,6 +9414,15 @@ impl Aurora {
                 .width(u32::from(menu.2))
                 .height(u32::from(menu.3)),
         )?;
+        let aurora_menu = self.aurora_menu_geometry();
+        self.conn.configure_window(
+            self.ui.aurora_menu,
+            &ConfigureWindowAux::new()
+                .x(i32::from(aurora_menu.0))
+                .y(i32::from(aurora_menu.1))
+                .width(u32::from(aurora_menu.2))
+                .height(u32::from(aurora_menu.3)),
+        )?;
         self.conn.configure_window(
             self.ui.screenshot_overlay,
             &ConfigureWindowAux::new()
@@ -8734,6 +9504,12 @@ impl Aurora {
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
+        if self.aurora_menu_visible {
+            self.conn.configure_window(
+                self.ui.aurora_menu,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
         Ok(())
     }
 
@@ -8745,6 +9521,12 @@ impl Aurora {
         if self.app_menu_visible {
             self.conn.configure_window(
                 self.ui.app_menu,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
+        if self.aurora_menu_visible {
+            self.conn.configure_window(
+                self.ui.aurora_menu,
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
@@ -8976,6 +9758,12 @@ impl Aurora {
         (x, y, width, height)
     }
 
+    fn aurora_menu_geometry(&self) -> (i16, i16, u16, u16) {
+        let width = 390u16.min(self.screen_width.saturating_sub(24)).max(260);
+        let height = if self.aurora_menu_about { 276 } else { 168 };
+        (12, TOPBAR_HEIGHT as i16 + 8, width, height)
+    }
+
     fn media_geometry(&self, slot: usize) -> (i16, i16, u16, u16) {
         let folder = self.folder_geometry();
         let width = MEDIA_WIDTH
@@ -9054,6 +9842,7 @@ impl Aurora {
             || window == self.ui.folder_terminal
             || window == self.ui.screenshot_overlay
             || window == self.ui.app_menu
+            || window == self.ui.aurora_menu
             || self.ui.media.contains(&window)
     }
 
@@ -10608,6 +11397,70 @@ fn read_cpu_status(cpu_usage: f32) -> String {
     temp.unwrap_or_else(|| format!("{}% load", cpu_usage.round()))
 }
 
+fn read_cpu_frequencies() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
+        let mut cpus = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let idx = name.strip_prefix("cpu")?.parse::<usize>().ok()?;
+                Some((idx, entry.path()))
+            })
+            .collect::<Vec<_>>();
+        cpus.sort_by_key(|(idx, _)| *idx);
+        for (idx, path) in cpus {
+            let freq_path = path.join("cpufreq/scaling_cur_freq");
+            let fallback_path = path.join("cpufreq/cpuinfo_cur_freq");
+            let freq = fs::read_to_string(&freq_path)
+                .or_else(|_| fs::read_to_string(&fallback_path))
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok());
+            if let Some(khz) = freq {
+                out.push(format!("c{idx}: {:.2}GHz", khz as f64 / 1_000_000.0));
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    let Ok(text) = fs::read_to_string("/proc/cpuinfo") else {
+        return out;
+    };
+    for (idx, mhz) in text
+        .lines()
+        .filter_map(|line| line.strip_prefix("cpu MHz").and_then(|v| v.split_once(':')))
+        .filter_map(|(_, v)| v.trim().parse::<f64>().ok())
+        .enumerate()
+    {
+        out.push(format!("c{idx}: {:.2}GHz", mhz / 1000.0));
+    }
+    out
+}
+
+fn cpu_frequency_lines(freqs: &[String], max_chars: usize) -> Vec<String> {
+    if freqs.is_empty() {
+        return vec!["No CPU frequency data".to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for freq in freqs {
+        let sep = if line.is_empty() { "" } else { "  " };
+        if !line.is_empty() && line.len() + sep.len() + freq.len() > max_chars {
+            lines.push(line);
+            line = String::new();
+        }
+        if !line.is_empty() {
+            line.push_str(sep);
+        }
+        line.push_str(freq);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 fn read_memory() -> (u64, u64, u64, u64) {
     let Ok(text) = fs::read_to_string("/proc/meminfo") else {
         return (0, 0, 0, 0);
@@ -10764,16 +11617,25 @@ fn terminal_settings_path() -> PathBuf {
     home_dir().join(".config/aurora-wm/settings.conf")
 }
 
-fn read_app_command(kind: DefaultAppKind) -> String {
+fn read_setting_value(key: &str) -> Option<String> {
     fs::read_to_string(terminal_settings_path())
         .ok()
         .and_then(|text| {
             text.lines().find_map(|line| {
-                line.strip_prefix(&format!("{}=", kind.key()))
-                    .map(str::to_string)
+                let (line_key, value) = line.split_once('=')?;
+                (line_key == key).then(|| value.to_string())
             })
         })
-        .unwrap_or_default()
+}
+
+fn read_u32_setting(key: &str, fallback: u32) -> u32 {
+    read_setting_value(key)
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(fallback)
+}
+
+fn read_app_command(kind: DefaultAppKind) -> String {
+    read_setting_value(kind.key()).unwrap_or_default()
 }
 
 fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
@@ -10785,11 +11647,13 @@ fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
     fs::write(
         path,
         format!(
-            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\n",
+            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nauto_power_saver_minutes={}\n",
             clean(&settings.terminal_command),
             clean(&settings.browser_command),
             clean(&settings.photo_command),
             clean(&settings.video_command),
+            settings.sleep_after_secs.min(7200),
+            settings.auto_power_saver_minutes.min(240),
         ),
     )?;
     Ok(())
@@ -10991,14 +11855,6 @@ fn read_battery() -> Option<String> {
         return Some(format!("{}% {}", cap.trim(), status.trim()));
     }
     None
-}
-
-fn percent(used: u64, total: u64) -> f32 {
-    if total == 0 {
-        0.0
-    } else {
-        (used as f32 * 100.0 / total as f32).clamp(0.0, 100.0)
-    }
 }
 
 fn format_kib(kib: u64) -> String {
@@ -11488,22 +12344,22 @@ fn terminal_display_char(ch: char, line_drawing: bool) -> char {
 
 fn ansi_color(idx: u8) -> Color {
     match idx {
-        0 => Color::rgb(40, 40, 40),       // Black
-        1 => Color::rgb(205, 0, 0),        // Red
-        2 => Color::rgb(0, 205, 0),        // Green
-        3 => Color::rgb(205, 205, 0),      // Yellow
-        4 => Color::rgb(0, 0, 238),        // Blue
-        5 => Color::rgb(205, 0, 205),      // Magenta
-        6 => Color::rgb(0, 205, 205),      // Cyan
-        7 => Color::rgb(229, 229, 229),    // White
-        8 => Color::rgb(127, 127, 127),    // Bright Black
-        9 => Color::rgb(255, 0, 0),        // Bright Red
-        10 => Color::rgb(0, 255, 0),       // Bright Green
-        11 => Color::rgb(255, 255, 0),     // Bright Yellow
-        12 => Color::rgb(92, 92, 255),     // Bright Blue
-        13 => Color::rgb(255, 0, 255),     // Bright Magenta
-        14 => Color::rgb(0, 255, 255),     // Bright Cyan
-        15 => Color::rgb(255, 255, 255),   // Bright White
+        0 => Color::rgb(40, 40, 40),     // Black
+        1 => Color::rgb(205, 0, 0),      // Red
+        2 => Color::rgb(0, 205, 0),      // Green
+        3 => Color::rgb(205, 205, 0),    // Yellow
+        4 => Color::rgb(0, 0, 238),      // Blue
+        5 => Color::rgb(205, 0, 205),    // Magenta
+        6 => Color::rgb(0, 205, 205),    // Cyan
+        7 => Color::rgb(229, 229, 229),  // White
+        8 => Color::rgb(127, 127, 127),  // Bright Black
+        9 => Color::rgb(255, 0, 0),      // Bright Red
+        10 => Color::rgb(0, 255, 0),     // Bright Green
+        11 => Color::rgb(255, 255, 0),   // Bright Yellow
+        12 => Color::rgb(92, 92, 255),   // Bright Blue
+        13 => Color::rgb(255, 0, 255),   // Bright Magenta
+        14 => Color::rgb(0, 255, 255),   // Bright Cyan
+        15 => Color::rgb(255, 255, 255), // Bright White
         16..=231 => {
             let offset = idx - 16;
             let r = offset / 36;
@@ -11571,6 +12427,10 @@ fn command_exists(name: &str) -> bool {
                 .find(|path| path.exists())
         })
         .is_some()
+}
+
+fn shell_quote_text(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 fn spawn_detached(mut cmd: Command) {
