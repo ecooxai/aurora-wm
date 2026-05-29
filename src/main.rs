@@ -641,6 +641,7 @@ struct UiWindows {
     app_menu: Window,
     aurora_menu: Window,
     media: [Window; MEDIA_SLOT_COUNT],
+    dock_more_menu: Window,
 }
 
 #[derive(Clone, Copy)]
@@ -1156,8 +1157,11 @@ struct Aurora {
     app_menu_visible: bool,
     app_menu_more: bool,
     app_menu_scroll: usize,
+    dock_more_visible: bool,
     aurora_menu_visible: bool,
     aurora_menu_about: bool,
+    aurora_menu_restart_confirm: bool,
+    wm_s_atom: Atom,
     folder_context_open: bool,
     folder_context_pos: (i32, i32),
     folder_clipboard: Option<(PathBuf, bool)>,
@@ -1193,12 +1197,73 @@ fn main() {
 }
 
 fn run() -> AnyResult<()> {
+    let args: Vec<String> = env::args().collect();
+    let replace = args.iter().any(|arg| arg == "--replace");
+
     let display = env::var("DISPLAY").unwrap_or_else(|_| ":111".to_string());
     let (conn, screen_num) = RustConnection::connect(Some(&display))?;
     let screen = conn.setup().roots[screen_num].clone();
-    become_wm(&conn, &screen)?;
 
-    let mut app = Aurora::new(conn, display, &screen)?;
+    // Acquire WM_S<screen_num> selection to announce presence and/or replace existing WM
+    let selection_name = format!("WM_S{}", screen_num);
+    let wm_s_atom = conn.intern_atom(false, selection_name.as_bytes())?.reply()?.atom;
+
+    let wm_window = conn.generate_id()?;
+    conn.create_window(
+        x11rb::COPY_FROM_PARENT as u8,
+        wm_window,
+        screen.root,
+        -10, -10, 1, 1, 0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new(),
+    )?;
+
+    if replace {
+        conn.set_selection_owner(wm_window, wm_s_atom, CURRENT_TIME)?;
+        let manager_atom = conn.intern_atom(false, b"MANAGER")?.reply()?.atom;
+        let client_message = ClientMessageEvent {
+            response_type: CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: screen.root,
+            type_: manager_atom,
+            data: ClientMessageData::from([
+                CURRENT_TIME,
+                wm_s_atom,
+                wm_window,
+                0, 0,
+            ]),
+        };
+        conn.send_event(false, screen.root, EventMask::STRUCTURE_NOTIFY, client_message)?;
+    }
+
+    // Now try to become WM (with retries if --replace)
+    let mut retry_count = 0;
+    loop {
+        match become_wm(&conn, &screen) {
+            Ok(()) => break,
+            Err(err) => {
+                if replace && retry_count < 15 {
+                    retry_count += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    continue;
+                }
+                if let ReplyError::X11Error(ref x11_err) = err {
+                    if x11_err.error_kind == ErrorKind::Access {
+                        eprintln!("Another window manager already owns this X display.");
+                    }
+                }
+                return Err(err.into());
+            }
+        }
+    }
+
+    if !replace {
+        conn.set_selection_owner(wm_window, wm_s_atom, CURRENT_TIME)?;
+    }
+
+    let mut app = Aurora::new(conn, display, &screen, screen_num)?;
     app.scan_existing_windows()?;
     app.redraw_everything()?;
     app.run_loop()
@@ -1210,18 +1275,11 @@ fn become_wm(conn: &RustConnection, screen: &Screen) -> Result<(), ReplyError> {
         | EventMask::STRUCTURE_NOTIFY
         | EventMask::PROPERTY_CHANGE
         | EventMask::BUTTON_PRESS;
-    let res = conn
-        .change_window_attributes(
-            screen.root,
-            &ChangeWindowAttributesAux::new().event_mask(mask),
-        )?
-        .check();
-    if let Err(ReplyError::X11Error(ref err)) = res {
-        if err.error_kind == ErrorKind::Access {
-            eprintln!("Another window manager already owns this X display.");
-        }
-    }
-    res
+    conn.change_window_attributes(
+        screen.root,
+        &ChangeWindowAttributesAux::new().event_mask(mask),
+    )?
+    .check()
 }
 
 fn init_light_compositor(conn: &RustConnection, root: Window) -> bool {
@@ -1255,7 +1313,7 @@ fn init_light_compositor(conn: &RustConnection, root: Window) -> bool {
 }
 
 impl Aurora {
-    fn new(conn: RustConnection, display: String, screen: &Screen) -> AnyResult<Self> {
+    fn new(conn: RustConnection, display: String, screen: &Screen, screen_num: usize) -> AnyResult<Self> {
         let gc = conn.generate_id()?;
         conn.create_gc(
             gc,
@@ -1308,6 +1366,7 @@ impl Aurora {
                 conn.generate_id()?,
                 conn.generate_id()?,
             ],
+            dock_more_menu: conn.generate_id()?,
         };
         let mut sampler = SystemSampler::new();
         let metrics = sampler.sample();
@@ -1317,6 +1376,7 @@ impl Aurora {
         let workspace_ui = (0..DEFAULT_WORKSPACE_COUNT)
             .map(|_| WorkspaceUiState::new(screen.height_in_pixels))
             .collect();
+        let wm_s_atom = conn.intern_atom(false, format!("WM_S{}", screen_num).as_bytes())?.reply()?.atom;
         let mut app = Self {
             conn,
             display,
@@ -1388,8 +1448,11 @@ impl Aurora {
             app_menu_visible: false,
             app_menu_more: false,
             app_menu_scroll: 0,
+            dock_more_visible: false,
             aurora_menu_visible: false,
             aurora_menu_about: false,
+            aurora_menu_restart_confirm: false,
+            wm_s_atom,
             folder_context_open: false,
             folder_context_pos: (0, 0),
             folder_clipboard: None,
@@ -1806,6 +1869,26 @@ impl Aurora {
             &menu_aux,
         )?;
 
+        let more_menu = self.dock_more_menu_geometry();
+        let more_menu_aux = CreateWindowAux::new()
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
+            .cursor(self.cursor)
+            .background_pixel(0);
+        self.conn.create_window(
+            self.depth,
+            self.ui.dock_more_menu,
+            self.root,
+            more_menu.0,
+            more_menu.1,
+            more_menu.2,
+            more_menu.3,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual,
+            &more_menu_aux,
+        )?;
+
         let aurora_menu = self.aurora_menu_geometry();
         let aurora_menu_aux = CreateWindowAux::new()
             .override_redirect(1)
@@ -1899,6 +1982,7 @@ impl Aurora {
             self.ui.folder_terminal,
             self.ui.app_menu,
             self.ui.aurora_menu,
+            self.ui.dock_more_menu,
         ];
         windows.extend(self.ui.media);
         windows.extend(self.clients.values().map(|info| info.frame));
@@ -1982,6 +2066,11 @@ impl Aurora {
             Event::ClientMessage(ev) => self.handle_client_message(ev)?,
             Event::SelectionRequest(ev) => self.handle_selection_request(ev)?,
             Event::SelectionNotify(ev) => self.handle_selection_notify(ev)?,
+            Event::SelectionClear(ev) => {
+                if ev.selection == self.wm_s_atom {
+                    std::process::exit(0);
+                }
+            }
             Event::MapRequest(ev) => self.manage_window(ev.window)?,
             Event::MapNotify(ev) => {
                 if ev.event == self.root && !ev.override_redirect {
@@ -2034,6 +2123,8 @@ impl Aurora {
             self.redraw_app_menu()?;
         } else if ev.window == self.ui.aurora_menu && self.aurora_menu_visible {
             self.redraw_aurora_menu()?;
+        } else if ev.window == self.ui.dock_more_menu && self.dock_more_visible {
+            self.redraw_dock_more_menu()?;
         } else if let Some(slot) = self.media_slot_for_window(ev.window) {
             if self
                 .media_slots
@@ -2057,6 +2148,9 @@ impl Aurora {
     }
 
     fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
+        if self.dock_more_visible && ev.event != self.ui.dock_more_menu && ev.event != self.ui.dock {
+            self.hide_dock_more_menu()?;
+        }
         if self.aurora_menu_visible && ev.event != self.ui.topbar && ev.event != self.ui.aurora_menu
         {
             let (mx, my, mw, mh) = self.aurora_menu_geometry();
@@ -2154,6 +2248,8 @@ impl Aurora {
             self.handle_app_menu_click(ev.detail, i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if ev.event == self.ui.aurora_menu {
             self.handle_aurora_menu_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
+        } else if ev.event == self.ui.dock_more_menu {
+            self.handle_dock_more_menu_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if let Some(slot) = self.media_slot_for_window(ev.event) {
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_media_scroll(slot, ev.detail)?;
@@ -2712,7 +2808,10 @@ impl Aurora {
 
     fn handle_topbar_press_x(&mut self, x: i32) -> AnyResult<bool> {
         let controls = self.topbar_controls();
-        if (0..=126).contains(&x) {
+        let brand_x = 24;
+        let aurora_width = measure_text(&self.bold, "Aurora", 16.0);
+        let aurora_end = brand_x + 23 + aurora_width;
+        if (0..=aurora_end).contains(&x) {
             self.toggle_aurora_menu()?;
             return Ok(true);
         }
@@ -3255,6 +3354,7 @@ impl Aurora {
     }
 
     fn focus_window_at(&mut self, window: Window, time: Timestamp) -> AnyResult<()> {
+        self.hide_dock_more_menu()?;
         let Some(client) = self.client_key_for(window) else {
             return Ok(());
         };
@@ -3497,6 +3597,9 @@ impl Aurora {
         }
         self.redraw_topbar()?;
         self.redraw_dock()?;
+        if self.dock_more_visible {
+            self.redraw_dock_more_menu()?;
+        }
         self.redraw_settings()?;
         if self.app_menu_visible {
             self.redraw_app_menu()?;
@@ -3657,6 +3760,11 @@ impl Aurora {
     }
 
     fn redraw_dock(&mut self) -> AnyResult<()> {
+        let task_windows = self.task_client_windows();
+        if task_windows.len() <= 10 {
+            let _ = self.hide_dock_more_menu();
+        }
+
         let (x, y, w, h) = self.dock_geometry();
         self.conn.configure_window(
             self.ui.dock,
@@ -3676,7 +3784,6 @@ impl Aurora {
         );
 
         let buttons = self.dock_button_count();
-        let task_windows = self.task_client_windows();
         let stride = 58;
         let total = buttons as i32 * stride - 12;
         let mut bx = (i32::from(w) - total) / 2;
@@ -3703,6 +3810,20 @@ impl Aurora {
                     Color::rgba(196, 219, 229, 95),
                 );
                 draw_dock_icon(&mut c, i, icon_x + 22, icon_y + 22);
+            } else if i == 15 && task_windows.len() > 10 {
+                c.draw_round_rect(icon_x, icon_y, 44, 44, 12, Color::rgba(255, 255, 255, 215));
+                c.draw_round_rect(
+                    icon_x + 1,
+                    icon_y + 1,
+                    42,
+                    42,
+                    11,
+                    Color::rgba(196, 219, 229, 95),
+                );
+                let dot_color = Color::rgba(44, 77, 91, 220);
+                c.draw_circle(icon_x + 14, icon_y + 22, 3, dot_color);
+                c.draw_circle(icon_x + 22, icon_y + 22, 3, dot_color);
+                c.draw_circle(icon_x + 30, icon_y + 22, 3, dot_color);
             } else if let Some(client) = task_windows
                 .get(i - 5)
                 .and_then(|window| self.clients.get(window))
@@ -4161,7 +4282,7 @@ impl Aurora {
                 &self.regular,
                 "A small X11 desktop shell with dock, folders, media viewer,",
                 18,
-                88,
+                84,
                 11.0,
                 INK,
             );
@@ -4169,16 +4290,24 @@ impl Aurora {
                 &self.regular,
                 "settings, screenshots, and lightweight window controls.",
                 18,
-                106,
+                100,
                 11.0,
                 INK,
             );
-            c.draw_text(&self.bold, "Help", 18, 140, 13.0, INK);
+            c.draw_text(
+                &self.bold,
+                &format!("Display: {}", self.display),
+                18,
+                118,
+                11.0,
+                MINT_DARK,
+            );
+            c.draw_text(&self.bold, "Help", 18, 142, 13.0, INK);
             c.draw_text(
                 &self.regular,
                 "Alt+Tab switches running apps.",
                 18,
-                164,
+                162,
                 11.0,
                 MUTED,
             );
@@ -4186,7 +4315,7 @@ impl Aurora {
                 &self.regular,
                 "Use the dock for apps and settings; drag titlebars to move windows.",
                 18,
-                182,
+                180,
                 11.0,
                 MUTED,
             );
@@ -4194,21 +4323,16 @@ impl Aurora {
                 &self.regular,
                 "Bottom corners resize windows; settings are saved in ~/.config/aurora-wm.",
                 18,
-                200,
+                198,
                 11.0,
                 MUTED,
             );
             c.draw_round_rect(16, 230, 76, 28, 8, Color::rgba(234, 244, 248, 220));
             c.draw_text_center(&self.bold, "Back", 54, 238, 12.0, MINT_DARK);
         } else {
-            for (idx, (label, hint)) in [
-                ("Restart WM", "Reload Aurora and keep saved settings"),
-                ("About Aurora", "Version, description, and quick help"),
-            ]
-            .iter()
-            .enumerate()
+            // Draw Restart WM
             {
-                let row_y = 64 + idx as i32 * 50;
+                let row_y = 64;
                 c.draw_round_rect(
                     14,
                     row_y - 8,
@@ -4217,8 +4341,49 @@ impl Aurora {
                     9,
                     Color::rgba(255, 255, 255, 150),
                 );
-                c.draw_text(&self.bold, label, 28, row_y, 13.0, INK);
-                c.draw_text(&self.regular, hint, 28, row_y + 17, 10.0, MUTED);
+                draw_reload_menu_icon(&mut c, 32, row_y + 11, MINT_DARK);
+                c.draw_text(&self.bold, "Restart WM", 50, row_y, 13.0, INK);
+                c.draw_text(&self.regular, "Reload Aurora and keep saved settings", 50, row_y + 17, 10.0, MUTED);
+            }
+
+            let mut next_row_y = 114;
+
+            if self.aurora_menu_restart_confirm {
+                c.draw_round_rect(
+                    14,
+                    102,
+                    i32::from(w) - 28,
+                    46,
+                    9,
+                    Color::rgba(238, 245, 248, 220),
+                );
+                c.draw_text(&self.bold, "Confirm?", 28, 118, 12.0, INK);
+
+                // Yes button
+                c.draw_round_rect(160, 110, 90, 28, 6, Color::rgba(232, 74, 95, 210));
+                c.draw_text_center(&self.bold, "Yes", 205, 118, 12.0, Color::rgb(255, 255, 255));
+
+                // No button
+                c.draw_round_rect(270, 110, 90, 28, 6, Color::rgba(200, 215, 225, 180));
+                c.draw_text_center(&self.bold, "No", 315, 118, 12.0, INK);
+
+                next_row_y = 166;
+            }
+
+            // Draw About Aurora
+            {
+                let row_y = next_row_y;
+                c.draw_round_rect(
+                    14,
+                    row_y - 8,
+                    i32::from(w) - 28,
+                    38,
+                    9,
+                    Color::rgba(255, 255, 255, 150),
+                );
+                draw_info_menu_icon(&mut c, 32, row_y + 11, MINT_LIGHT);
+                c.draw_text(&self.bold, "About Aurora", 50, row_y, 13.0, INK);
+                c.draw_text(&self.regular, "Version, description, and quick help", 50, row_y + 17, 10.0, MUTED);
             }
         }
         self.upload_canvas(self.ui.aurora_menu, &c)
@@ -5316,7 +5481,7 @@ impl Aurora {
             12.0,
             MUTED,
         );
-        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 220);
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 248);
         c.draw_text(&self.bold, "Computer", sx + 16, 106, 15.0, INK);
         let cpu = compact(&self.metrics.cpu_model, 34);
         draw_info_row(c, &self.regular, sx + 16, 136, "CPU", &cpu);
@@ -5364,31 +5529,32 @@ impl Aurora {
             compact(&self.metrics.nics.join(", "), 32)
         };
         draw_info_row(c, &self.regular, sx + 16, 276, "NIC", &nics);
+        draw_info_row(c, &self.regular, sx + 16, 304, "Display", &self.display);
 
-        draw_card(c, sx, 326, i32::from(c.width) - sx - 24, 154);
-        c.draw_text(&self.bold, "Network speed", sx + 16, 348, 15.0, INK);
-        c.draw_text(&self.regular, "Down", sx + 16, 380, 12.0, MUTED);
+        draw_card(c, sx, 354, i32::from(c.width) - sx - 24, 154);
+        c.draw_text(&self.bold, "Network speed", sx + 16, 376, 15.0, INK);
+        c.draw_text(&self.regular, "Down", sx + 16, 408, 12.0, MUTED);
         c.draw_text(
             &self.bold,
             &format_bps(self.metrics.net_rx_bps),
             sx + 70,
-            377,
+            405,
             17.0,
             INK,
         );
-        c.draw_text(&self.regular, "Up", sx + 16, 422, 12.0, MUTED);
+        c.draw_text(&self.regular, "Up", sx + 16, 450, 12.0, MUTED);
         c.draw_text(
             &self.bold,
             &format_bps(self.metrics.net_tx_bps),
             sx + 70,
-            419,
+            447,
             17.0,
             INK,
         );
         draw_sparkline(
             c,
             sx + 152,
-            374,
+            402,
             i32::from(c.width) - sx - 190,
             22,
             self.metrics.net_rx_bps,
@@ -5397,7 +5563,7 @@ impl Aurora {
         draw_sparkline(
             c,
             sx + 152,
-            416,
+            444,
             i32::from(c.width) - sx - 190,
             22,
             self.metrics.net_tx_bps,
@@ -5610,6 +5776,7 @@ impl Aurora {
         for frame in shown_frames {
             self.conn.map_window(frame)?;
         }
+        self.hide_dock_more_menu()?;
         self.dock_last_click = None;
         self.active_client = None;
         self.conn
@@ -5997,15 +6164,24 @@ impl Aurora {
             if x >= rx && x <= rx + 44 && y >= ry && y <= ry + 44 {
                 if i == 0 {
                     self.dock_last_click = None;
+                    self.hide_dock_more_menu()?;
                     self.toggle_app_menu()?;
                 } else if i >= 5 {
                     self.hide_app_menu()?;
-                    if let Some(client) = task_windows.get(i - 5).copied() {
+                    if i == 15 && task_windows.len() > 10 {
+                        if self.dock_more_visible {
+                            self.hide_dock_more_menu()?;
+                        } else {
+                            self.show_dock_more_menu()?;
+                        }
+                    } else if let Some(client) = task_windows.get(i - 5).copied() {
+                        self.hide_dock_more_menu()?;
                         self.handle_task_icon_click(client)?;
                     }
                 } else {
                     self.dock_last_click = None;
                     self.hide_app_menu()?;
+                    self.hide_dock_more_menu()?;
                     if i == 1 {
                         self.show_folder(FolderMode::Pictures, true)?;
                     } else if i == 2 {
@@ -6030,6 +6206,7 @@ impl Aurora {
             }
             bx += stride;
         }
+        self.hide_dock_more_menu()?;
         Ok(())
     }
 
@@ -6068,6 +6245,7 @@ impl Aurora {
     fn toggle_app_menu(&mut self) -> AnyResult<()> {
         self.app_menu_visible = !self.app_menu_visible;
         if self.app_menu_visible {
+            self.hide_dock_more_menu()?;
             let menu = self.app_menu_geometry();
             self.conn.configure_window(
                 self.ui.app_menu,
@@ -6095,14 +6273,139 @@ impl Aurora {
         Ok(())
     }
 
+    fn redraw_dock_more_menu(&mut self) -> AnyResult<()> {
+        let (x, y, w, h) = self.dock_more_menu_geometry();
+        self.conn.configure_window(
+            self.ui.dock_more_menu,
+            &ConfigureWindowAux::new()
+                .x(i32::from(x))
+                .y(i32::from(y))
+                .width(u32::from(w))
+                .height(u32::from(h)),
+        )?;
+        let mut c = Canvas::from_wallpaper_crop(
+            &self.wallpaper_pixels,
+            self.screen_width,
+            i32::from(x),
+            i32::from(y),
+            w,
+            h,
+        );
+        c.draw_round_rect(
+            0,
+            0,
+            i32::from(w),
+            i32::from(h),
+            16,
+            Color::rgba(248, 253, 255, 232),
+        );
+        c.draw_round_rect(
+            0,
+            0,
+            i32::from(w),
+            i32::from(h),
+            16,
+            Color::rgba(214, 229, 237, 70),
+        );
+
+        let task_windows = self.task_client_windows();
+        if task_windows.len() > 10 {
+            let hidden_apps = &task_windows[10..];
+            for (idx, &window) in hidden_apps.iter().enumerate() {
+                let row_y = 8 + idx as i32 * 40;
+                let active = self.active_client == Some(window);
+                c.draw_round_rect(
+                    8,
+                    row_y,
+                    i32::from(w) - 16,
+                    32,
+                    8,
+                    if active {
+                        Color::rgba(172, 218, 255, 180)
+                    } else {
+                        Color::rgba(255, 255, 255, 120)
+                    },
+                );
+
+                let icon_x = 16;
+                let icon_y = row_y + 2;
+                let title = self.window_title(window);
+                if !self.paint_window_icon(&mut c, window, icon_x, icon_y, 28)
+                    && !self.paint_desktop_icon(&mut c, window, icon_x, icon_y, 28)
+                {
+                    let mapped = self.clients.get(&window).map(|info| info.mapped).unwrap_or(true);
+                    draw_client_task_icon(
+                        &mut c,
+                        &self.bold,
+                        icon_x + 14,
+                        icon_y + 14,
+                        mapped,
+                        &title,
+                    );
+                }
+
+                let text_x = 52;
+                let text_y = row_y + 8;
+                let display_title = compact(&title, 20);
+                c.draw_text(&self.bold, &display_title, text_x, text_y, 12.0, INK);
+            }
+        }
+
+        self.upload_canvas(self.ui.dock_more_menu, &c)?;
+        Ok(())
+    }
+
+    fn show_dock_more_menu(&mut self) -> AnyResult<()> {
+        self.dock_more_visible = true;
+        let menu = self.dock_more_menu_geometry();
+        self.conn.configure_window(
+            self.ui.dock_more_menu,
+            &ConfigureWindowAux::new()
+                .x(i32::from(menu.0))
+                .y(i32::from(menu.1))
+                .width(u32::from(menu.2))
+                .height(u32::from(menu.3))
+                .stack_mode(StackMode::ABOVE),
+        )?;
+        self.conn.map_window(self.ui.dock_more_menu)?;
+        self.redraw_dock_more_menu()?;
+        self.redraw_dock()?;
+        Ok(())
+    }
+
+    fn hide_dock_more_menu(&mut self) -> AnyResult<()> {
+        if self.dock_more_visible {
+            self.dock_more_visible = false;
+            self.conn.unmap_window(self.ui.dock_more_menu)?;
+            self.redraw_dock()?;
+        }
+        Ok(())
+    }
+
+    fn handle_dock_more_menu_click(&mut self, _x: i32, y: i32) -> AnyResult<()> {
+        let task_windows = self.task_client_windows();
+        if task_windows.len() > 10 {
+            let hidden_apps = &task_windows[10..];
+            let idx = (y - 8) / 40;
+            if idx >= 0 && idx < hidden_apps.len() as i32 {
+                let client = hidden_apps[idx as usize];
+                self.handle_task_icon_click(client)?;
+                self.hide_dock_more_menu()?;
+            }
+        }
+        Ok(())
+    }
+
     fn toggle_aurora_menu(&mut self) -> AnyResult<()> {
         self.aurora_menu_visible = !self.aurora_menu_visible;
         if self.aurora_menu_visible {
+            self.hide_dock_more_menu()?;
             self.app_menu_visible = false;
             self.app_menu_more = false;
             self.app_menu_scroll = 0;
             let _ = self.conn.unmap_window(self.ui.app_menu);
             self.aurora_menu_about = false;
+            self.aurora_menu_restart_confirm = false;
             let menu = self.aurora_menu_geometry();
             self.conn.configure_window(
                 self.ui.aurora_menu,
@@ -6126,6 +6429,7 @@ impl Aurora {
         if self.aurora_menu_visible {
             self.aurora_menu_visible = false;
             self.aurora_menu_about = false;
+            self.aurora_menu_restart_confirm = false;
             self.conn.unmap_window(self.ui.aurora_menu)?;
         }
         Ok(())
@@ -6139,11 +6443,28 @@ impl Aurora {
             }
             return Ok(());
         }
-        if (56..=94).contains(&y) {
-            self.restart_aurora()?;
-        } else if (106..=144).contains(&y) {
-            self.aurora_menu_about = true;
-            self.redraw_aurora_menu()?;
+
+        if self.aurora_menu_restart_confirm {
+            if (110..=138).contains(&y) {
+                if (160..=250).contains(&x) {
+                    self.restart_aurora()?;
+                } else if (270..=360).contains(&x) {
+                    self.aurora_menu_restart_confirm = false;
+                    self.redraw_aurora_menu()?;
+                }
+            } else if (158..=196).contains(&y) {
+                self.aurora_menu_about = true;
+                self.aurora_menu_restart_confirm = false;
+                self.redraw_aurora_menu()?;
+            }
+        } else {
+            if (56..=94).contains(&y) {
+                self.aurora_menu_restart_confirm = true;
+                self.redraw_aurora_menu()?;
+            } else if (106..=144).contains(&y) {
+                self.aurora_menu_about = true;
+                self.redraw_aurora_menu()?;
+            }
         }
         Ok(())
     }
@@ -9361,6 +9682,7 @@ impl Aurora {
             self.screen_height,
         )?;
         self.wallpaper_cache[self.wallpaper_index] = Some(self.wallpaper_pixels.clone());
+        self.hide_dock_more_menu()?;
         let dock = self.dock_geometry();
         let settings = self.settings_geometry();
         let folder = self.folder_geometry();
@@ -9527,6 +9849,12 @@ impl Aurora {
         if self.aurora_menu_visible {
             self.conn.configure_window(
                 self.ui.aurora_menu,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
+        if self.dock_more_visible {
+            self.conn.configure_window(
+                self.ui.dock_more_menu,
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
@@ -9760,7 +10088,13 @@ impl Aurora {
 
     fn aurora_menu_geometry(&self) -> (i16, i16, u16, u16) {
         let width = 390u16.min(self.screen_width.saturating_sub(24)).max(260);
-        let height = if self.aurora_menu_about { 276 } else { 168 };
+        let height = if self.aurora_menu_about {
+            276
+        } else if self.aurora_menu_restart_confirm {
+            220
+        } else {
+            168
+        };
         (12, TOPBAR_HEIGHT as i16 + 8, width, height)
     }
 
@@ -9781,12 +10115,12 @@ impl Aurora {
     }
 
     fn dock_button_count(&self) -> usize {
-        5 + self
-            .clients
-            .values()
-            .filter(|info| info.workspace == self.active_workspace)
-            .count()
-            .min(5)
+        let task_windows = self.task_client_windows();
+        if task_windows.len() <= 10 {
+            5 + task_windows.len()
+        } else {
+            5 + 10 + 1
+        }
     }
 
     fn task_client_windows(&self) -> Vec<Window> {
@@ -9798,8 +10132,33 @@ impl Aurora {
             })
             .collect::<Vec<_>>();
         windows.sort_unstable();
-        windows.truncate(5);
         windows
+    }
+
+    fn dock_more_menu_geometry(&self) -> (i16, i16, u16, u16) {
+        let (dx, dy, dw, _dh) = self.dock_geometry();
+        let buttons = self.dock_button_count();
+        let stride = 58;
+        let total = buttons as i32 * stride - 12;
+        let mut bx = (i32::from(dw) - total) / 2;
+        bx += 15 * stride;
+        let icon_x = bx + 7;
+        let center_x = dx + icon_x as i16 + 22;
+
+        let task_windows = self.task_client_windows();
+        let hidden_count = task_windows.len().saturating_sub(10);
+        let width = 240u16;
+        let height = (hidden_count as u16 * 40 + 16).max(40);
+
+        let mut x = center_x - (width as i16 / 2);
+        if x + width as i16 > self.screen_width as i16 - 12 {
+            x = self.screen_width as i16 - width as i16 - 12;
+        }
+        if x < 12 {
+            x = 12;
+        }
+        let y = dy - height as i16 - 8;
+        (x, y, width, height)
     }
 
     fn client_key_for(&self, window: Window) -> Option<Window> {
@@ -9843,6 +10202,7 @@ impl Aurora {
             || window == self.ui.screenshot_overlay
             || window == self.ui.app_menu
             || window == self.ui.aurora_menu
+            || window == self.ui.dock_more_menu
             || self.ui.media.contains(&window)
     }
 
@@ -12868,4 +13228,18 @@ fn compact_path(path: &std::path::Path, max_chars: usize) -> String {
             .collect::<String>();
         format!("...{tail}")
     }
+}
+
+fn draw_reload_menu_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_arc(c, cx, cy, 6, 40.0, 320.0, 0, 2, color);
+    let tip_x = cx + 4;
+    let tip_y = cy + 4;
+    draw_round_line(c, tip_x, tip_y, tip_x - 4, tip_y, 2, color);
+    draw_round_line(c, tip_x, tip_y, tip_x, tip_y - 4, 2, color);
+}
+
+fn draw_info_menu_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_arc(c, cx, cy, 7, 0.0, 359.9, 0, 2, color);
+    c.draw_circle(cx, cy - 3, 1, color);
+    draw_round_line(c, cx, cy - 1, cx, cy + 3, 2, color);
 }
