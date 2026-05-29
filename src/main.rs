@@ -5493,7 +5493,9 @@ impl Aurora {
         );
         draw_card(c, sx, 86, card_w, 154);
         c.draw_text(&self.bold, "Current status", sx + 16, 106, 15.0, INK);
-        let start = (self.settings.scroll / 29).max(0) as usize;
+        
+        // Scroll exactly with step 24 matching line spacing!
+        let start = (self.settings.scroll / 24).max(0) as usize;
         for (idx, line) in read_network_details()
             .iter()
             .skip(start)
@@ -5512,49 +5514,62 @@ impl Aurora {
 
         draw_card(c, sx, 258, card_w, 288);
         c.draw_text(&self.bold, "Wi-Fi", sx + 16, 278, 15.0, INK);
-        let refresh_x = sx + card_w - 96;
-        c.draw_round_rect(refresh_x, 266, 76, 28, 7, Color::rgba(160, 238, 220, 150));
-        c.draw_text_center(&self.bold, "Refresh", refresh_x + 38, 284, 11.0, MINT_DARK);
 
-        if let Some(wifi) = read_connected_wifi().as_ref() {
-            c.draw_text(
-                &self.regular,
-                &compact(
-                    &format!("{}  {}", wifi.ssid, wifi.ip.as_deref().unwrap_or("no ip")),
-                    44,
-                ),
-                sx + 16,
-                306,
-                12.0,
-                INK,
-            );
-            let disconnect_x = sx + card_w - 128;
-            c.draw_round_rect(
-                disconnect_x,
-                294,
-                108,
-                28,
-                7,
-                Color::rgba(241, 126, 135, 112),
-            );
-            c.draw_text_center(
-                &self.bold,
-                "Disconnect",
-                disconnect_x + 54,
-                312,
-                11.0,
-                Color::rgb(160, 58, 68),
-            );
+        // Beautiful Premium 24x24 Refresh Icon Button
+        c.draw_round_rect(sx + 75, 262, 24, 24, 6, Color::rgba(160, 238, 220, 150));
+        c.draw_circle(sx + 87, 274, 6, MINT_DARK);
+        c.draw_circle(sx + 87, 274, 4, Color::rgb(255, 255, 255));
+        c.draw_rect(sx + 87, 268, 5, 4, Color::rgb(255, 255, 255));
+        c.draw_line(sx + 89, 267, sx + 89, 271, 2, MINT_DARK);
+        c.draw_line(sx + 89, 271, sx + 85, 271, 2, MINT_DARK);
+
+        let connected_wifi = read_connected_wifi();
+        
+        // Beautiful Premium 24x24 Disconnect Icon Button
+        if connected_wifi.is_some() {
+            c.draw_round_rect(sx + 105, 262, 24, 24, 6, Color::rgba(241, 126, 135, 112));
+            c.draw_line(sx + 105 + 7, 262 + 7, sx + 105 + 17, 262 + 17, 2, Color::rgb(160, 58, 68));
+            c.draw_line(sx + 105 + 17, 262 + 7, sx + 105 + 7, 262 + 17, 2, Color::rgb(160, 58, 68));
         } else {
-            c.draw_text(&self.regular, "Not connected", sx + 16, 306, 12.0, MUTED);
+            c.draw_round_rect(sx + 105, 262, 24, 24, 6, Color::rgba(200, 200, 200, 80));
+            c.draw_line(sx + 105 + 7, 262 + 7, sx + 105 + 17, 262 + 17, 2, Color::rgba(120, 120, 120, 150));
+            c.draw_line(sx + 105 + 17, 262 + 7, sx + 105 + 7, 262 + 17, 2, Color::rgba(120, 120, 120, 150));
         }
 
+        // Beautiful Premium 40x24 Sliding On/Off Switch
+        let wifi_enabled = read_wifi_radio_enabled();
+        if wifi_enabled {
+            c.draw_round_rect(sx + 135, 262, 40, 24, 12, Color::rgba(160, 238, 220, 200));
+            c.draw_circle(sx + 163, 274, 8, Color::rgb(255, 255, 255));
+        } else {
+            c.draw_round_rect(sx + 135, 262, 40, 24, 12, Color::rgba(200, 200, 200, 180));
+            c.draw_circle(sx + 147, 274, 8, Color::rgb(255, 255, 255));
+        }
+
+        let mut list_start_y = 344;
+        if let Some(wifi) = connected_wifi.as_ref() {
+            c.draw_text(&self.bold, "Connected", sx + 16, 302, 11.0, MINT_DARK);
+            c.draw_text(&self.bold, &compact(&wifi.ssid, 44), sx + 16, 318, 13.0, INK);
+            c.draw_text(
+                &self.regular,
+                wifi.ip.as_deref().unwrap_or("no ip"),
+                sx + 16,
+                334,
+                12.0,
+                MUTED,
+            );
+            list_start_y = 376;
+        } else {
+            c.draw_text(&self.regular, "Not connected", sx + 16, 302, 12.0, MUTED);
+        }
+
+        let status_y = list_start_y - 22;
         if let Some(status) = self.settings.wifi_status.as_deref() {
             c.draw_text(
                 &self.regular,
                 &compact(status, 54),
                 sx + 16,
-                328,
+                status_y,
                 11.0,
                 BLUE,
             );
@@ -5563,7 +5578,7 @@ impl Aurora {
                 &self.regular,
                 "Click Refresh to scan nearby Wi-Fi networks",
                 sx + 16,
-                328,
+                status_y,
                 11.0,
                 MUTED,
             );
@@ -5572,7 +5587,7 @@ impl Aurora {
         if self.settings.wifi_disconnect_confirm {
             c.draw_round_rect(
                 sx + 12,
-                340,
+                list_start_y,
                 card_w - 24,
                 44,
                 8,
@@ -5582,22 +5597,22 @@ impl Aurora {
                 &self.bold,
                 "Disconnect current Wi-Fi?",
                 sx + 24,
-                366,
+                list_start_y + 26,
                 13.0,
                 INK,
             );
             c.draw_round_rect(
                 sx + card_w - 194,
-                348,
+                list_start_y + 8,
                 76,
                 28,
                 7,
                 Color::rgba(211, 225, 232, 170),
             );
-            c.draw_text_center(&self.bold, "Cancel", sx + card_w - 156, 366, 11.0, INK);
+            c.draw_text_center(&self.bold, "Cancel", sx + card_w - 156, list_start_y + 26, 11.0, INK);
             c.draw_round_rect(
                 sx + card_w - 108,
-                348,
+                list_start_y + 8,
                 88,
                 28,
                 7,
@@ -5607,7 +5622,7 @@ impl Aurora {
                 &self.bold,
                 "Disconnect",
                 sx + card_w - 64,
-                366,
+                list_start_y + 26,
                 11.0,
                 Color::rgb(160, 58, 68),
             );
@@ -5619,13 +5634,13 @@ impl Aurora {
                 &self.regular,
                 "No Wi-Fi networks found",
                 sx + 16,
-                366,
+                list_start_y + 10,
                 13.0,
                 MUTED,
             );
         } else {
             for (idx, network) in self.settings.wifi_networks.iter().take(5).enumerate() {
-                let y = 356 + idx as i32 * 24;
+                let y = list_start_y + idx as i32 * 24;
                 let selected = self
                     .settings
                     .wifi_selected
@@ -5634,7 +5649,7 @@ impl Aurora {
                 if selected {
                     c.draw_round_rect(
                         sx + 12,
-                        y - 14,
+                        y - 11, // Moved overlay down to y - 11 to perfectly center text
                         card_w - 24,
                         22,
                         7,
@@ -5662,7 +5677,7 @@ impl Aurora {
                 INK,
             );
             let input_x = sx + 16;
-            let button_w = 86;
+            let button_w = 34; // 34x34 icon button
             let gap = 12;
             let input_w = (card_w - 32 - button_w - gap).max(132);
             let input_y = 508;
@@ -5684,6 +5699,8 @@ impl Aurora {
             } else {
                 password_mask(self.settings.wifi_password.chars().count())
             };
+            
+            // Text y = input_y + 21 is perfectly vertically centered
             c.draw_text(
                 &self.regular,
                 &compact(&shown, 38),
@@ -5696,6 +5713,7 @@ impl Aurora {
                     INK
                 },
             );
+            
             let button_x = input_x + input_w + gap;
             c.draw_round_rect(
                 button_x,
@@ -5705,14 +5723,13 @@ impl Aurora {
                 7,
                 Color::rgba(160, 238, 220, 170),
             );
-            c.draw_text_center(
-                &self.bold,
-                "Connect",
-                button_x + button_w / 2,
-                input_y + 21,
-                12.0,
-                MINT_DARK,
-            );
+            
+            // Draw Connect icon arrow centered vertically and horizontally
+            let cx = button_x + 17;
+            let cy = input_y + 17;
+            c.draw_line(cx - 6, cy, cx + 6, cy, 2, MINT_DARK);
+            c.draw_line(cx + 6, cy, cx + 2, cy - 4, 2, MINT_DARK);
+            c.draw_line(cx + 6, cy, cx + 2, cy + 4, 2, MINT_DARK);
         }
     }
 
@@ -6387,7 +6404,11 @@ impl Aurora {
             return Ok(());
         }
         let max_scroll = match self.settings.tab {
-            SettingsTab::Network | SettingsTab::Startup | SettingsTab::About => 180,
+            SettingsTab::Network => {
+                let lines = read_network_details().len();
+                (lines.saturating_sub(4) * 24) as i32
+            }
+            SettingsTab::Startup | SettingsTab::About => 180,
             SettingsTab::Audio | SettingsTab::Wallpaper => 80,
             SettingsTab::Apps => self
                 .available_apps(self.settings.app_kind)
@@ -6399,6 +6420,8 @@ impl Aurora {
         let old_scroll = self.settings.scroll;
         let step = if self.settings.tab == SettingsTab::Apps {
             29
+        } else if self.settings.tab == SettingsTab::Network {
+            24
         } else {
             36
         };
@@ -6462,16 +6485,17 @@ impl Aurora {
     fn handle_network_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let sx = SIDEBAR_WIDTH + 24;
         let card_w = i32::from(self.settings_geometry().2) - sx - 24;
-        let refresh_x = sx + card_w - 96;
-        if y >= 266 && y <= 294 && x >= refresh_x && x <= refresh_x + 76 {
+        
+        // Clicks on the new Refresh icon button next to Wi-Fi title
+        if y >= 262 && y <= 286 && x >= sx + 75 && x <= sx + 99 {
             self.settings.wifi_disconnect_confirm = false;
             self.refresh_wifi_networks();
             self.redraw_settings()?;
             return Ok(());
         }
 
-        let disconnect_x = sx + card_w - 128;
-        if y >= 294 && y <= 322 && x >= disconnect_x && x <= disconnect_x + 108 {
+        // Clicks on the new Disconnect icon button next to Wi-Fi title
+        if y >= 262 && y <= 286 && x >= sx + 105 && x <= sx + 129 {
             if read_connected_wifi().is_some() {
                 self.settings.wifi_disconnect_confirm = true;
                 self.settings.wifi_password_editing = false;
@@ -6480,13 +6504,32 @@ impl Aurora {
             }
         }
 
+        // Clicks on the new On/Off toggle switch next to Wi-Fi title
+        if y >= 262 && y <= 286 && x >= sx + 135 && x <= sx + 175 {
+            let current_enabled = read_wifi_radio_enabled();
+            if let Err(e) = set_wifi_radio_enabled(!current_enabled) {
+                self.settings.wifi_status = Some(format!("Error setting Wi-Fi radio: {e}"));
+            } else {
+                self.settings.wifi_status = Some(format!("Wi-Fi turned {}", if !current_enabled { "on" } else { "off" }));
+                if !current_enabled {
+                    self.refresh_wifi_networks();
+                } else {
+                    self.settings.wifi_networks.clear();
+                    self.settings.wifi_selected = None;
+                }
+            }
+            self.redraw_settings()?;
+            return Ok(());
+        }
+
         if self.settings.wifi_disconnect_confirm {
-            if y >= 348 && y <= 376 && x >= sx + card_w - 194 && x <= sx + card_w - 118 {
+            let list_start_y = if read_connected_wifi().is_some() { 376 } else { 344 };
+            if y >= list_start_y + 8 && y <= list_start_y + 36 && x >= sx + card_w - 194 && x <= sx + card_w - 118 {
                 self.settings.wifi_disconnect_confirm = false;
                 self.redraw_settings()?;
                 return Ok(());
             }
-            if y >= 348 && y <= 376 && x >= sx + card_w - 108 && x <= sx + card_w - 20 {
+            if y >= list_start_y + 8 && y <= list_start_y + 36 && x >= sx + card_w - 108 && x <= sx + card_w - 20 {
                 self.disconnect_wifi()?;
                 return Ok(());
             }
@@ -6495,8 +6538,11 @@ impl Aurora {
             return Ok(());
         }
 
-        if (342..=486).contains(&y) {
-            let idx = ((y - 342) / 24) as usize;
+        // Dynamic Wi-Fi list coordinates
+        let list_start_y = if read_connected_wifi().is_some() { 376 } else { 344 };
+        let list_end_y = list_start_y + 5 * 24;
+        if y >= list_start_y && y < list_end_y {
+            let idx = ((y - list_start_y) / 24) as usize;
             if let Some(network) = self.settings.wifi_networks.get(idx) {
                 self.settings.wifi_selected = Some(network.ssid.clone());
                 self.settings.wifi_password.clear();
@@ -6515,7 +6561,7 @@ impl Aurora {
 
         if self.settings.wifi_selected.is_some() {
             let input_x = sx + 16;
-            let button_w = 86;
+            let button_w = 34; // Updated button_w to 34
             let gap = 12;
             let input_w = (card_w - 32 - button_w - gap).max(132);
             let input_y = 508;
@@ -12972,6 +13018,29 @@ fn unescape_nmcli_field(value: &str) -> String {
 
 fn split_nmcli_line(line: &str) -> Vec<String> {
     line.split(':').map(unescape_nmcli_field).collect()
+}
+
+fn read_wifi_radio_enabled() -> bool {
+    if let Ok(output) = Command::new("nmcli").args(["radio", "wifi"]).output() {
+        if output.status.success() {
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return status == "enabled";
+        }
+    }
+    true
+}
+
+fn set_wifi_radio_enabled(enabled: bool) -> Result<(), String> {
+    let arg = if enabled { "on" } else { "off" };
+    let output = Command::new("nmcli")
+        .args(["radio", "wifi", arg])
+        .output()
+        .map_err(|err| format!("Could not run nmcli radio wifi: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 fn password_mask(len: usize) -> String {
