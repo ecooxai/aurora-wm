@@ -1229,6 +1229,7 @@ struct Aurora {
     ffplay_process: Option<std::process::Child>,
     pending_window_nudges: Vec<PendingWindowNudge>,
     focus_history: Vec<Window>,
+    choose_file_mode: bool,
 }
 
 fn main() {
@@ -1240,6 +1241,84 @@ fn main() {
 
 fn run() -> AnyResult<()> {
     let args: Vec<String> = env::args().collect();
+    
+    if args.len() >= 3 && args[1] == "--open-folder" {
+        let display = env::var("DISPLAY").unwrap_or_else(|_| ":11".to_string());
+        let (conn, _screen_num) = RustConnection::connect(Some(&display))?;
+        let setup = conn.setup();
+        let root = setup.roots[0].root;
+        let path_atom = conn.intern_atom(false, b"_AURORA_OPEN_FOLDER_PATH")?.reply()?.atom;
+        let string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+        let path = std::path::PathBuf::from(&args[2]);
+        let abs_path = std::fs::canonicalize(&path).unwrap_or(path);
+        let path_str = abs_path.to_string_lossy().into_owned();
+        conn.change_property8(
+            PropMode::REPLACE,
+            root,
+            path_atom,
+            string_atom,
+            path_str.as_bytes(),
+        )?;
+        let open_atom = conn.intern_atom(false, b"_AURORA_OPEN_FOLDER")?.reply()?.atom;
+        let event = ClientMessageEvent {
+            response_type: CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: root,
+            type_: open_atom,
+            data: ClientMessageData::from([0, 0, 0, 0, 0]),
+        };
+        conn.send_event(false, root, EventMask::STRUCTURE_NOTIFY, event)?;
+        conn.flush()?;
+        println!("Requested folder opening for {}", path_str);
+        return Ok(());
+    }
+
+    if args.len() >= 2 && args[1] == "--choose-file" {
+        let display = env::var("DISPLAY").unwrap_or_else(|_| ":11".to_string());
+        let (conn, _screen_num) = RustConnection::connect(Some(&display))?;
+        let setup = conn.setup();
+        let root = setup.roots[0].root;
+        let result_atom = conn.intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?.reply()?.atom;
+        conn.delete_property(root, result_atom)?;
+        
+        let choose_atom = conn.intern_atom(false, b"_AURORA_CHOOSE_FILE")?.reply()?.atom;
+        let event = ClientMessageEvent {
+            response_type: CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: root,
+            type_: choose_atom,
+            data: ClientMessageData::from([0, 0, 0, 0, 0]),
+        };
+        conn.send_event(false, root, EventMask::STRUCTURE_NOTIFY, event)?;
+        conn.flush()?;
+        
+        let string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+        let start_time = std::time::Instant::now();
+        loop {
+            if let Ok(prop) = conn.get_property(false, root, result_atom, string_atom, 0, 65535)?.reply() {
+                if !prop.value.is_empty() {
+                    let result_str = String::from_utf8_lossy(&prop.value);
+                    if result_str == "CANCEL" {
+                        eprintln!("File selection cancelled.");
+                        conn.delete_property(root, result_atom)?;
+                        std::process::exit(1);
+                    } else {
+                        println!("{}", result_str);
+                        conn.delete_property(root, result_atom)?;
+                        return Ok(());
+                    }
+                }
+            }
+            if start_time.elapsed() > std::time::Duration::from_secs(300) {
+                eprintln!("File selection timed out.");
+                std::process::exit(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     let replace = args.iter().any(|arg| arg == "--replace");
 
     let display = env::var("DISPLAY").unwrap_or_else(|_| ":111".to_string());
@@ -1538,6 +1617,7 @@ impl Aurora {
             ffplay_process: None,
             pending_window_nudges: Vec::new(),
             focus_history: Vec::new(),
+            choose_file_mode: false,
         };
         app.apply_sleep_timeout();
         if app.settings.auto_power_saver_minutes > 0 {
@@ -2536,6 +2616,43 @@ impl Aurora {
                 }
                 self.focus_window(client)?;
             }
+            return Ok(());
+        }
+        let open_folder_atom = self.atom(b"_AURORA_OPEN_FOLDER")?;
+        if ev.type_ == open_folder_atom {
+            let path_atom = self.conn.intern_atom(false, b"_AURORA_OPEN_FOLDER_PATH")?.reply()?.atom;
+            let string_atom = self.conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+            if let Ok(prop) = self.conn.get_property(false, self.root, path_atom, string_atom, 0, 65535)?.reply() {
+                if !prop.value.is_empty() {
+                    let path_str = String::from_utf8_lossy(&prop.value).into_owned();
+                    let path = PathBuf::from(path_str);
+                    if path.exists() {
+                        self.folder_path = path.clone();
+                        self.folder_entries = folder_entries_in(path, self.folder_sort);
+                        self.folder_selected = None;
+                        self.folder_scroll = 0;
+                        self.folder_front = true;
+                        self.choose_file_mode = false;
+                        self.conn.map_window(self.ui.folder)?;
+                        self.redraw_folder()?;
+                        self.raise_ui()?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let choose_file_atom = self.atom(b"_AURORA_CHOOSE_FILE")?;
+        if ev.type_ == choose_file_atom {
+            self.choose_file_mode = true;
+            self.folder_path = folder_path_for(FolderMode::Home);
+            self.folder_entries = folder_entries_for(FolderMode::Home, self.folder_sort);
+            self.folder_selected = None;
+            self.folder_scroll = 0;
+            self.folder_front = true;
+            self.conn.map_window(self.ui.folder)?;
+            self.redraw_folder()?;
+            self.raise_ui()?;
             return Ok(());
         }
 
@@ -4277,11 +4394,12 @@ impl Aurora {
                 MUTED,
             );
         } else {
+            let limit = if self.choose_file_mode { 7 } else { 9 };
             for (idx, entry) in self
                 .folder_entries
                 .iter()
                 .skip(self.folder_scroll)
-                .take(9)
+                .take(limit)
                 .enumerate()
             {
                 let row_y = 90 + idx as i32 * 42;
@@ -4353,20 +4471,20 @@ impl Aurora {
                 .iter()
                 .copied()
                 .enumerate()
-            {
-                let y = menu_y + 16 + idx as i32 * 28;
-                if sort == self.folder_sort {
-                    c.draw_round_rect(
-                        menu_x + 8,
-                        y - 5,
-                        106,
-                        23,
-                        7,
-                        Color::rgba(116, 213, 198, 92),
-                    );
+                {
+                    let y = menu_y + 16 + idx as i32 * 28;
+                    if sort == self.folder_sort {
+                        c.draw_round_rect(
+                            menu_x + 8,
+                            y - 5,
+                            106,
+                            23,
+                            7,
+                            Color::rgba(116, 213, 198, 92),
+                        );
+                    }
+                    c.draw_text(&self.regular, sort.label(), menu_x + 18, y, 12.0, INK);
                 }
-                c.draw_text(&self.regular, sort.label(), menu_x + 18, y, 12.0, INK);
-            }
         }
         if self.folder_context_open {
             let menu_x = self.folder_context_pos.0.min(i32::from(w) - 166).max(10);
@@ -4395,14 +4513,15 @@ impl Aurora {
                 MUTED,
             );
         }
-        if self.folder_entries.len() > 9 {
-            let track_h = i32::from(h) - 100;
+        let displayed_count = if self.choose_file_mode { 7 } else { 9 };
+        if self.folder_entries.len() > displayed_count {
+            let track_h = i32::from(h) - 100 - if self.choose_file_mode { 42 } else { 0 };
             let track_x = i32::from(w) - 13;
             c.draw_round_rect(track_x, 84, 5, track_h, 3, Color::rgba(176, 198, 210, 90));
-            let thumb_h = ((track_h as f32 * 9.0 / self.folder_entries.len() as f32) as i32)
+            let thumb_h = ((track_h as f32 * displayed_count as f32 / self.folder_entries.len() as f32) as i32)
                 .max(34)
                 .min(track_h);
-            let max_scroll = self.folder_entries.len().saturating_sub(9).max(1);
+            let max_scroll = self.folder_entries.len().saturating_sub(displayed_count).max(1);
             let thumb_y = 84
                 + ((track_h - thumb_h) as f32 * self.folder_scroll.min(max_scroll) as f32
                     / max_scroll as f32) as i32;
@@ -4415,7 +4534,71 @@ impl Aurora {
                 Color::rgba(29, 145, 137, 180),
             );
         }
+
+        if self.choose_file_mode {
+            let cancel_x = i32::from(w) - 190;
+            let choose_x = i32::from(w) - 100;
+            let btn_y = i32::from(h) - 46;
+            
+            c.draw_round_rect(cancel_x, btn_y, 80, 32, 8, Color::rgba(241, 126, 135, 150));
+            c.draw_text_center(&self.bold, "Cancel", cancel_x + 40, btn_y + 20, 12.0, Color::rgb(160, 58, 68));
+            
+            c.draw_round_rect(choose_x, btn_y, 80, 32, 8, Color::rgba(160, 238, 220, 200));
+            c.draw_text_center(&self.bold, "Open", choose_x + 40, btn_y + 20, 12.0, MINT_DARK);
+            
+            if let Some(selected) = self.folder_selected.as_ref() {
+                let name = selected.file_name().unwrap_or_default().to_string_lossy();
+                c.draw_text(&self.regular, &compact(&format!("File: {name}"), 24), 24, btn_y + 20, 12.0, INK);
+            } else {
+                c.draw_text(&self.regular, "Select a file", 24, btn_y + 20, 12.0, MUTED);
+            }
+        }
+
         self.upload_canvas(self.ui.folder, &c)
+    }
+
+    fn cancel_choose_file(&mut self) -> AnyResult<()> {
+        self.choose_file_mode = false;
+        let result_atom = self.conn.intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?.reply()?.atom;
+        let string_atom = self.conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            self.root,
+            result_atom,
+            string_atom,
+            b"CANCEL",
+        )?;
+        self.conn.unmap_window(self.ui.folder)?;
+        if self.folder_terminal.visible {
+            self.conn.unmap_window(self.ui.folder_terminal)?;
+        }
+        self.redraw_folder()?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn submit_choose_file(&mut self) -> AnyResult<()> {
+        let Some(path) = self.folder_selected.clone() else {
+            return Ok(());
+        };
+        self.choose_file_mode = false;
+        let result_atom = self.conn.intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?.reply()?.atom;
+        let string_atom = self.conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+        let path_str = path.to_string_lossy();
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            self.root,
+            result_atom,
+            string_atom,
+            path_str.as_bytes(),
+        )?;
+        self.conn.unmap_window(self.ui.folder)?;
+        if self.folder_terminal.visible {
+            self.conn.unmap_window(self.ui.folder_terminal)?;
+        }
+        self.redraw_folder()?;
+        self.conn.flush()?;
+        Ok(())
     }
 
     fn redraw_app_menu(&self) -> AnyResult<()> {
@@ -6291,6 +6474,9 @@ impl Aurora {
         if workspace >= self.workspace_count || workspace == self.active_workspace {
             return Ok(());
         }
+        if self.choose_file_mode {
+            let _ = self.cancel_choose_file();
+        }
         self.end_drag()?;
         let previous = self.active_workspace;
         let hidden_frames = self
@@ -7367,8 +7553,23 @@ impl Aurora {
     fn handle_folder_click(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
         let x = i32::from(ev.event_x);
         let y = i32::from(ev.event_y);
-        let (_, _, w, _) = self.folder_geometry();
+        let (_, _, w, h) = self.folder_geometry();
         self.folder_press = None;
+        if self.choose_file_mode {
+            let cancel_x = i32::from(w) - 190;
+            let choose_x = i32::from(w) - 100;
+            let btn_y = i32::from(h) - 46;
+            if y >= btn_y && y <= btn_y + 32 {
+                if x >= cancel_x && x <= cancel_x + 80 {
+                    self.cancel_choose_file()?;
+                    return Ok(());
+                }
+                if x >= choose_x && x <= choose_x + 80 {
+                    self.submit_choose_file()?;
+                    return Ok(());
+                }
+            }
+        }
         if self.folder_sort_open {
             if let Some(sort) = self.folder_sort_at(x, y) {
                 self.folder_sort = sort;
@@ -7484,7 +7685,11 @@ impl Aurora {
             | FileKind::Video
             | FileKind::Other => {
                 if self.folder_selected.as_ref() == Some(&entry.path) {
-                    self.open_media(entry)?;
+                    if self.choose_file_mode {
+                        self.submit_choose_file()?;
+                    } else {
+                        self.open_media(entry)?;
+                    }
                 } else {
                     self.folder_selected = Some(entry.path.clone());
                     self.folder_info = Some(folder_entry_info(&entry));
@@ -7597,7 +7802,11 @@ impl Aurora {
             | FileKind::Video
             | FileKind::Other => {
                 if self.folder_selected.as_ref() == Some(&entry.path) {
-                    self.open_media(entry)?;
+                    if self.choose_file_mode {
+                        self.submit_choose_file()?;
+                    } else {
+                        self.open_media(entry)?;
+                    }
                 } else {
                     self.folder_selected = Some(entry.path.clone());
                     self.folder_info = Some(folder_entry_info(&entry));
