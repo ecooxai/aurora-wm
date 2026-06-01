@@ -433,6 +433,43 @@ impl DisplayMode {
     }
 }
 
+#[derive(Clone)]
+struct AudioDevice {
+    id: String,
+    name: String,
+    label: String,
+    is_default: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AudioDeviceKind {
+    Output,
+    Input,
+}
+
+impl AudioDeviceKind {
+    fn pactl_list_arg(self) -> &'static str {
+        match self {
+            Self::Output => "sinks",
+            Self::Input => "sources",
+        }
+    }
+
+    fn pactl_default_key(self) -> &'static str {
+        match self {
+            Self::Output => "Default Sink:",
+            Self::Input => "Default Source:",
+        }
+    }
+
+    fn pactl_set_default_command(self) -> &'static str {
+        match self {
+            Self::Output => "set-default-sink",
+            Self::Input => "set-default-source",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     Display,
@@ -6089,29 +6126,94 @@ impl Aurora {
                 BLUE,
             );
         }
-        draw_card(c, sx, 220, i32::from(c.width) - sx - 24, 150);
+        let card_w = i32::from(c.width) - sx - 24;
+        draw_card(c, sx, 220, card_w, 150);
         c.draw_text(&self.bold, "Output device", sx + 16, 240, 15.0, INK);
-        for (idx, dev) in read_audio_devices("Sink").iter().take(3).enumerate() {
+        let outputs = read_audio_devices(AudioDeviceKind::Output);
+        if outputs.is_empty() {
             c.draw_text(
                 &self.regular,
-                &compact(dev, 48),
+                "No output devices found",
                 sx + 16,
-                272 + idx as i32 * 28,
+                272,
                 12.0,
-                INK,
+                MUTED,
             );
         }
-        draw_card(c, sx, 392, i32::from(c.width) - sx - 24, 108);
-        c.draw_text(&self.bold, "Input device", sx + 16, 412, 15.0, INK);
-        for (idx, dev) in read_audio_devices("Source").iter().take(2).enumerate() {
+        for (idx, dev) in outputs.iter().take(3).enumerate() {
+            let row_y = 260 + idx as i32 * 30;
+            if dev.is_default {
+                c.draw_round_rect(
+                    sx + 12,
+                    row_y - 3,
+                    card_w - 24,
+                    24,
+                    6,
+                    Color::rgba(116, 213, 198, 120),
+                );
+            }
             c.draw_text(
                 &self.regular,
-                &compact(dev, 48),
-                sx + 16,
-                444 + idx as i32 * 28,
+                &compact(&dev.label, 45),
+                sx + 18,
+                row_y + 4,
                 12.0,
                 INK,
             );
+            if dev.is_default {
+                c.draw_text(
+                    &self.bold,
+                    "default",
+                    sx + card_w - 76,
+                    row_y + 4,
+                    11.0,
+                    BLUE,
+                );
+            }
+        }
+        draw_card(c, sx, 392, card_w, 108);
+        c.draw_text(&self.bold, "Input device", sx + 16, 412, 15.0, INK);
+        let inputs = read_audio_devices(AudioDeviceKind::Input);
+        if inputs.is_empty() {
+            c.draw_text(
+                &self.regular,
+                "No input devices found",
+                sx + 16,
+                444,
+                12.0,
+                MUTED,
+            );
+        }
+        for (idx, dev) in inputs.iter().take(2).enumerate() {
+            let row_y = 432 + idx as i32 * 30;
+            if dev.is_default {
+                c.draw_round_rect(
+                    sx + 12,
+                    row_y - 3,
+                    card_w - 24,
+                    24,
+                    6,
+                    Color::rgba(116, 213, 198, 120),
+                );
+            }
+            c.draw_text(
+                &self.regular,
+                &compact(&dev.label, 45),
+                sx + 18,
+                row_y + 4,
+                12.0,
+                INK,
+            );
+            if dev.is_default {
+                c.draw_text(
+                    &self.bold,
+                    "default",
+                    sx + card_w - 76,
+                    row_y + 4,
+                    11.0,
+                    BLUE,
+                );
+            }
         }
     }
 
@@ -7273,6 +7375,41 @@ impl Aurora {
                 Err(err) => Some(err),
             };
             self.redraw_settings()?;
+        }
+        let card_w = i32::from(self.settings_geometry().2) - sx - 24;
+        if x >= sx + 12 && x <= sx + card_w - 12 {
+            for (idx, dev) in read_audio_devices(AudioDeviceKind::Output)
+                .iter()
+                .take(3)
+                .enumerate()
+            {
+                let row_y = 260 + idx as i32 * 30;
+                if y >= row_y - 3 && y <= row_y + 21 {
+                    self.settings.audio_status =
+                        match set_default_audio_device(AudioDeviceKind::Output, dev) {
+                            Ok(()) => Some(format!("Output set to {}", dev.label)),
+                            Err(err) => Some(err),
+                        };
+                    self.redraw_settings()?;
+                    return Ok(());
+                }
+            }
+            for (idx, dev) in read_audio_devices(AudioDeviceKind::Input)
+                .iter()
+                .take(2)
+                .enumerate()
+            {
+                let row_y = 432 + idx as i32 * 30;
+                if y >= row_y - 3 && y <= row_y + 21 {
+                    self.settings.audio_status =
+                        match set_default_audio_device(AudioDeviceKind::Input, dev) {
+                            Ok(()) => Some(format!("Input set to {}", dev.label)),
+                            Err(err) => Some(err),
+                        };
+                    self.redraw_settings()?;
+                    return Ok(());
+                }
+            }
         }
         Ok(())
     }
@@ -13858,36 +13995,212 @@ fn read_nics() -> Vec<String> {
     out
 }
 
-fn read_audio_devices(kind: &str) -> Vec<String> {
-    let Ok(output) = Command::new("pactl")
-        .arg("list")
-        .arg("short")
-        .arg(kind)
-        .output()
-    else {
-        return vec!["PulseAudio/PipeWire device list unavailable".to_string()];
+fn read_audio_devices(kind: AudioDeviceKind) -> Vec<AudioDevice> {
+    let default_name = read_pactl_default_audio_device(kind);
+    let mut devices = read_pactl_audio_devices(kind, default_name.as_deref());
+    if devices.is_empty() {
+        devices = read_wpctl_audio_devices(kind);
+    }
+    if kind == AudioDeviceKind::Input {
+        let filtered = devices
+            .iter()
+            .filter(|device| !device.name.ends_with(".monitor"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !filtered.is_empty() {
+            devices = filtered;
+        }
+    }
+    devices.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.label.cmp(&b.label)));
+    devices
+}
+
+fn read_pactl_default_audio_device(kind: AudioDeviceKind) -> Option<String> {
+    let output = pulse_command_output("pactl", &["info"])?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(kind.pactl_default_key())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn read_pactl_audio_devices(kind: AudioDeviceKind, default_name: Option<&str>) -> Vec<AudioDevice> {
+    let Some(output) = pulse_command_output("pactl", &["list", kind.pactl_list_arg()]) else {
+        return Vec::new();
     };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut devices = Vec::new();
+    let mut id = String::new();
+    let mut name = String::new();
+    let mut label = String::new();
+    let header = match kind {
+        AudioDeviceKind::Output => "Sink #",
+        AudioDeviceKind::Input => "Source #",
+    };
+    let push_device =
+        |devices: &mut Vec<AudioDevice>, id: &mut String, name: &mut String, label: &mut String| {
+            if name.is_empty() {
+                id.clear();
+                label.clear();
+                return;
+            }
+            let display = if label.is_empty() {
+                prettify_audio_name(name)
+            } else {
+                label.clone()
+            };
+            let is_default = default_name.is_some_and(|default| default == name || default == id);
+            devices.push(AudioDevice {
+                id: id.clone(),
+                name: name.clone(),
+                label: display,
+                is_default,
+            });
+            id.clear();
+            name.clear();
+            label.clear();
+        };
+
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix(header) {
+            push_device(&mut devices, &mut id, &mut name, &mut label);
+            id = value.trim().to_string();
+        } else if let Some(value) = line.trim().strip_prefix("Name:") {
+            name = value.trim().to_string();
+        } else if let Some(value) = line.trim().strip_prefix("Description:") {
+            label = value.trim().to_string();
+        }
+    }
+    push_device(&mut devices, &mut id, &mut name, &mut label);
+    if devices.is_empty() {
+        read_pactl_short_audio_devices(kind, default_name)
+    } else {
+        devices
+    }
+}
+
+fn read_pactl_short_audio_devices(
+    kind: AudioDeviceKind,
+    default_name: Option<&str>,
+) -> Vec<AudioDevice> {
+    let Some(output) = pulse_command_output("pactl", &["list", "short", kind.pactl_list_arg()])
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let id = parts.next()?.to_string();
+            let name = parts.next()?.to_string();
+            let is_default = default_name.is_some_and(|default| default == name || default == id);
+            Some(AudioDevice {
+                id,
+                label: prettify_audio_name(&name),
+                name,
+                is_default,
+            })
+        })
         .collect()
 }
 
+fn read_wpctl_audio_devices(kind: AudioDeviceKind) -> Vec<AudioDevice> {
+    let Some(output) = pulse_command_output("wpctl", &["status"]) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let wanted = match kind {
+        AudioDeviceKind::Output => "Sinks:",
+        AudioDeviceKind::Input => "Sources:",
+    };
+    let mut in_audio = false;
+    let mut in_section = false;
+    let mut devices = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Audio" {
+            in_audio = true;
+            in_section = false;
+            continue;
+        }
+        if matches!(trimmed, "Video" | "Settings") {
+            in_audio = false;
+            in_section = false;
+        }
+        if !in_audio {
+            continue;
+        }
+        if trimmed.contains(wanted) {
+            in_section = true;
+            continue;
+        }
+        if in_section && (trimmed.starts_with("├─") || trimmed.starts_with("└─")) {
+            break;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some(dot) = trimmed.find('.') else {
+            continue;
+        };
+        let prefix = trimmed[..dot].replace(['│', '*'], " ");
+        let Some(id) = prefix.split_whitespace().last() else {
+            continue;
+        };
+        if !id.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let rest = trimmed[dot + 1..].trim();
+        let label = rest
+            .split_once("  [")
+            .map(|(label, _)| label)
+            .or_else(|| rest.split_once(" [").map(|(label, _)| label))
+            .unwrap_or(rest)
+            .trim();
+        if label.is_empty() {
+            continue;
+        }
+        devices.push(AudioDevice {
+            id: id.to_string(),
+            name: id.to_string(),
+            label: label.to_string(),
+            is_default: trimmed.contains('*'),
+        });
+    }
+    devices
+}
+
+fn prettify_audio_name(name: &str) -> String {
+    name.replace("alsa_output.", "")
+        .replace("alsa_input.", "")
+        .replace("pci-", "PCI ")
+        .replace("usb-", "USB ")
+        .replace(['_', '.'], " ")
+}
+
 fn read_audio_volume_percent() -> Option<u8> {
-    if let Ok(output) = Command::new("pactl")
-        .args(["get-sink-volume", "@DEFAULT_SINK@"])
-        .output()
-    {
+    if let Some(output) = pulse_command_output("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]) {
         if output.status.success() {
             if let Some(percent) = parse_first_percent(&String::from_utf8_lossy(&output.stdout)) {
                 return Some(percent);
             }
         }
     }
-    if let Ok(output) = Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-        .output()
-    {
+    if let Some(output) = pulse_command_output("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
             if let Some(value) = text
@@ -13917,9 +14230,11 @@ fn set_audio_volume_percent(percent: u8) -> Result<(), String> {
     let pactl_percent = format!("{percent}%");
     let mut pactl = Command::new("pactl");
     pactl.args(["set-sink-volume", "@DEFAULT_SINK@", &pactl_percent]);
+    apply_pulse_env_defaults(&mut pactl);
     if command_status_success(&mut pactl) {
         let mut unmute = Command::new("pactl");
         unmute.args(["set-sink-mute", "@DEFAULT_SINK@", "0"]);
+        apply_pulse_env_defaults(&mut unmute);
         let _ = command_status_success(&mut unmute);
         return Ok(());
     }
@@ -13927,9 +14242,11 @@ fn set_audio_volume_percent(percent: u8) -> Result<(), String> {
     let wpctl_value = format!("{:.2}", f32::from(percent) / 100.0);
     let mut wpctl = Command::new("wpctl");
     wpctl.args(["set-volume", "@DEFAULT_AUDIO_SINK@", &wpctl_value]);
+    apply_pulse_env_defaults(&mut wpctl);
     if command_status_success(&mut wpctl) {
         let mut unmute = Command::new("wpctl");
         unmute.args(["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]);
+        apply_pulse_env_defaults(&mut unmute);
         let _ = command_status_success(&mut unmute);
         return Ok(());
     }
@@ -13941,6 +14258,49 @@ fn set_audio_volume_percent(percent: u8) -> Result<(), String> {
     }
 
     Err("Could not set audio volume".to_string())
+}
+
+fn set_default_audio_device(kind: AudioDeviceKind, device: &AudioDevice) -> Result<(), String> {
+    let mut pactl = Command::new("pactl");
+    pactl.args([kind.pactl_set_default_command(), &device.name]);
+    apply_pulse_env_defaults(&mut pactl);
+    if command_status_success(&mut pactl) {
+        move_current_audio_streams(kind, &device.name);
+        return Ok(());
+    }
+
+    if !device.id.is_empty() {
+        let mut wpctl = Command::new("wpctl");
+        wpctl.args(["set-default", &device.id]);
+        apply_pulse_env_defaults(&mut wpctl);
+        if command_status_success(&mut wpctl) {
+            return Ok(());
+        }
+    }
+
+    Err(format!("Could not set {} as default", device.label))
+}
+
+fn move_current_audio_streams(kind: AudioDeviceKind, device_name: &str) {
+    let (list_arg, move_arg) = match kind {
+        AudioDeviceKind::Output => ("sink-inputs", "move-sink-input"),
+        AudioDeviceKind::Input => ("source-outputs", "move-source-output"),
+    };
+    let Some(output) = pulse_command_output("pactl", &["list", "short", list_arg]) else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    for stream_id in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        let mut cmd = Command::new("pactl");
+        cmd.args([move_arg, stream_id, device_name]);
+        apply_pulse_env_defaults(&mut cmd);
+        let _ = command_status_success(&mut cmd);
+    }
 }
 
 fn read_network_details() -> Vec<String> {
@@ -15000,6 +15360,13 @@ fn command_status_success(cmd: &mut Command) -> bool {
 
 fn shell_quote_text(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn pulse_command_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    apply_pulse_env_defaults(&mut cmd);
+    cmd.output().ok()
 }
 
 fn apply_pulse_env_defaults(cmd: &mut Command) {
