@@ -10356,6 +10356,7 @@ impl Aurora {
                 if let Some(path) = self.folder_selected.as_ref() {
                     let mut cmd = Command::new("xdg-open");
                     cmd.env("DISPLAY", &self.display).arg(path);
+                    apply_pulse_env_defaults(&mut cmd);
                     spawn_detached(cmd);
                 }
             }
@@ -10415,6 +10416,7 @@ impl Aurora {
                 .args(["-left", &i32::from(ffplay_x).to_string()])
                 .args(["-top", &i32::from(ffplay_y).to_string()])
                 .arg(&path_str);
+            apply_pulse_env_defaults(&mut cmd);
             match cmd
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -11393,6 +11395,7 @@ impl Aurora {
         if let Some(path) = path {
             cmd.arg(path);
         }
+        apply_pulse_env_defaults(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -11417,6 +11420,7 @@ impl Aurora {
             if command_exists(name) {
                 let mut cmd = Command::new(name);
                 cmd.env("DISPLAY", &self.display).args(args);
+                apply_pulse_env_defaults(&mut cmd);
                 spawn_detached(cmd);
                 break;
             }
@@ -14996,6 +15000,32 @@ fn command_status_success(cmd: &mut Command) -> bool {
 
 fn shell_quote_text(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn apply_pulse_env_defaults(cmd: &mut Command) {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| {
+        let uid = unsafe { libc::geteuid() };
+        format!("/run/user/{uid}").into()
+    });
+    cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+
+    if env::var_os("PULSE_SERVER").is_none() {
+        let native = PathBuf::from(&runtime_dir).join("pulse/native");
+        let server = format!("unix:{}", native.to_string_lossy());
+        cmd.env("PULSE_SERVER", server);
+    }
+    if env::var_os("PULSE_RUNTIME_PATH").is_none() {
+        cmd.env(
+            "PULSE_RUNTIME_PATH",
+            PathBuf::from(&runtime_dir).join("pulse"),
+        );
+    }
+    if env::var_os("PULSE_COOKIE").is_none() {
+        let cookie = home_dir().join(".config/pulse/cookie");
+        if cookie.exists() {
+            cmd.env("PULSE_COOKIE", cookie);
+        }
+    }
 }
 
 fn spawn_detached(mut cmd: Command) {
