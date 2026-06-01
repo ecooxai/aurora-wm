@@ -4480,25 +4480,9 @@ impl Aurora {
         );
 
         let controls = self.topbar_controls();
-        draw_topbar_tool_button(&mut c, controls.screenshot_x, self.screenshot_mode);
         draw_screenshot_icon(&mut c, controls.screenshot_x, 20, MINT_LIGHT);
-        draw_topbar_tool_button(
-            &mut c,
-            controls.display_x,
-            self.settings_visible && self.settings.tab == SettingsTab::Display,
-        );
         draw_sidebar_display_icon(&mut c, controls.display_x, 20, MINT_LIGHT);
-        draw_topbar_tool_button(
-            &mut c,
-            controls.audio_x,
-            self.settings_visible && self.settings.tab == SettingsTab::Audio,
-        );
         draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
-        draw_topbar_tool_button(
-            &mut c,
-            controls.network_x,
-            self.settings_visible && self.settings.tab == SettingsTab::Network,
-        );
         draw_sidebar_network_icon(&mut c, controls.network_x, 20, MINT_LIGHT);
         let battery = self.metrics.battery.as_deref().unwrap_or("100%");
         c.draw_round_rect(
@@ -12984,21 +12968,6 @@ fn draw_screenshot_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     c.draw_round_rect(cx - 10, cy - 8, 20, 16, 5, fill);
     c.draw_circle(cx, cy, 4, Color::rgba(255, 255, 255, 210));
     c.draw_circle(cx, cy, 2, fill);
-}
-
-fn draw_topbar_tool_button(c: &mut Canvas, cx: i32, active: bool) {
-    c.draw_round_rect(
-        cx - 14,
-        7,
-        28,
-        26,
-        8,
-        if active {
-            Color::rgba(116, 213, 198, 118)
-        } else {
-            Color::rgba(255, 255, 255, 42)
-        },
-    );
 }
 
 fn draw_copy_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
