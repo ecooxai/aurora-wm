@@ -3,11 +3,14 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::CString;
 use std::fs;
+use std::io;
 use std::io::Read;
 use std::os::fd::RawFd;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,7 +20,7 @@ use time::OffsetDateTime;
 use x11rb::CURRENT_TIME;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ReplyError;
-use x11rb::image::{BitsPerPixel, Image, ImageOrder, ScanlinePad};
+use x11rb::image::{BitsPerPixel, Image, ImageOrder as XrbImageOrder, ScanlinePad};
 use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
 use x11rb::protocol::shape::{self, ConnectionExt as ShapeConnectionExt};
 use x11rb::protocol::xfixes::{self, ConnectionExt as XFixesConnectionExt};
@@ -499,6 +502,7 @@ impl PowerMode {
 struct SettingsState {
     tab: SettingsTab,
     sleep_after_secs: u32,
+    brightness_percent: u8,
     power_mode: PowerMode,
     auto_power_saver_minutes: u32,
     auto_power_saver_input: String,
@@ -515,6 +519,7 @@ struct SettingsState {
     display_status: Option<String>,
     audio_status: Option<String>,
     wifi_networks: Vec<WifiNetwork>,
+    wifi_scroll: usize,
     wifi_selected: Option<String>,
     wifi_password: String,
     wifi_password_editing: bool,
@@ -530,6 +535,7 @@ impl Default for SettingsState {
         Self {
             tab: SettingsTab::Display,
             sleep_after_secs: read_u32_setting("sleep_after_secs", 600).min(7200),
+            brightness_percent: read_u32_setting("brightness_percent", 100).clamp(10, 100) as u8,
             power_mode: PowerMode::Balanced,
             auto_power_saver_minutes,
             auto_power_saver_input: auto_power_saver_minutes.to_string(),
@@ -546,6 +552,7 @@ impl Default for SettingsState {
             display_status: None,
             audio_status: None,
             wifi_networks: Vec::new(),
+            wifi_scroll: 0,
             wifi_selected: None,
             wifi_password: String::new(),
             wifi_password_editing: false,
@@ -734,6 +741,7 @@ struct DragState {
     start_h: u16,
     kind: DragKind,
     resize_edges: ResizeEdges,
+    last_update_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -1130,6 +1138,12 @@ struct WifiConnection {
     ip: Option<String>,
 }
 
+struct WifiRefreshResult {
+    radio_enabled: bool,
+    connected: Option<WifiConnection>,
+    networks: Option<Result<Vec<WifiNetwork>, String>>,
+}
+
 struct Aurora {
     conn: RustConnection,
     display: String,
@@ -1143,7 +1157,7 @@ struct Aurora {
     wallpaper_index: usize,
     wallpaper_pixels: Vec<u8>,
     wallpaper_cache: Vec<Option<Vec<u8>>>,
-    wallpaper_previews: Vec<Vec<u8>>,
+    wallpaper_previews: Vec<Option<Vec<u8>>>,
     wallpaper_pixmap: Option<Pixmap>,
     shape_supported: bool,
     ui: UiWindows,
@@ -1233,7 +1247,10 @@ struct Aurora {
     topbar_notice: Option<(String, Instant)>,
     ffplay_process: Option<std::process::Child>,
     pending_window_nudges: Vec<PendingWindowNudge>,
+    wifi_refresh_rx: Option<Receiver<WifiRefreshResult>>,
     focus_history: Vec<Window>,
+    alt_tab_index: usize,
+    alt_tab_windows: Vec<Window>,
     choose_file_mode: bool,
 }
 
@@ -1246,13 +1263,16 @@ fn main() {
 
 fn run() -> AnyResult<()> {
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() >= 3 && args[1] == "--open-folder" {
         let display = env::var("DISPLAY").unwrap_or_else(|_| ":11".to_string());
         let (conn, _screen_num) = RustConnection::connect(Some(&display))?;
         let setup = conn.setup();
         let root = setup.roots[0].root;
-        let path_atom = conn.intern_atom(false, b"_AURORA_OPEN_FOLDER_PATH")?.reply()?.atom;
+        let path_atom = conn
+            .intern_atom(false, b"_AURORA_OPEN_FOLDER_PATH")?
+            .reply()?
+            .atom;
         let string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
         let path = std::path::PathBuf::from(&args[2]);
         let abs_path = std::fs::canonicalize(&path).unwrap_or(path);
@@ -1264,7 +1284,10 @@ fn run() -> AnyResult<()> {
             string_atom,
             path_str.as_bytes(),
         )?;
-        let open_atom = conn.intern_atom(false, b"_AURORA_OPEN_FOLDER")?.reply()?.atom;
+        let open_atom = conn
+            .intern_atom(false, b"_AURORA_OPEN_FOLDER")?
+            .reply()?
+            .atom;
         let event = ClientMessageEvent {
             response_type: CLIENT_MESSAGE_EVENT,
             format: 32,
@@ -1284,10 +1307,16 @@ fn run() -> AnyResult<()> {
         let (conn, _screen_num) = RustConnection::connect(Some(&display))?;
         let setup = conn.setup();
         let root = setup.roots[0].root;
-        let result_atom = conn.intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?.reply()?.atom;
+        let result_atom = conn
+            .intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?
+            .reply()?
+            .atom;
         conn.delete_property(root, result_atom)?;
-        
-        let choose_atom = conn.intern_atom(false, b"_AURORA_CHOOSE_FILE")?.reply()?.atom;
+
+        let choose_atom = conn
+            .intern_atom(false, b"_AURORA_CHOOSE_FILE")?
+            .reply()?
+            .atom;
         let event = ClientMessageEvent {
             response_type: CLIENT_MESSAGE_EVENT,
             format: 32,
@@ -1298,11 +1327,14 @@ fn run() -> AnyResult<()> {
         };
         conn.send_event(false, root, EventMask::STRUCTURE_NOTIFY, event)?;
         conn.flush()?;
-        
+
         let string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
         let start_time = std::time::Instant::now();
         loop {
-            if let Ok(prop) = conn.get_property(false, root, result_atom, string_atom, 0, 65535)?.reply() {
+            if let Ok(prop) = conn
+                .get_property(false, root, result_atom, string_atom, 0, 65535)?
+                .reply()
+            {
                 if !prop.value.is_empty() {
                     let result_str = String::from_utf8_lossy(&prop.value);
                     if result_str == "CANCEL" {
@@ -1415,6 +1447,59 @@ fn become_wm(conn: &RustConnection, screen: &Screen) -> Result<(), ReplyError> {
     .check()
 }
 
+fn event_name(event: &Event) -> &'static str {
+    match event {
+        Event::KeyPress(_) => "KeyPress",
+        Event::KeyRelease(_) => "KeyRelease",
+        Event::ButtonPress(_) => "ButtonPress",
+        Event::ButtonRelease(_) => "ButtonRelease",
+        Event::MotionNotify(_) => "MotionNotify",
+        Event::EnterNotify(_) => "EnterNotify",
+        Event::LeaveNotify(_) => "LeaveNotify",
+        Event::FocusIn(_) => "FocusIn",
+        Event::FocusOut(_) => "FocusOut",
+        Event::Expose(_) => "Expose",
+        Event::GraphicsExposure(_) => "GraphicsExposure",
+        Event::NoExposure(_) => "NoExposure",
+        Event::VisibilityNotify(_) => "VisibilityNotify",
+        Event::CreateNotify(_) => "CreateNotify",
+        Event::DestroyNotify(_) => "DestroyNotify",
+        Event::UnmapNotify(_) => "UnmapNotify",
+        Event::MapNotify(_) => "MapNotify",
+        Event::MapRequest(_) => "MapRequest",
+        Event::ReparentNotify(_) => "ReparentNotify",
+        Event::ConfigureNotify(_) => "ConfigureNotify",
+        Event::ConfigureRequest(_) => "ConfigureRequest",
+        Event::GravityNotify(_) => "GravityNotify",
+        Event::ResizeRequest(_) => "ResizeRequest",
+        Event::CirculateNotify(_) => "CirculateNotify",
+        Event::CirculateRequest(_) => "CirculateRequest",
+        Event::PropertyNotify(_) => "PropertyNotify",
+        Event::SelectionClear(_) => "SelectionClear",
+        Event::SelectionRequest(_) => "SelectionRequest",
+        Event::SelectionNotify(_) => "SelectionNotify",
+        Event::ColormapNotify(_) => "ColormapNotify",
+        Event::ClientMessage(_) => "ClientMessage",
+        Event::MappingNotify(_) => "MappingNotify",
+        _ => "Other",
+    }
+}
+
+fn wait_for_x_event_or_timeout(conn: &RustConnection, timeout: Duration) {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let mut poll_fd = libc::pollfd {
+        fd: conn.stream().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
+    }
+}
+
 fn init_light_compositor(conn: &RustConnection, root: Window) -> bool {
     let Ok(Some(_)) = conn.extension_information(composite::X11_EXTENSION_NAME) else {
         eprintln!("aurora-wm: Composite extension unavailable; compositor disabled");
@@ -1480,10 +1565,7 @@ impl Aurora {
         )?;
         let mut wallpaper_cache = vec![None; WALLPAPERS.len()];
         wallpaper_cache[0] = Some(wallpaper_pixels.clone());
-        let wallpaper_previews = WALLPAPERS
-            .iter()
-            .map(|asset| render_asset_preview_pixels(asset.bytes, 92, 56).unwrap_or_default())
-            .collect();
+        let wallpaper_previews = vec![None; WALLPAPERS.len()];
         init_light_compositor(&conn, screen.root);
         let shape_supported = conn
             .extension_information(shape::X11_EXTENSION_NAME)?
@@ -1621,7 +1703,10 @@ impl Aurora {
             topbar_notice: None,
             ffplay_process: None,
             pending_window_nudges: Vec::new(),
+            wifi_refresh_rx: None,
             focus_history: Vec::new(),
+            alt_tab_index: 0,
+            alt_tab_windows: Vec::new(),
             choose_file_mode: false,
         };
         app.apply_sleep_timeout();
@@ -1634,28 +1719,29 @@ impl Aurora {
     }
 
     fn run_loop(&mut self) -> AnyResult<()> {
+        let trace_events = env::var_os("AURORA_TRACE_EVENTS").is_some();
+        let mut trace_counts: HashMap<&'static str, usize> = HashMap::new();
+        let mut next_trace_log = Instant::now() + Duration::from_secs(1);
+        let mut next_pointer_poll = Instant::now();
         loop {
             let mut handled_event = false;
             let mut pending_motion = None;
             while let Some(event) = self.conn.poll_for_event()? {
+                if trace_events {
+                    *trace_counts.entry(event_name(&event)).or_default() += 1;
+                }
                 if let Event::MotionNotify(ev) = event {
-                    if self.drag.is_some() {
-                        handled_event = true;
-                        pending_motion = Some(ev);
-                    } else {
-                        handled_event = true;
-                        self.handle_motion_notify(ev)?;
-                    }
+                    pending_motion = Some(ev);
                 } else {
                     handled_event = true;
                     if let Some(ev) = pending_motion.take() {
-                        self.handle_motion_notify(ev)?;
+                        handled_event |= self.handle_motion_notify(ev)?;
                     }
                     self.handle_event(event)?;
                 }
             }
             if let Some(ev) = pending_motion.take() {
-                self.handle_motion_notify(ev)?;
+                handled_event |= self.handle_motion_notify(ev)?;
             }
 
             if self.folder_terminal.visible && self.poll_folder_terminal()? {
@@ -1664,9 +1750,12 @@ impl Aurora {
             if self.folder_terminal.visible && self.sync_folder_to_terminal_cwd()? {
                 handled_event = true;
             }
+            if self.poll_wifi_refresh()? {
+                handled_event = true;
+            }
 
             if let Some(pending) = self.pending_resize {
-                if pending.pressed_at.elapsed() >= Duration::from_secs(1) {
+                if pending.pressed_at.elapsed() >= Duration::from_secs(2) {
                     self.pending_resize = None;
                     self.start_resize(
                         pending.client,
@@ -1684,8 +1773,42 @@ impl Aurora {
                 }
             }
 
-            if let Some(pending) = self.pending_client_drag {
-                let pointer = self.conn.query_pointer(self.root)?.reply()?;
+            let needs_pointer_poll = self.pending_resize.is_some()
+                || self.pending_ui_resize.is_some()
+                || self.pending_client_drag.is_some()
+                || self.drag.is_some()
+                || self.ui_resize.is_some()
+                || self.pending_screenshot_button.is_some();
+            let now = Instant::now();
+            let pointer = if needs_pointer_poll && now >= next_pointer_poll {
+                let interval = if self.drag.is_some() || self.ui_resize.is_some() {
+                    Duration::from_millis(16)
+                } else {
+                    Duration::from_millis(50)
+                };
+                next_pointer_poll = now + interval;
+                Some(self.conn.query_pointer(self.root)?.reply()?)
+            } else {
+                None
+            };
+
+            if let (Some(pending), Some(pointer)) = (self.pending_resize, pointer.as_ref()) {
+                let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
+                if !button_down || pending.pressed_at.elapsed() >= Duration::from_secs(5) {
+                    self.pending_resize = None;
+                    let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+                }
+            }
+
+            if let (Some(pending), Some(pointer)) = (self.pending_ui_resize, pointer.as_ref()) {
+                let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
+                if !button_down || pending.pressed_at.elapsed() >= Duration::from_secs(5) {
+                    self.pending_ui_resize = None;
+                    let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+                }
+            }
+
+            if let (Some(pending), Some(pointer)) = (self.pending_client_drag, pointer.as_ref()) {
                 let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
                 if !button_down {
                     self.pending_client_drag = None;
@@ -1695,33 +1818,32 @@ impl Aurora {
                     if moved && pending.pressed_at.elapsed() >= Duration::from_millis(500) {
                         self.pending_client_drag = None;
                         self.start_drag(pending.client, pointer.root_x, pointer.root_y)?;
+                    } else if pending.pressed_at.elapsed() >= Duration::from_secs(2) {
+                        self.pending_client_drag = None;
                     }
                 }
             }
-            if self.drag.is_some() {
-                let pointer = self.conn.query_pointer(self.root)?.reply()?;
+            if let Some(pointer) = pointer.as_ref().filter(|_| self.drag.is_some()) {
                 let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
                 if button_down {
-                    self.update_drag_position(pointer.root_x, pointer.root_y)?;
-                    handled_event = true;
+                    handled_event |= self.update_drag_position(pointer.root_x, pointer.root_y)?;
                 } else {
                     self.drag = None;
                     let _ = self.conn.ungrab_pointer(CURRENT_TIME);
                 }
             }
-            if self.ui_resize.is_some() {
-                let pointer = self.conn.query_pointer(self.root)?.reply()?;
+            if let Some(pointer) = pointer.as_ref().filter(|_| self.ui_resize.is_some()) {
                 let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
                 if button_down {
-                    self.update_ui_resize(pointer.root_x, pointer.root_y)?;
-                    handled_event = true;
+                    handled_event |= self.update_ui_resize(pointer.root_x, pointer.root_y)?;
                 } else {
                     self.end_drag()?;
                 }
             }
 
-            if let Some(pending) = self.pending_screenshot_button {
-                let pointer = self.conn.query_pointer(self.root)?.reply()?;
+            if let (Some(pending), Some(pointer)) =
+                (self.pending_screenshot_button, pointer.as_ref())
+            {
                 let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
                 if button_down && pending.pressed_at.elapsed() >= Duration::from_secs(2) {
                     self.pending_screenshot_button = None;
@@ -1746,7 +1868,9 @@ impl Aurora {
                 self.conn.flush()?;
             }
 
-            if self.last_media_tick.elapsed() >= Duration::from_millis(250) {
+            if self.has_playing_internal_media()
+                && self.last_media_tick.elapsed() >= Duration::from_millis(250)
+            {
                 self.last_media_tick = Instant::now();
                 if self.advance_internal_media()? {
                     self.conn.flush()?;
@@ -1768,7 +1892,15 @@ impl Aurora {
                 }
             }
 
-            if self.settings.auto_power_saver_minutes > 0
+            let interactive = self.drag.is_some()
+                || self.ui_resize.is_some()
+                || self.pending_resize.is_some()
+                || self.pending_ui_resize.is_some()
+                || self.pending_client_drag.is_some()
+                || self.pending_screenshot_button.is_some();
+
+            if !interactive
+                && self.settings.auto_power_saver_minutes > 0
                 && self.last_power_saver_check.elapsed() >= Duration::from_secs(5)
             {
                 self.last_power_saver_check = Instant::now();
@@ -1777,7 +1909,7 @@ impl Aurora {
                 }
             }
 
-            if self.last_tick.elapsed() >= Duration::from_millis(3000) {
+            if !interactive && self.last_tick.elapsed() >= Duration::from_millis(3000) {
                 self.last_tick = Instant::now();
                 self.metrics = self.sampler.sample();
                 let clock_label = format_clock();
@@ -1787,7 +1919,6 @@ impl Aurora {
                 }
                 if self.settings_visible {
                     if self.settings.tab == SettingsTab::Network {
-                        self.update_cached_wifi_status();
                         self.redraw_settings()?;
                     } else if matches!(self.settings.tab, SettingsTab::Power | SettingsTab::About) {
                         self.redraw_settings()?;
@@ -1796,16 +1927,96 @@ impl Aurora {
                 self.conn.flush()?;
             }
 
-            thread::sleep(if handled_event {
-                if self.drag.is_some() {
-                    Duration::from_millis(1)
-                } else {
-                    Duration::from_millis(3)
+            if trace_events && Instant::now() >= next_trace_log {
+                if !trace_counts.is_empty() {
+                    eprintln!("event counts: {:?}", trace_counts);
+                    trace_counts.clear();
                 }
-            } else {
-                Duration::from_millis(8)
-            });
+                next_trace_log = Instant::now() + Duration::from_secs(1);
+            }
+
+            wait_for_x_event_or_timeout(
+                &self.conn,
+                self.loop_wait_timeout(handled_event, needs_pointer_poll, next_pointer_poll),
+            );
         }
+    }
+
+    fn has_playing_internal_media(&self) -> bool {
+        self.media_slots.iter().any(|slot| {
+            slot.as_ref().is_some_and(|media| {
+                media.playing && matches!(media.entry.kind, FileKind::Audio | FileKind::Video)
+            })
+        })
+    }
+
+    fn loop_wait_timeout(
+        &self,
+        handled_event: bool,
+        needs_pointer_poll: bool,
+        next_pointer_poll: Instant,
+    ) -> Duration {
+        let now = Instant::now();
+        let interactive = self.drag.is_some()
+            || self.ui_resize.is_some()
+            || self.pending_resize.is_some()
+            || self.pending_ui_resize.is_some()
+            || self.pending_client_drag.is_some()
+            || self.pending_screenshot_button.is_some();
+        let mut timeout = if handled_event {
+            if interactive {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(4)
+            }
+        } else if interactive {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(250)
+        };
+
+        if needs_pointer_poll {
+            timeout = timeout.min(next_pointer_poll.saturating_duration_since(now));
+        }
+        if let Some(pending) = self.pending_resize {
+            timeout = timeout
+                .min((pending.pressed_at + Duration::from_secs(2)).saturating_duration_since(now));
+        }
+        if let Some(pending) = self.pending_ui_resize {
+            timeout = timeout
+                .min((pending.pressed_at + Duration::from_secs(1)).saturating_duration_since(now));
+        }
+        if let Some(pending) = self.pending_client_drag {
+            timeout = timeout.min(
+                (pending.pressed_at + Duration::from_millis(500)).saturating_duration_since(now),
+            );
+        }
+        if let Some(pending) = self.pending_screenshot_button {
+            timeout = timeout
+                .min((pending.pressed_at + Duration::from_secs(2)).saturating_duration_since(now));
+        }
+        if let Some((_, until)) = self.topbar_notice.as_ref() {
+            timeout = timeout.min((*until).saturating_duration_since(now));
+        }
+        if let Some(at) = self.pending_auto_power_saver_apply {
+            timeout = timeout.min(at.saturating_duration_since(now));
+        }
+        if self.has_playing_internal_media() {
+            timeout = timeout.min(
+                (self.last_media_tick + Duration::from_millis(250)).saturating_duration_since(now),
+            );
+        }
+        if !interactive {
+            if self.settings.auto_power_saver_minutes > 0 {
+                timeout = timeout.min(
+                    (self.last_power_saver_check + Duration::from_secs(5))
+                        .saturating_duration_since(now),
+                );
+            }
+            timeout = timeout
+                .min((self.last_tick + Duration::from_millis(3000)).saturating_duration_since(now));
+        }
+        timeout
     }
 
     fn update_auto_power_saver(&mut self) -> AnyResult<bool> {
@@ -2211,10 +2422,18 @@ impl Aurora {
                     self.handle_media_release(slot)?;
                 } else {
                     self.pending_client_drag = None;
+                    if self.drag.is_some() {
+                        let _ = self.update_drag_position_inner(ev.root_x, ev.root_y, true)?;
+                    }
+                    if self.ui_resize.is_some() {
+                        let _ = self.update_ui_resize(ev.root_x, ev.root_y)?;
+                    }
                     self.end_drag()?;
                 }
             }
-            Event::MotionNotify(ev) => self.handle_motion_notify(ev)?,
+            Event::MotionNotify(ev) => {
+                self.handle_motion_notify(ev)?;
+            }
             Event::LeaveNotify(ev) => self.handle_leave_notify(ev)?,
             Event::EnterNotify(ev) => self.handle_enter_notify(ev)?,
             Event::ClientMessage(ev) => self.handle_client_message(ev)?,
@@ -2241,18 +2460,42 @@ impl Aurora {
                     self.remove_client(ev.window)?;
                 }
             }
-            Event::PropertyNotify(ev) => {
-                if self.clients.contains_key(&ev.window) {
-                    self.update_client_chrome(ev.window)?;
-                    self.redraw_dock()?;
-                }
-            }
+            Event::PropertyNotify(ev) => self.handle_property_notify(ev)?,
             Event::ConfigureNotify(ev) => {
                 if ev.window == self.root {
                     self.resize_to_root()?;
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_property_notify(&mut self, ev: PropertyNotifyEvent) -> AnyResult<()> {
+        if !self.clients.contains_key(&ev.window) {
+            return Ok(());
+        }
+        let relevant = ev.atom == AtomEnum::WM_NAME.into()
+            || ev.atom == AtomEnum::WM_CLASS.into()
+            || ev.atom == AtomEnum::WM_HINTS.into();
+        if !relevant {
+            return Ok(());
+        }
+
+        let had_titlebar = self
+            .clients
+            .get(&ev.window)
+            .is_some_and(|info| info.titlebar);
+        self.update_client_chrome(ev.window)?;
+        if self
+            .clients
+            .get(&ev.window)
+            .is_some_and(|info| info.titlebar)
+        {
+            self.redraw_frame_titlebar(ev.window)?;
+        }
+        if had_titlebar || ev.atom == AtomEnum::WM_HINTS.into() {
+            self.redraw_dock()?;
         }
         Ok(())
     }
@@ -2329,7 +2572,11 @@ impl Aurora {
             }
         } else if ev.event == self.ui.settings {
             if ev.detail == 4 || ev.detail == 5 {
-                self.handle_settings_scroll(ev.detail, i32::from(ev.event_x))?;
+                self.handle_settings_scroll(
+                    ev.detail,
+                    i32::from(ev.event_x),
+                    i32::from(ev.event_y),
+                )?;
                 self.conn.flush()?;
                 return Ok(());
             }
@@ -2444,15 +2691,16 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<()> {
+    fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<bool> {
         if self.drag.is_none() {
             if self.screenshot_mode {
                 if let Some(selection) = self.screenshot_selection.as_mut() {
                     selection.current_x = ev.root_x;
                     selection.current_y = ev.root_y;
                     self.update_screenshot_live_rect()?;
+                    return Ok(true);
                 }
-                return Ok(());
+                return Ok(false);
             }
             if let Some(pending) = self.pending_client_drag {
                 let moved = (i32::from(ev.root_x) - i32::from(pending.root_x)).abs() > 4
@@ -2460,9 +2708,10 @@ impl Aurora {
                 if moved && pending.pressed_at.elapsed() >= Duration::from_millis(500) {
                     self.pending_client_drag = None;
                     self.start_drag(pending.client, ev.root_x, ev.root_y)?;
-                    return Ok(());
+                    return Ok(true);
                 }
             }
+            let mut changed = false;
             if let Some(slot) = self.media_slot_for_window(ev.event) {
                 let button_down = u16::from(ev.state) & u16::from(KeyButMask::BUTTON1) != 0;
                 self.handle_media_motion(
@@ -2471,6 +2720,7 @@ impl Aurora {
                     i32::from(ev.event_y),
                     button_down,
                 )?;
+                changed |= button_down;
             }
             if ev.event == self.ui.folder_terminal {
                 let button_down = u16::from(ev.state) & u16::from(KeyButMask::BUTTON1) != 0;
@@ -2479,6 +2729,7 @@ impl Aurora {
                     i32::from(ev.event_y),
                     button_down,
                 )?;
+                changed |= button_down;
             }
             if let Some(ref mut pending) = self.pending_resize {
                 pending.root_x = ev.root_x;
@@ -2505,9 +2756,10 @@ impl Aurora {
                     if let Some((client, _)) = self.title_hover {
                         self.redraw_frame_titlebar(client)?;
                     }
+                    changed = true;
                 }
             }
-            return Ok(());
+            return Ok(changed);
         }
         if self.ui_resize.is_some() {
             return self.update_ui_resize(ev.root_x, ev.root_y);
@@ -2515,13 +2767,30 @@ impl Aurora {
         self.update_drag_position(ev.root_x, ev.root_y)
     }
 
-    fn update_drag_position(&mut self, root_x: i16, root_y: i16) -> AnyResult<()> {
-        let Some(drag) = self.drag else {
-            return Ok(());
+    fn update_drag_position(&mut self, root_x: i16, root_y: i16) -> AnyResult<bool> {
+        self.update_drag_position_inner(root_x, root_y, false)
+    }
+
+    fn update_drag_position_inner(
+        &mut self,
+        root_x: i16,
+        root_y: i16,
+        force: bool,
+    ) -> AnyResult<bool> {
+        let Some(mut drag) = self.drag else {
+            return Ok(false);
         };
+        let now = Instant::now();
+        let min_interval = match drag.kind {
+            DragKind::Move => Duration::from_millis(16),
+            DragKind::Resize => Duration::from_millis(33),
+        };
+        if !force && now.duration_since(drag.last_update_at) < min_interval {
+            return Ok(false);
+        }
         let Some(mut info) = self.clients.get(&drag.client).copied() else {
             self.drag = None;
-            return Ok(());
+            return Ok(true);
         };
         match drag.kind {
             DragKind::Move => {
@@ -2532,7 +2801,7 @@ impl Aurora {
                     .get(&drag.client)
                     .is_some_and(|old| old.x == info.x && old.y == info.y)
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 self.conn.configure_window(
                     info.frame,
@@ -2568,6 +2837,14 @@ impl Aurora {
                 info.y = new_y.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
                 info.width = new_w as u16;
                 info.height = new_h as u16;
+                if self.clients.get(&drag.client).is_some_and(|old| {
+                    old.x == info.x
+                        && old.y == info.y
+                        && old.width == info.width
+                        && old.height == info.height
+                }) {
+                    return Ok(false);
+                }
                 let title_h = self.titlebar_height(&info);
                 self.conn.configure_window(
                     info.frame,
@@ -2589,9 +2866,13 @@ impl Aurora {
                 self.redraw_frame_titlebar(drag.client)?;
             }
         }
+        drag.last_update_at = now;
+        self.drag = Some(drag);
         self.clients.insert(drag.client, info);
-        self.send_synthetic_configure(&info)?;
-        Ok(())
+        if force || matches!(drag.kind, DragKind::Resize) {
+            self.send_synthetic_configure(&info)?;
+        }
+        Ok(true)
     }
 
     fn handle_leave_notify(&mut self, ev: LeaveNotifyEvent) -> AnyResult<()> {
@@ -2628,9 +2909,17 @@ impl Aurora {
         }
         let open_folder_atom = self.atom(b"_AURORA_OPEN_FOLDER")?;
         if ev.type_ == open_folder_atom {
-            let path_atom = self.conn.intern_atom(false, b"_AURORA_OPEN_FOLDER_PATH")?.reply()?.atom;
+            let path_atom = self
+                .conn
+                .intern_atom(false, b"_AURORA_OPEN_FOLDER_PATH")?
+                .reply()?
+                .atom;
             let string_atom = self.conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
-            if let Ok(prop) = self.conn.get_property(false, self.root, path_atom, string_atom, 0, 65535)?.reply() {
+            if let Ok(prop) = self
+                .conn
+                .get_property(false, self.root, path_atom, string_atom, 0, 65535)?
+                .reply()
+            {
                 if !prop.value.is_empty() {
                     let path_str = String::from_utf8_lossy(&prop.value).into_owned();
                     let path = PathBuf::from(path_str);
@@ -2890,7 +3179,7 @@ impl Aurora {
         }
         if resize_side_hint_for_frame(&info, ev.event_x) {
             self.set_topbar_notice(
-                "Resize from the bottom-left or bottom-right corner: hold 1s, then drag",
+                "Resize from the bottom-left or bottom-right corner: hold 2s, then drag",
                 Duration::from_secs(3),
             )?;
         }
@@ -2935,7 +3224,7 @@ impl Aurora {
         } else {
             if resize_side_hint_for_client(&info, client_x) {
                 self.set_topbar_notice(
-                    "Resize from the bottom-left or bottom-right corner: hold 1s, then drag",
+                    "Resize from the bottom-left or bottom-right corner: hold 2s, then drag",
                     Duration::from_secs(3),
                 )?;
             }
@@ -2990,7 +3279,7 @@ impl Aurora {
                 }
                 if resize_side_hint_for_frame(&info, frame_x) {
                     self.set_topbar_notice(
-                        "Resize from the bottom-left or bottom-right corner: hold 1s, then drag",
+                        "Resize from the bottom-left or bottom-right corner: hold 2s, then drag",
                         Duration::from_secs(3),
                     )?;
                 }
@@ -3089,13 +3378,17 @@ impl Aurora {
         };
         let lock = ModMask::LOCK;
         let num_lock = ModMask::M2;
-        
-        // Grab Alt + Tab
+
+        // Grab Alt + Tab and Alt + Shift + Tab
         for modifiers in [
             ModMask::M1,
+            ModMask::M1 | ModMask::SHIFT,
             ModMask::M1 | lock,
+            ModMask::M1 | ModMask::SHIFT | lock,
             ModMask::M1 | num_lock,
+            ModMask::M1 | ModMask::SHIFT | num_lock,
             ModMask::M1 | lock | num_lock,
+            ModMask::M1 | ModMask::SHIFT | lock | num_lock,
         ] {
             let _ = self.conn.grab_key(
                 false,
@@ -3136,7 +3429,7 @@ impl Aurora {
         let lock = ModMask::LOCK;
         let num_lock = ModMask::M2;
         let super_mod = ModMask::M4; // Mod4 is standard for Super/Win
-        
+
         for keycode in [left_keycode, right_keycode] {
             for modifiers in [
                 super_mod,
@@ -3311,6 +3604,7 @@ impl Aurora {
             start_h: info.height,
             kind: DragKind::Move,
             resize_edges: ResizeEdges::default(),
+            last_update_at: Instant::now() - Duration::from_millis(16),
         });
         self.settings_front = false;
         self.folder_front = false;
@@ -3353,6 +3647,7 @@ impl Aurora {
             start_h: info.height,
             kind: DragKind::Resize,
             resize_edges,
+            last_update_at: Instant::now() - Duration::from_millis(33),
         });
         self.focus_window(client)?;
         let _ = self
@@ -3401,12 +3696,14 @@ impl Aurora {
         Ok(())
     }
 
-    fn update_ui_resize(&mut self, root_x: i16, root_y: i16) -> AnyResult<()> {
+    fn update_ui_resize(&mut self, root_x: i16, root_y: i16) -> AnyResult<bool> {
         let Some(resize) = self.ui_resize else {
-            return Ok(());
+            return Ok(false);
         };
         let dx = i32::from(root_x) - i32::from(resize.start_root_x);
         let dy = i32::from(root_y) - i32::from(resize.start_root_y);
+        let old_folder = (self.folder_width, self.folder_height);
+        let old_terminal = (self.folder_terminal_width, self.folder_terminal_height);
         match resize.target {
             UiResizeTarget::Folder => {
                 let max_w = self.screen_width.saturating_sub(48).max(FOLDER_MIN_WIDTH);
@@ -3437,6 +3734,11 @@ impl Aurora {
                     as u16;
             }
         }
+        if old_folder == (self.folder_width, self.folder_height)
+            && old_terminal == (self.folder_terminal_width, self.folder_terminal_height)
+        {
+            return Ok(false);
+        }
         let folder = self.folder_geometry();
         let terminal = self.folder_terminal_geometry();
         self.conn.configure_window(
@@ -3458,7 +3760,7 @@ impl Aurora {
         if self.folder_terminal.visible {
             self.redraw_folder_terminal()?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn end_drag(&mut self) -> AnyResult<()> {
@@ -3584,11 +3886,7 @@ impl Aurora {
         self.conn.change_window_attributes(
             window,
             &ChangeWindowAttributesAux::new().event_mask(
-                EventMask::PROPERTY_CHANGE
-                    | EventMask::STRUCTURE_NOTIFY
-                    | EventMask::POINTER_MOTION
-                    | EventMask::BUTTON_MOTION
-                    | EventMask::BUTTON_RELEASE,
+                EventMask::STRUCTURE_NOTIFY | EventMask::BUTTON_MOTION | EventMask::BUTTON_RELEASE,
             ),
         )?;
         self.conn.change_save_set(SetMode::INSERT, window)?;
@@ -3888,6 +4186,9 @@ impl Aurora {
         let Some(info) = self.clients.get(&client) else {
             return Ok(());
         };
+        if self.titlebar_height(info) == 0 {
+            return Ok(());
+        }
         let mut c = Canvas::from_wallpaper_crop(
             &self.wallpaper_pixels,
             self.screen_width,
@@ -3896,9 +4197,6 @@ impl Aurora {
             info.width,
             TITLEBAR_HEIGHT,
         );
-        if self.titlebar_height(info) == 0 {
-            return Ok(());
-        }
         let active = self.active_client == Some(client);
         c.draw_rect(
             0,
@@ -4263,7 +4561,10 @@ impl Aurora {
         self.upload_canvas(self.ui.dock, &c)
     }
 
-    fn redraw_settings(&self) -> AnyResult<()> {
+    fn redraw_settings(&mut self) -> AnyResult<()> {
+        if self.settings.tab == SettingsTab::Wallpaper {
+            self.ensure_wallpaper_previews();
+        }
         let (x, y, w, h) = self.settings_geometry();
         let mut c = Canvas::from_wallpaper_crop(
             &self.wallpaper_pixels,
@@ -4479,20 +4780,20 @@ impl Aurora {
                 .iter()
                 .copied()
                 .enumerate()
-                {
-                    let y = menu_y + 16 + idx as i32 * 28;
-                    if sort == self.folder_sort {
-                        c.draw_round_rect(
-                            menu_x + 8,
-                            y - 5,
-                            106,
-                            23,
-                            7,
-                            Color::rgba(116, 213, 198, 92),
-                        );
-                    }
-                    c.draw_text(&self.regular, sort.label(), menu_x + 18, y, 12.0, INK);
+            {
+                let y = menu_y + 16 + idx as i32 * 28;
+                if sort == self.folder_sort {
+                    c.draw_round_rect(
+                        menu_x + 8,
+                        y - 5,
+                        106,
+                        23,
+                        7,
+                        Color::rgba(116, 213, 198, 92),
+                    );
                 }
+                c.draw_text(&self.regular, sort.label(), menu_x + 18, y, 12.0, INK);
+            }
         }
         if self.folder_context_open {
             let menu_x = self.folder_context_pos.0.min(i32::from(w) - 166).max(10);
@@ -4526,10 +4827,15 @@ impl Aurora {
             let track_h = i32::from(h) - 100 - if self.choose_file_mode { 42 } else { 0 };
             let track_x = i32::from(w) - 13;
             c.draw_round_rect(track_x, 84, 5, track_h, 3, Color::rgba(176, 198, 210, 90));
-            let thumb_h = ((track_h as f32 * displayed_count as f32 / self.folder_entries.len() as f32) as i32)
+            let thumb_h = ((track_h as f32 * displayed_count as f32
+                / self.folder_entries.len() as f32) as i32)
                 .max(34)
                 .min(track_h);
-            let max_scroll = self.folder_entries.len().saturating_sub(displayed_count).max(1);
+            let max_scroll = self
+                .folder_entries
+                .len()
+                .saturating_sub(displayed_count)
+                .max(1);
             let thumb_y = 84
                 + ((track_h - thumb_h) as f32 * self.folder_scroll.min(max_scroll) as f32
                     / max_scroll as f32) as i32;
@@ -4547,16 +4853,37 @@ impl Aurora {
             let cancel_x = i32::from(w) - 190;
             let choose_x = i32::from(w) - 100;
             let btn_y = i32::from(h) - 46;
-            
+
             c.draw_round_rect(cancel_x, btn_y, 80, 32, 8, Color::rgba(241, 126, 135, 150));
-            c.draw_text_center(&self.bold, "Cancel", cancel_x + 40, btn_y + 20, 12.0, Color::rgb(160, 58, 68));
-            
+            c.draw_text_center(
+                &self.bold,
+                "Cancel",
+                cancel_x + 40,
+                btn_y + 20,
+                12.0,
+                Color::rgb(160, 58, 68),
+            );
+
             c.draw_round_rect(choose_x, btn_y, 80, 32, 8, Color::rgba(160, 238, 220, 200));
-            c.draw_text_center(&self.bold, "Open", choose_x + 40, btn_y + 20, 12.0, MINT_DARK);
-            
+            c.draw_text_center(
+                &self.bold,
+                "Open",
+                choose_x + 40,
+                btn_y + 20,
+                12.0,
+                MINT_DARK,
+            );
+
             if let Some(selected) = self.folder_selected.as_ref() {
                 let name = selected.file_name().unwrap_or_default().to_string_lossy();
-                c.draw_text(&self.regular, &compact(&format!("File: {name}"), 24), 24, btn_y + 20, 12.0, INK);
+                c.draw_text(
+                    &self.regular,
+                    &compact(&format!("File: {name}"), 24),
+                    24,
+                    btn_y + 20,
+                    12.0,
+                    INK,
+                );
             } else {
                 c.draw_text(&self.regular, "Select a file", 24, btn_y + 20, 12.0, MUTED);
             }
@@ -4567,7 +4894,11 @@ impl Aurora {
 
     fn cancel_choose_file(&mut self) -> AnyResult<()> {
         self.choose_file_mode = false;
-        let result_atom = self.conn.intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?.reply()?.atom;
+        let result_atom = self
+            .conn
+            .intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?
+            .reply()?
+            .atom;
         let string_atom = self.conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
         self.conn.change_property8(
             PropMode::REPLACE,
@@ -4590,7 +4921,11 @@ impl Aurora {
             return Ok(());
         };
         self.choose_file_mode = false;
-        let result_atom = self.conn.intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?.reply()?.atom;
+        let result_atom = self
+            .conn
+            .intern_atom(false, b"_AURORA_CHOOSE_FILE_RESULT")?
+            .reply()?
+            .atom;
         let string_atom = self.conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
         let path_str = path.to_string_lossy();
         self.conn.change_property8(
@@ -5468,20 +5803,39 @@ impl Aurora {
             );
         }
 
-        draw_card(c, sx, 360, i32::from(c.width) - sx - 24, 94);
-        c.draw_text(&self.bold, "Sleep after", sx + 16, 379, 15.0, INK);
-        c.draw_round_rect(sx + 18, 409, 28, 28, 9, Color::rgba(234, 244, 248, 220));
-        c.draw_text_center(&self.bold, "-", sx + 32, 411, 18.0, MINT_DARK);
+        draw_card(c, sx, 360, i32::from(c.width) - sx - 24, 86);
+        c.draw_text(&self.bold, "Brightness", sx + 16, 379, 15.0, INK);
+        c.draw_text_right(
+            &self.bold,
+            &format!("{}%", self.settings.brightness_percent),
+            i32::from(c.width) - 42,
+            379,
+            15.0,
+            MINT_DARK,
+        );
+        let bar_x = sx + 16;
+        let bar_y = 412;
+        let bar_w = 230;
+        c.draw_round_rect(bar_x, bar_y, bar_w, 12, 6, Color::rgba(225, 235, 238, 235));
+        let fill_w = ((i32::from(self.settings.brightness_percent) - 10) * bar_w / 90).max(6);
+        c.draw_round_rect(bar_x, bar_y, fill_w, 12, 6, Color::rgba(116, 213, 198, 220));
+        c.draw_text(&self.regular, "10%", bar_x, 430, 11.0, MUTED);
+        c.draw_text_right(&self.regular, "100%", bar_x + bar_w, 430, 11.0, MUTED);
+
+        draw_card(c, sx, 462, i32::from(c.width) - sx - 24, 94);
+        c.draw_text(&self.bold, "Sleep after", sx + 16, 481, 15.0, INK);
+        c.draw_round_rect(sx + 18, 511, 28, 28, 9, Color::rgba(234, 244, 248, 220));
+        c.draw_text_center(&self.bold, "-", sx + 32, 513, 18.0, MINT_DARK);
         c.draw_text_center(
             &self.bold,
             &format!("{} s", self.settings.sleep_after_secs),
             sx + 112,
-            413,
+            515,
             15.0,
             INK,
         );
-        c.draw_round_rect(sx + 178, 409, 28, 28, 9, Color::rgba(234, 244, 248, 220));
-        c.draw_text_center(&self.bold, "+", sx + 192, 411, 18.0, MINT_DARK);
+        c.draw_round_rect(sx + 178, 511, 28, 28, 9, Color::rgba(234, 244, 248, 220));
+        c.draw_text_center(&self.bold, "+", sx + 192, 513, 18.0, MINT_DARK);
     }
 
     fn draw_power_tab(&self, c: &mut Canvas) {
@@ -5630,7 +5984,11 @@ impl Aurora {
             draw_card(c, sx, y, i32::from(c.width) - sx - 24, 94);
             let preview_x = sx + 14;
             let preview_y = y + 14;
-            if let Some(preview) = self.wallpaper_previews.get(idx) {
+            if let Some(preview) = self
+                .wallpaper_previews
+                .get(idx)
+                .and_then(|preview| preview.as_ref())
+            {
                 paint_bgr_pixels(c, preview, preview_x, preview_y, 92, 56);
             }
             c.draw_round_rect(
@@ -5681,6 +6039,15 @@ impl Aurora {
                     2,
                     Color::rgb(255, 255, 255),
                 );
+            }
+        }
+    }
+
+    fn ensure_wallpaper_previews(&mut self) {
+        for (idx, asset) in WALLPAPERS.iter().enumerate() {
+            if self.wallpaper_previews[idx].is_none() {
+                self.wallpaper_previews[idx] =
+                    render_asset_preview_pixels(asset.bytes, 92, 56).ok();
             }
         }
     }
@@ -5762,7 +6129,7 @@ impl Aurora {
         );
         draw_card(c, sx, 86, card_w, 154);
         c.draw_text(&self.bold, "Current status", sx + 16, 106, 15.0, INK);
-        
+
         // Scroll exactly with step 24 matching line spacing!
         let start = (self.settings.scroll / 24).max(0) as usize;
         for (idx, line) in read_network_details()
@@ -5784,78 +6151,28 @@ impl Aurora {
         draw_card(c, sx, 258, card_w, 288);
         c.draw_text(&self.bold, "Wi-Fi", sx + 16, 278, 15.0, INK);
 
-        // Beautiful Premium 24x24 Refresh Icon Button (Symmetric double circular sync arrows, same bg as parent card)
-        let rx = sx + 75;
-        let ry = 273;
-        let rcx = rx + 12;
-        let rcy = ry + 12;
-        let r = 7.0f32;
+        let connected_wifi = self.settings.wifi_connected.clone().flatten();
+        let wifi_enabled = self.settings.wifi_radio_enabled.unwrap_or(true);
+        let disconnect_color = if connected_wifi.is_some() {
+            INK
+        } else {
+            Color::rgba(120, 120, 120, 170)
+        };
 
-        // Arc 1 (top-right): from -160 degrees (top-left) to 0 degrees (right)
-        let start1 = -160.0f32.to_radians();
-        let end1 = 0.0f32.to_radians();
-        let steps = 8;
-        let mut prev_x1 = rcx as f32 + r * start1.cos();
-        let mut prev_y1 = rcy as f32 + r * start1.sin();
-        for i in 1..=steps {
-            let angle = start1 + (end1 - start1) * (i as f32) / (steps as f32);
-            let px = rcx as f32 + r * angle.cos();
-            let py = rcy as f32 + r * angle.sin();
-            c.draw_line(prev_x1 as i32, prev_y1 as i32, px as i32, py as i32, 2, MINT_DARK);
-            prev_x1 = px;
-            prev_y1 = py;
-        }
-        // Arrowhead 1 (on the right pointing downwards)
-        let ax1 = rcx + r as i32;
-        let ay1 = rcy;
-        c.draw_line(ax1, ay1, ax1 - 3, ay1 - 3, 2, MINT_DARK);
-        c.draw_line(ax1, ay1, ax1 + 3, ay1 - 3, 2, MINT_DARK);
-
-        // Arc 2 (bottom-left): from 20 degrees (bottom-right) to 180 degrees (left)
-        let start2 = 20.0f32.to_radians();
-        let end2 = 180.0f32.to_radians();
-        let mut prev_x2 = rcx as f32 + r * start2.cos();
-        let mut prev_y2 = rcy as f32 + r * start2.sin();
-        for i in 1..=steps {
-            let angle = start2 + (end2 - start2) * (i as f32) / (steps as f32);
-            let px = rcx as f32 + r * angle.cos();
-            let py = rcy as f32 + r * angle.sin();
-            c.draw_line(prev_x2 as i32, prev_y2 as i32, px as i32, py as i32, 2, MINT_DARK);
-            prev_x2 = px;
-            prev_y2 = py;
-        }
-        // Arrowhead 2 (on the left pointing upwards)
-        let ax2 = rcx - r as i32;
-        let ay2 = rcy;
-        c.draw_line(ax2, ay2, ax2 - 3, ay2 + 3, 2, MINT_DARK);
-        c.draw_line(ax2, ay2, ax2 + 3, ay2 + 3, 2, MINT_DARK);
-
-        let connected_wifi = self.settings.wifi_connected.clone().unwrap_or_else(|| read_connected_wifi());
-        let wifi_enabled = self.settings.wifi_radio_enabled.unwrap_or_else(|| read_wifi_radio_enabled());
-
-        // Beautiful Premium 24x24 Disconnect Icon Button (Wi-Fi slash, same bg as parent card)
-        let dx = sx + 107;
-        let dy = 273;
-        let dcx = dx + 12;
-        let dcy = dy + 12;
-        let disc_color = if connected_wifi.is_some() { Color::rgb(160, 58, 68) } else { Color::rgba(120, 120, 120, 150) };
-        c.draw_circle(dcx, dcy + 6, 2, disc_color);
-        for i in -4..=4 {
-            let a = (225.0f32 + i as f32 * 10.0).to_radians();
-            let x = dcx + (6.0 * a.cos()) as i32;
-            let y = dcy + 6 + (6.0 * a.sin()) as i32;
-            c.draw_circle(x, y, 1, disc_color);
-        }
-        for i in -4..=4 {
-            let a = (225.0f32 + i as f32 * 10.0).to_radians();
-            let x = dcx + (11.0 * a.cos()) as i32;
-            let y = dcy + 6 + (11.0 * a.sin()) as i32;
-            c.draw_circle(x, y, 1, disc_color);
-        }
-        c.draw_line(dcx - 7, dcy - 7, dcx + 7, dcy + 7, 2, disc_color);
+        c.draw_round_rect(sx + 75, 273, 58, 24, 7, Color::rgba(234, 244, 248, 220));
+        c.draw_text_center(&self.bold, "Refresh", sx + 104, 281, 10.0, MINT_DARK);
+        c.draw_round_rect(sx + 141, 273, 78, 24, 7, Color::rgba(234, 244, 248, 220));
+        c.draw_text_center(
+            &self.bold,
+            "Disconnect",
+            sx + 180,
+            281,
+            10.0,
+            disconnect_color,
+        );
 
         // Beautiful Premium 40x24 Sliding On/Off Switch
-        let tx = sx + 139;
+        let tx = sx + 227;
         let ty = 273;
         if wifi_enabled {
             c.draw_round_rect(tx, ty, 40, 24, 12, Color::rgba(160, 238, 220, 200));
@@ -5868,7 +6185,14 @@ impl Aurora {
         let mut list_start_y = 344;
         if let Some(wifi) = connected_wifi.as_ref() {
             c.draw_text(&self.bold, "Connected", sx + 16, 302, 11.0, MINT_DARK);
-            c.draw_text(&self.bold, &compact(&wifi.ssid, 44), sx + 16, 318, 13.0, INK);
+            c.draw_text(
+                &self.bold,
+                &compact(&wifi.ssid, 44),
+                sx + 16,
+                318,
+                13.0,
+                INK,
+            );
             c.draw_text(
                 &self.regular,
                 wifi.ip.as_deref().unwrap_or("no ip"),
@@ -5928,7 +6252,14 @@ impl Aurora {
                 7,
                 Color::rgba(211, 225, 232, 170),
             );
-            c.draw_text_center(&self.bold, "Cancel", sx + card_w - 156, list_start_y + 26, 11.0, INK);
+            c.draw_text_center(
+                &self.bold,
+                "Cancel",
+                sx + card_w - 156,
+                list_start_y + 26,
+                11.0,
+                INK,
+            );
             c.draw_round_rect(
                 sx + card_w - 108,
                 list_start_y + 8,
@@ -5958,7 +6289,14 @@ impl Aurora {
                 MUTED,
             );
         } else {
-            for (idx, network) in self.settings.wifi_networks.iter().take(5).enumerate() {
+            for (idx, network) in self
+                .settings
+                .wifi_networks
+                .iter()
+                .skip(self.settings.wifi_scroll)
+                .take(5)
+                .enumerate()
+            {
                 let y = list_start_y + idx as i32 * 24;
                 let selected = self
                     .settings
@@ -6018,7 +6356,7 @@ impl Aurora {
             } else {
                 password_mask(self.settings.wifi_password.chars().count())
             };
-            
+
             // Text y = input_y + 10 is perfectly vertically centered (top of bounding box)
             c.draw_text(
                 &self.regular,
@@ -6032,7 +6370,7 @@ impl Aurora {
                     INK
                 },
             );
-            
+
             let button_x = input_x + input_w + gap;
             c.draw_round_rect(
                 button_x,
@@ -6042,7 +6380,7 @@ impl Aurora {
                 7,
                 Color::rgba(160, 238, 220, 170),
             );
-            
+
             // Draw Connect icon arrow centered vertically and horizontally
             let cx = button_x + 17;
             let cy = input_y + 17;
@@ -6606,21 +6944,88 @@ impl Aurora {
         self.conn.map_window(self.ui.settings)?;
         self.raise_ui()?;
         if tab == SettingsTab::Network {
-            self.update_cached_wifi_status();
-            if self.settings.wifi_networks.is_empty() {
-                self.refresh_wifi_networks_lazy();
-            }
+            self.ensure_wifi_refresh_started(false);
         }
         self.redraw_settings()
     }
 
-    fn refresh_wifi_networks(&mut self) {
-        self.settings.wifi_status = Some("Refreshing Wi-Fi networks...".to_string());
-        let _ = self.redraw_settings();
-        let _ = self.conn.flush();
-        match scan_wifi_networks(true) {
-            Ok(networks) => {
+    fn ensure_wifi_refresh_started(&mut self, rescan: bool) {
+        if self.wifi_refresh_rx.is_some() {
+            return;
+        }
+        if rescan
+            || self.settings.wifi_networks.is_empty()
+            || self.settings.wifi_radio_enabled.is_none()
+        {
+            self.start_wifi_refresh(rescan);
+        }
+    }
+
+    fn start_wifi_refresh(&mut self, rescan: bool) {
+        self.settings.wifi_status = Some(
+            if rescan {
+                "Refreshing Wi-Fi networks..."
+            } else {
+                "Loading Wi-Fi networks..."
+            }
+            .to_string(),
+        );
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let radio_enabled = read_wifi_radio_enabled();
+            let connected = read_connected_wifi();
+            let networks = radio_enabled.then(|| scan_wifi_networks(rescan));
+            let _ = tx.send(WifiRefreshResult {
+                radio_enabled,
+                connected,
+                networks,
+            });
+        });
+        self.wifi_refresh_rx = Some(rx);
+    }
+
+    fn poll_wifi_refresh(&mut self) -> AnyResult<bool> {
+        let Some(rx) = self.wifi_refresh_rx.as_ref() else {
+            return Ok(false);
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return Ok(false),
+            Err(TryRecvError::Disconnected) => {
+                self.wifi_refresh_rx = None;
+                self.settings.wifi_status = Some("Wi-Fi refresh stopped".to_string());
+                if self.settings_visible && self.settings.tab == SettingsTab::Network {
+                    self.redraw_settings()?;
+                }
+                return Ok(true);
+            }
+        };
+        self.wifi_refresh_rx = None;
+        self.apply_wifi_refresh_result(result);
+        if self.settings_visible && self.settings.tab == SettingsTab::Network {
+            self.redraw_settings()?;
+        }
+        Ok(true)
+    }
+
+    fn apply_wifi_refresh_result(&mut self, result: WifiRefreshResult) {
+        self.settings.wifi_radio_enabled = Some(result.radio_enabled);
+        self.settings.wifi_connected = Some(result.connected);
+        if !result.radio_enabled {
+            self.settings.wifi_networks.clear();
+            self.settings.wifi_scroll = 0;
+            self.settings.wifi_selected = None;
+            self.settings.wifi_password.clear();
+            self.settings.wifi_password_editing = false;
+            self.settings.wifi_status = Some("Wi-Fi is off".to_string());
+            return;
+        }
+
+        match result.networks {
+            Some(Ok(networks)) => {
                 self.settings.wifi_networks = networks;
+                self.settings.wifi_scroll = 0;
                 self.settings.wifi_status = Some(format!(
                     "Found {} Wi-Fi network{}",
                     self.settings.wifi_networks.len(),
@@ -6643,40 +7048,13 @@ impl Aurora {
                     }
                 }
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 self.settings.wifi_networks.clear();
+                self.settings.wifi_scroll = 0;
                 self.settings.wifi_status = Some(err);
             }
+            None => {}
         }
-    }
-
-    fn refresh_wifi_networks_lazy(&mut self) {
-        self.settings.wifi_status = Some("Loading Wi-Fi networks...".to_string());
-        let _ = self.redraw_settings();
-        let _ = self.conn.flush();
-        match scan_wifi_networks(false) {
-            Ok(networks) => {
-                self.settings.wifi_networks = networks;
-                self.settings.wifi_status = Some(format!(
-                    "Found {} Wi-Fi network{}",
-                    self.settings.wifi_networks.len(),
-                    if self.settings.wifi_networks.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                ));
-            }
-            Err(err) => {
-                self.settings.wifi_networks.clear();
-                self.settings.wifi_status = Some(err);
-            }
-        }
-    }
-
-    fn update_cached_wifi_status(&mut self) {
-        self.settings.wifi_radio_enabled = Some(read_wifi_radio_enabled());
-        self.settings.wifi_connected = Some(read_connected_wifi());
     }
 
     fn connect_selected_wifi(&mut self) -> AnyResult<()> {
@@ -6737,10 +7115,7 @@ impl Aurora {
                 self.settings.tab = tab;
                 self.settings.scroll = 0;
                 if tab == SettingsTab::Network {
-                    self.update_cached_wifi_status();
-                    if self.settings.wifi_networks.is_empty() {
-                        self.refresh_wifi_networks_lazy();
-                    }
+                    self.ensure_wifi_refresh_started(false);
                 }
                 self.redraw_settings()?;
             }
@@ -6763,8 +7138,13 @@ impl Aurora {
         Ok(())
     }
 
-    fn handle_settings_scroll(&mut self, button: u8, x: i32) -> AnyResult<()> {
+    fn handle_settings_scroll(&mut self, button: u8, x: i32, y: i32) -> AnyResult<()> {
         if x <= SIDEBAR_WIDTH {
+            return Ok(());
+        }
+        if self.settings.tab == SettingsTab::Network
+            && self.handle_wifi_list_scroll(button, x, y)?
+        {
             return Ok(());
         }
         let max_scroll = match self.settings.tab {
@@ -6779,7 +7159,8 @@ impl Aurora {
                 .len()
                 .saturating_sub(6)
                 .saturating_mul(29) as i32,
-            SettingsTab::Display | SettingsTab::Power | SettingsTab::Bluetooth => 40,
+            SettingsTab::Display => 120,
+            SettingsTab::Power | SettingsTab::Bluetooth => 40,
         };
         let old_scroll = self.settings.scroll;
         let step = if self.settings.tab == SettingsTab::Apps {
@@ -6801,6 +7182,39 @@ impl Aurora {
         Ok(())
     }
 
+    fn handle_wifi_list_scroll(&mut self, button: u8, x: i32, y: i32) -> AnyResult<bool> {
+        if button != 4 && button != 5 {
+            return Ok(false);
+        }
+        let sx = SIDEBAR_WIDTH + 24;
+        let card_w = i32::from(self.settings_geometry().2) - sx - 24;
+        let list_start_y = if self
+            .settings
+            .wifi_connected
+            .as_ref()
+            .is_some_and(Option::is_some)
+        {
+            376
+        } else {
+            344
+        };
+        let list_end_y = list_start_y + 5 * 24;
+        if x < sx + 12 || x > sx + card_w - 12 || y < list_start_y || y >= list_end_y {
+            return Ok(false);
+        }
+        let max_scroll = self.settings.wifi_networks.len().saturating_sub(5);
+        let old_scroll = self.settings.wifi_scroll;
+        if button == 4 {
+            self.settings.wifi_scroll = self.settings.wifi_scroll.saturating_sub(1);
+        } else {
+            self.settings.wifi_scroll = (self.settings.wifi_scroll + 1).min(max_scroll);
+        }
+        if self.settings.wifi_scroll != old_scroll {
+            self.redraw_settings()?;
+        }
+        Ok(true)
+    }
+
     fn handle_display_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let sx = SIDEBAR_WIDTH + 24;
         if x >= sx + 14 && x <= i32::from(self.settings_geometry().2) - 24 {
@@ -6814,7 +7228,24 @@ impl Aurora {
                 }
             }
         }
-        if y >= 407 && y <= 440 {
+        let bar_x = sx + 16;
+        let bar_w = 230;
+        if x >= bar_x && x <= bar_x + bar_w && (404..=432).contains(&y) {
+            let percent = (10 + ((x - bar_x) * 90) / bar_w).clamp(10, 100) as u8;
+            self.settings.brightness_percent = percent;
+            self.settings.display_status = match apply_xrandr_brightness(
+                &self.display,
+                self.current_display_output(),
+                percent,
+            ) {
+                Ok(()) => Some(format!("Brightness set to {percent}%")),
+                Err(err) => Some(err),
+            };
+            save_app_commands(&self.settings)?;
+            self.redraw_settings()?;
+            return Ok(());
+        }
+        if y >= 509 && y <= 542 {
             if x >= sx + 16 && x <= sx + 50 {
                 self.settings.sleep_after_secs =
                     self.settings.sleep_after_secs.saturating_sub(60).max(0);
@@ -6849,18 +7280,23 @@ impl Aurora {
     fn handle_network_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let sx = SIDEBAR_WIDTH + 24;
         let card_w = i32::from(self.settings_geometry().2) - sx - 24;
-        
-        // Clicks on the new Refresh icon button next to Wi-Fi title
-        if y >= 273 && y <= 297 && x >= sx + 75 && x <= sx + 99 {
+
+        // Clicks on the Refresh text button next to Wi-Fi title
+        if y >= 273 && y <= 297 && x >= sx + 75 && x <= sx + 133 {
             self.settings.wifi_disconnect_confirm = false;
-            self.refresh_wifi_networks();
+            self.start_wifi_refresh(true);
             self.redraw_settings()?;
             return Ok(());
         }
 
-        // Clicks on the new Disconnect icon button next to Wi-Fi title
-        if y >= 273 && y <= 297 && x >= sx + 107 && x <= sx + 131 {
-            if read_connected_wifi().is_some() {
+        // Clicks on the Disconnect text button next to Wi-Fi title
+        if y >= 273 && y <= 297 && x >= sx + 141 && x <= sx + 219 {
+            if self
+                .settings
+                .wifi_connected
+                .as_ref()
+                .is_some_and(Option::is_some)
+            {
                 self.settings.wifi_disconnect_confirm = true;
                 self.settings.wifi_password_editing = false;
                 self.redraw_settings()?;
@@ -6869,17 +7305,24 @@ impl Aurora {
         }
 
         // Clicks on the new On/Off toggle switch next to Wi-Fi title
-        if y >= 273 && y <= 297 && x >= sx + 139 && x <= sx + 179 {
-            let current_enabled = read_wifi_radio_enabled();
+        if y >= 273 && y <= 297 && x >= sx + 227 && x <= sx + 267 {
+            let current_enabled = self.settings.wifi_radio_enabled.unwrap_or(true);
             if let Err(e) = set_wifi_radio_enabled(!current_enabled) {
                 self.settings.wifi_status = Some(format!("Error setting Wi-Fi radio: {e}"));
             } else {
-                self.settings.wifi_status = Some(format!("Wi-Fi turned {}", if !current_enabled { "on" } else { "off" }));
+                self.settings.wifi_status = Some(format!(
+                    "Wi-Fi turned {}",
+                    if !current_enabled { "on" } else { "off" }
+                ));
+                self.settings.wifi_radio_enabled = Some(!current_enabled);
                 if !current_enabled {
-                    self.refresh_wifi_networks();
+                    self.start_wifi_refresh(true);
                 } else {
+                    self.wifi_refresh_rx = None;
                     self.settings.wifi_networks.clear();
+                    self.settings.wifi_scroll = 0;
                     self.settings.wifi_selected = None;
+                    self.settings.wifi_connected = Some(None);
                 }
             }
             self.redraw_settings()?;
@@ -6887,13 +7330,30 @@ impl Aurora {
         }
 
         if self.settings.wifi_disconnect_confirm {
-            let list_start_y = if read_connected_wifi().is_some() { 376 } else { 344 };
-            if y >= list_start_y + 8 && y <= list_start_y + 36 && x >= sx + card_w - 194 && x <= sx + card_w - 118 {
+            let list_start_y = if self
+                .settings
+                .wifi_connected
+                .as_ref()
+                .is_some_and(Option::is_some)
+            {
+                376
+            } else {
+                344
+            };
+            if y >= list_start_y + 8
+                && y <= list_start_y + 36
+                && x >= sx + card_w - 194
+                && x <= sx + card_w - 118
+            {
                 self.settings.wifi_disconnect_confirm = false;
                 self.redraw_settings()?;
                 return Ok(());
             }
-            if y >= list_start_y + 8 && y <= list_start_y + 36 && x >= sx + card_w - 108 && x <= sx + card_w - 20 {
+            if y >= list_start_y + 8
+                && y <= list_start_y + 36
+                && x >= sx + card_w - 108
+                && x <= sx + card_w - 20
+            {
                 self.disconnect_wifi()?;
                 return Ok(());
             }
@@ -6903,10 +7363,19 @@ impl Aurora {
         }
 
         // Dynamic Wi-Fi list coordinates
-        let list_start_y = if read_connected_wifi().is_some() { 376 } else { 344 };
+        let list_start_y = if self
+            .settings
+            .wifi_connected
+            .as_ref()
+            .is_some_and(Option::is_some)
+        {
+            376
+        } else {
+            344
+        };
         let list_end_y = list_start_y + 5 * 24;
         if y >= list_start_y && y < list_end_y {
-            let idx = ((y - list_start_y) / 24) as usize;
+            let idx = self.settings.wifi_scroll + ((y - list_start_y) / 24) as usize;
             if let Some(network) = self.settings.wifi_networks.get(idx) {
                 self.settings.wifi_selected = Some(network.ssid.clone());
                 self.settings.wifi_password.clear();
@@ -7062,10 +7531,11 @@ impl Aurora {
     }
 
     fn handle_key_press(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
-        if self.is_alt_tab_key(&ev)? {
-            self.switch_to_next_running_app()?;
+        if let Some(forward) = self.alt_tab_direction(&ev)? {
+            self.switch_running_app(forward)?;
             return Ok(());
         }
+        self.reset_alt_tab_sequence();
         if let Some(forward) = self.is_workspace_switch_key(&ev)? {
             let current = self.active_workspace;
             let count = self.workspace_count;
@@ -7207,15 +7677,19 @@ impl Aurora {
         Ok(())
     }
 
-    fn is_alt_tab_key(&self, ev: &KeyPressEvent) -> AnyResult<bool> {
+    fn alt_tab_direction(&self, ev: &KeyPressEvent) -> AnyResult<Option<bool>> {
         let is_alt = u16::from(ev.state) & u16::from(KeyButMask::MOD1) != 0;
-        let is_ctrl_shift = (u16::from(ev.state) & u16::from(KeyButMask::CONTROL) != 0) &&
-                             (u16::from(ev.state) & u16::from(KeyButMask::SHIFT) != 0);
+        let is_shift = u16::from(ev.state) & u16::from(KeyButMask::SHIFT) != 0;
+        let is_ctrl_shift = (u16::from(ev.state) & u16::from(KeyButMask::CONTROL) != 0) && is_shift;
         if !is_alt && !is_ctrl_shift {
-            return Ok(false);
+            return Ok(None);
         }
         let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
-        Ok(mapping.keysyms.contains(&0xff09))
+        if mapping.keysyms.contains(&0xff09) {
+            Ok(Some(!is_shift))
+        } else {
+            Ok(None)
+        }
     }
 
     fn is_workspace_switch_key(&self, ev: &KeyPressEvent) -> AnyResult<Option<bool>> {
@@ -7231,25 +7705,57 @@ impl Aurora {
         Ok(None)
     }
 
-    fn switch_to_next_running_app(&mut self) -> AnyResult<()> {
+    fn reset_alt_tab_sequence(&mut self) {
+        self.alt_tab_index = 0;
+        self.alt_tab_windows.clear();
+    }
+
+    fn switch_running_app(&mut self, forward: bool) -> AnyResult<()> {
         let windows = self.task_client_windows();
         if windows.is_empty() {
+            self.reset_alt_tab_sequence();
             return Ok(());
         }
-        let mut mru: Vec<Window> = self.focus_history.iter()
-            .filter(|w| windows.contains(w))
-            .copied()
-            .collect();
-        for w in &windows {
-            if !mru.contains(w) {
-                mru.insert(0, *w);
+        let active = self.active_client;
+        let needs_new_sequence = self.alt_tab_windows.is_empty()
+            || active.is_some_and(|client| {
+                self.alt_tab_windows.get(self.alt_tab_index) != Some(&client)
+            })
+            || self
+                .alt_tab_windows
+                .iter()
+                .any(|window| !windows.contains(window));
+        if needs_new_sequence {
+            self.alt_tab_windows = self
+                .focus_history
+                .iter()
+                .rev()
+                .filter(|w| windows.contains(w))
+                .copied()
+                .collect();
+            for w in &windows {
+                if !self.alt_tab_windows.contains(w) {
+                    self.alt_tab_windows.push(*w);
+                }
             }
+            if let Some(active) = active {
+                if let Some(pos) = self.alt_tab_windows.iter().position(|&w| w == active) {
+                    self.alt_tab_windows.remove(pos);
+                    self.alt_tab_windows.insert(0, active);
+                }
+            }
+            self.alt_tab_index = 0;
         }
-        let next = if mru.len() >= 2 {
-            mru[mru.len() - 2]
+        let len = self.alt_tab_windows.len();
+        if len == 0 {
+            return Ok(());
+        }
+        self.alt_tab_index = if forward {
+            (self.alt_tab_index + 1) % len
         } else {
-            mru[0]
+            (self.alt_tab_index + len - 1) % len
         };
+        let next = self.alt_tab_windows[self.alt_tab_index];
         self.focus_window(next)?;
         self.redraw_dock()?;
         self.conn.flush()?;
@@ -8063,7 +8569,7 @@ impl Aurora {
         } else {
             self.screenshot_mode = true;
             self.screenshot_selection = None;
-            self.screenshot_base = capture_screen_preview(&self.display);
+            self.screenshot_base = capture_screen_preview(&self.conn, self.root);
             self.set_topbar_notice(
                 "Drag to pick area. Hold camera 2s for full screen.",
                 Duration::from_secs(4),
@@ -8187,13 +8693,33 @@ impl Aurora {
             "Aurora Screenshot {}.png",
             OffsetDateTime::now_utc().unix_timestamp()
         ));
-        let mut cmd = Command::new("import");
-        cmd.env("DISPLAY", &self.display).args(["-window", "root"]);
-        if let Some((x, y, w, h)) = rect {
-            cmd.args(["-crop", &format!("{w}x{h}+{x}+{y}")]);
-        }
-        let ok = cmd.arg(&path).status().is_ok_and(|status| status.success());
-        if !ok {
+        let (x, y, w, h) = rect.unwrap_or((
+            0,
+            0,
+            i32::from(self.screen_width),
+            i32::from(self.screen_height),
+        ));
+        let Ok((pixels, width, height)) = capture_root_rgba(
+            &self.conn,
+            self.root,
+            x as i16,
+            y as i16,
+            w.max(1) as u16,
+            h.max(1) as u16,
+        ) else {
+            self.set_topbar_notice("Screenshot failed", Duration::from_secs(3))?;
+            return Ok(());
+        };
+        if image::save_buffer_with_format(
+            &path,
+            &pixels,
+            width,
+            height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .is_err()
+        {
             self.set_topbar_notice("Screenshot failed", Duration::from_secs(3))?;
             return Ok(());
         }
@@ -10757,6 +11283,14 @@ impl Aurora {
         }
     }
 
+    fn current_display_output(&self) -> Option<&str> {
+        self.display_modes
+            .iter()
+            .find(|mode| mode.current)
+            .or_else(|| self.display_modes.get(self.settings.selected_mode))
+            .and_then(|mode| mode.output.as_deref())
+    }
+
     fn apply_sleep_timeout(&self) {
         let mut cmd = Command::new("xset");
         cmd.env("DISPLAY", &self.display);
@@ -10769,13 +11303,6 @@ impl Aurora {
     }
 
     fn set_power_mode(&mut self, mode: PowerMode) -> AnyResult<()> {
-        let status = Command::new("powerprofilesctl")
-            .args(["set", mode.command_value()])
-            .status();
-        if status.as_ref().is_ok_and(|status| status.success()) {
-            self.settings.power_mode = mode;
-            return Ok(());
-        }
         let mut cmd = Command::new("powerprofilesctl");
         cmd.args(["set", mode.command_value()]);
         spawn_detached(cmd);
@@ -11121,7 +11648,7 @@ impl Aurora {
             ScanlinePad::Pad32,
             self.depth,
             BitsPerPixel::B32,
-            ImageOrder::LsbFirst,
+            XrbImageOrder::LsbFirst,
             Cow::Borrowed(&canvas.data),
         )?;
         img.put(&self.conn, drawable, self.gc, x as i16, y as i16)?;
@@ -11509,35 +12036,45 @@ fn resize_corner_edges_for_frame(
 ) -> Option<ResizeEdges> {
     let frame_h = i16::try_from(info.height + title_h).unwrap_or(i16::MAX);
     let width = i16::try_from(info.width).unwrap_or(i16::MAX);
-    let bottom = y >= frame_h - RESIZE_EDGE;
-    if !bottom {
-        return None;
+
+    // Bottom-left corner: (0, frame_h) - within 20px
+    let left = x.abs() <= 20 && (frame_h - y).abs() <= 20;
+
+    // Bottom-right corner: (width, frame_h) - within 20px
+    let right = (width - x).abs() <= 20 && (frame_h - y).abs() <= 20;
+
+    if left || right {
+        Some(ResizeEdges {
+            left,
+            right,
+            top: false,
+            bottom: true,
+        })
+    } else {
+        None
     }
-    let left = x <= RESIZE_CORNER;
-    let right = x >= width - RESIZE_CORNER;
-    (left || right).then_some(ResizeEdges {
-        left,
-        right,
-        top: false,
-        bottom: true,
-    })
 }
 
 fn resize_corner_edges_for_client(info: &ClientInfo, x: i16, y: i16) -> Option<ResizeEdges> {
     let width = i16::try_from(info.width).unwrap_or(i16::MAX);
     let height = i16::try_from(info.height).unwrap_or(i16::MAX);
-    let bottom = y >= height - RESIZE_EDGE;
-    if !bottom {
-        return None;
+
+    // Bottom-left corner: (0, height) - within 20px
+    let left = x.abs() <= 20 && (height - y).abs() <= 20;
+
+    // Bottom-right corner: (width, height) - within 20px
+    let right = (width - x).abs() <= 20 && (height - y).abs() <= 20;
+
+    if left || right {
+        Some(ResizeEdges {
+            left,
+            right,
+            top: false,
+            bottom: true,
+        })
+    } else {
+        None
     }
-    let left = x <= RESIZE_CORNER;
-    let right = x >= width - RESIZE_CORNER;
-    (left || right).then_some(ResizeEdges {
-        left,
-        right,
-        top: false,
-        bottom: true,
-    })
 }
 
 fn resize_side_hint_for_frame(info: &ClientInfo, x: i16) -> bool {
@@ -12462,44 +12999,53 @@ fn render_wallpaper_pixels(
     screen_width: u16,
     screen_height: u16,
 ) -> AnyResult<Vec<u8>> {
-    let img = image::load_from_memory(bytes)?.to_rgba8();
-    let (iw, ih) = img.dimensions();
-    let sw = u32::from(screen_width);
-    let sh = u32::from(screen_height);
-    let scale = (sw as f32 / iw as f32).max(sh as f32 / ih as f32);
-    let nw = (iw as f32 * scale).ceil() as u32;
-    let nh = (ih as f32 * scale).ceil() as u32;
-    let resized = image::imageops::resize(&img, nw, nh, FilterType::Triangle);
-    let ox = (nw.saturating_sub(sw)) / 2;
-    let oy = (nh.saturating_sub(sh)) / 2;
-    let cropped = image::imageops::crop_imm(&resized, ox, oy, sw, sh).to_image();
-    let mut out = vec![0; usize::from(screen_width) * usize::from(screen_height) * 4];
-    for (idx, px) in cropped.pixels().enumerate() {
-        out[idx * 4] = px[2];
-        out[idx * 4 + 1] = px[1];
-        out[idx * 4 + 2] = px[0];
-        out[idx * 4 + 3] = 0;
-    }
-    Ok(out)
+    render_cover_pixels_nearest(bytes, screen_width, screen_height)
 }
 
 fn render_asset_preview_pixels(bytes: &[u8], w: u16, h: u16) -> AnyResult<Vec<u8>> {
+    render_cover_pixels_nearest(bytes, w, h)
+}
+
+fn render_cover_pixels_nearest(bytes: &[u8], w: u16, h: u16) -> AnyResult<Vec<u8>> {
     let img = image::load_from_memory(bytes)?.to_rgba8();
     let (iw, ih) = img.dimensions();
+    if iw == 0 || ih == 0 || w == 0 || h == 0 {
+        return Ok(Vec::new());
+    }
+
     let scale = (f32::from(w) / iw as f32).max(f32::from(h) / ih as f32);
-    let nw = (iw as f32 * scale).ceil() as u32;
-    let nh = (ih as f32 * scale).ceil() as u32;
-    let resized = image::imageops::resize(&img, nw, nh, FilterType::Triangle);
-    let ox = (nw.saturating_sub(u32::from(w))) / 2;
-    let oy = (nh.saturating_sub(u32::from(h))) / 2;
-    let cropped =
-        image::imageops::crop_imm(&resized, ox, oy, u32::from(w), u32::from(h)).to_image();
+    let view_w = f32::from(w) / scale;
+    let view_h = f32::from(h) / scale;
+    let src_x0 = ((iw as f32 - view_w) * 0.5).max(0.0);
+    let src_y0 = ((ih as f32 - view_h) * 0.5).max(0.0);
+    let raw = img.as_raw();
+    let x_map = (0..u32::from(w))
+        .map(|x| {
+            (src_x0 + (x as f32 + 0.5) * view_w / f32::from(w))
+                .floor()
+                .clamp(0.0, iw.saturating_sub(1) as f32) as usize
+        })
+        .collect::<Vec<_>>();
+    let y_map = (0..u32::from(h))
+        .map(|y| {
+            (src_y0 + (y as f32 + 0.5) * view_h / f32::from(h))
+                .floor()
+                .clamp(0.0, ih.saturating_sub(1) as f32) as usize
+        })
+        .collect::<Vec<_>>();
     let mut out = vec![0; usize::from(w) * usize::from(h) * 4];
-    for (idx, px) in cropped.pixels().enumerate() {
-        out[idx * 4] = px[2];
-        out[idx * 4 + 1] = px[1];
-        out[idx * 4 + 2] = px[0];
-        out[idx * 4 + 3] = 0;
+    let src_stride = iw as usize * 4;
+    for (dy, sy) in y_map.iter().copied().enumerate() {
+        let src_row = sy * src_stride;
+        let dst_row = dy * usize::from(w) * 4;
+        for (dx, sx) in x_map.iter().copied().enumerate() {
+            let src = src_row + sx * 4;
+            let dst = dst_row + dx * 4;
+            out[dst] = raw[src + 2];
+            out[dst + 1] = raw[src + 1];
+            out[dst + 2] = raw[src];
+            out[dst + 3] = 0;
+        }
     }
     Ok(out)
 }
@@ -12735,30 +13281,119 @@ fn render_image_preview(path: &std::path::Path, w: i32, h: i32) -> Option<ImageP
     })
 }
 
-fn capture_screen_preview(display: &str) -> Option<ImagePreview> {
-    let path = env::temp_dir().join(format!(
-        "aurora-screenshot-overlay-{}.png",
-        OffsetDateTime::now_utc().unix_timestamp_nanos()
-    ));
-    let ok = Command::new("import")
-        .env("DISPLAY", display)
-        .args(["-window", "root"])
-        .arg(&path)
-        .status()
-        .is_ok_and(|status| status.success());
-    if !ok {
-        return None;
-    }
-    let bytes = fs::read(&path).ok()?;
-    let _ = fs::remove_file(&path);
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-    let (iw, ih) = img.dimensions();
+fn capture_screen_preview(conn: &RustConnection, root: Window) -> Option<ImagePreview> {
+    let (pixels, iw, ih) = capture_root_rgba(conn, root, 0, 0, u16::MAX, u16::MAX).ok()?;
     Some(ImagePreview {
-        pixels: img.into_raw(),
+        pixels,
         width: iw.min(u16::MAX as u32) as u16,
         height: ih.min(u16::MAX as u32) as u16,
         resolution: Some((iw, ih)),
     })
+}
+
+fn capture_root_rgba(
+    conn: &RustConnection,
+    root: Window,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+) -> AnyResult<(Vec<u8>, u32, u32)> {
+    let geom = conn.get_geometry(root)?.reply()?;
+    let capture_x = x.max(0);
+    let capture_y = y.max(0);
+    let max_w = i32::from(geom.width).saturating_sub(i32::from(capture_x));
+    let max_h = i32::from(geom.height).saturating_sub(i32::from(capture_y));
+    let capture_w = u16::try_from(i32::from(width).min(max_w).max(1))?;
+    let capture_h = u16::try_from(i32::from(height).min(max_h).max(1))?;
+    let reply = conn
+        .get_image(
+            ImageFormat::Z_PIXMAP,
+            root,
+            capture_x,
+            capture_y,
+            capture_w,
+            capture_h,
+            u32::MAX,
+        )?
+        .reply()?;
+    let setup = conn.setup();
+    let format = setup
+        .pixmap_formats
+        .iter()
+        .find(|format| format.depth == reply.depth)
+        .ok_or("missing X11 pixmap format for screenshot depth")?;
+    let visual = find_visual(setup, reply.visual).ok_or("missing X11 visual for screenshot")?;
+    let bits_per_pixel = usize::from(format.bits_per_pixel);
+    let bytes_per_pixel = bits_per_pixel.div_ceil(8);
+    if bytes_per_pixel == 0 || bits_per_pixel > 32 {
+        return Err("unsupported X11 screenshot pixel format".into());
+    }
+    let stride_bits = usize::from(capture_w)
+        .checked_mul(bits_per_pixel)
+        .ok_or("screenshot row is too wide")?;
+    let pad = usize::from(format.scanline_pad).max(8);
+    let stride = stride_bits.div_ceil(pad) * (pad / 8);
+    let mut rgba = vec![0; usize::from(capture_w) * usize::from(capture_h) * 4];
+    for row in 0..usize::from(capture_h) {
+        let row_start = row * stride;
+        for col in 0..usize::from(capture_w) {
+            let src = row_start + col * bytes_per_pixel;
+            if src + bytes_per_pixel > reply.data.len() {
+                return Err("short X11 screenshot data".into());
+            }
+            let pixel = read_x11_pixel(
+                &reply.data[src..src + bytes_per_pixel],
+                setup.image_byte_order,
+            );
+            let dst = (row * usize::from(capture_w) + col) * 4;
+            rgba[dst] = scale_masked_channel(pixel, visual.red_mask);
+            rgba[dst + 1] = scale_masked_channel(pixel, visual.green_mask);
+            rgba[dst + 2] = scale_masked_channel(pixel, visual.blue_mask);
+            rgba[dst + 3] = 255;
+        }
+    }
+    Ok((rgba, u32::from(capture_w), u32::from(capture_h)))
+}
+
+fn find_visual(setup: &Setup, visual_id: Visualid) -> Option<Visualtype> {
+    setup.roots.iter().find_map(|screen| {
+        screen.allowed_depths.iter().find_map(|depth| {
+            depth
+                .visuals
+                .iter()
+                .find(|visual| visual.visual_id == visual_id)
+                .copied()
+        })
+    })
+}
+
+fn read_x11_pixel(bytes: &[u8], order: ImageOrder) -> u32 {
+    let mut pixel = 0u32;
+    match order {
+        ImageOrder::LSB_FIRST => {
+            for (shift, byte) in bytes.iter().enumerate() {
+                pixel |= u32::from(*byte) << (shift * 8);
+            }
+        }
+        ImageOrder::MSB_FIRST => {
+            for byte in bytes {
+                pixel = (pixel << 8) | u32::from(*byte);
+            }
+        }
+        _ => {}
+    }
+    pixel
+}
+
+fn scale_masked_channel(pixel: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let max = mask >> shift;
+    let value = (pixel & mask) >> shift;
+    ((value * 255 + max / 2) / max) as u8
 }
 
 fn canvas_from_preview(preview: &ImagePreview, width: u16, height: u16) -> Canvas {
@@ -13021,6 +13656,29 @@ fn apply_xrandr_mode(display: &str, mode: &DisplayMode) -> Result<(), String> {
     }
 
     Err(format!("Could not switch to {size} with xrandr"))
+}
+
+fn apply_xrandr_brightness(
+    display: &str,
+    output: Option<&str>,
+    brightness_percent: u8,
+) -> Result<(), String> {
+    let brightness = f32::from(brightness_percent.clamp(10, 100)) / 100.0;
+    if let Some(output) = output {
+        let mut cmd = Command::new("xrandr");
+        cmd.env("DISPLAY", display).args([
+            "--output",
+            output,
+            "--brightness",
+            &format!("{brightness:.2}"),
+        ]);
+        if command_status_success(&mut cmd) {
+            return Ok(());
+        }
+        return Err(format!("Could not set brightness for {output}"));
+    }
+
+    Err("Could not find an active display output for brightness".to_string())
 }
 
 fn read_cpu_model() -> String {
@@ -13310,7 +13968,9 @@ fn read_network_details() -> Vec<String> {
 fn scan_wifi_networks(rescan: bool) -> Result<Vec<WifiNetwork>, String> {
     let rescan_val = if rescan { "yes" } else { "no" };
     let output = Command::new("nmcli")
-        .args(["-t", "-f", "SSID", "dev", "wifi", "list", "--rescan", rescan_val])
+        .args([
+            "-t", "-f", "SSID", "dev", "wifi", "list", "--rescan", rescan_val,
+        ])
         .output()
         .map_err(|err| format!("Could not run nmcli Wi-Fi scan: {err}"))?;
     if !output.status.success() {
@@ -13547,12 +14207,13 @@ fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
     fs::write(
         path,
         format!(
-            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nauto_power_saver_minutes={}\n",
+            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\nauto_power_saver_minutes={}\n",
             clean(&settings.terminal_command),
             clean(&settings.browser_command),
             clean(&settings.photo_command),
             clean(&settings.video_command),
             settings.sleep_after_secs.min(7200),
+            settings.brightness_percent.clamp(10, 100),
             settings.auto_power_saver_minutes.min(240),
         ),
     )?;
