@@ -1476,7 +1476,8 @@ fn become_wm(conn: &RustConnection, screen: &Screen) -> Result<(), ReplyError> {
         | EventMask::SUBSTRUCTURE_NOTIFY
         | EventMask::STRUCTURE_NOTIFY
         | EventMask::PROPERTY_CHANGE
-        | EventMask::BUTTON_PRESS;
+        | EventMask::BUTTON_PRESS
+        | EventMask::KEY_RELEASE;
     conn.change_window_attributes(
         screen.root,
         &ChangeWindowAttributesAux::new().event_mask(mask),
@@ -2443,6 +2444,7 @@ impl Aurora {
         match event {
             Event::Expose(ev) => self.handle_expose(ev)?,
             Event::KeyPress(ev) => self.handle_key_press(ev)?,
+            Event::KeyRelease(ev) => self.handle_key_release(ev)?,
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
             Event::ButtonRelease(ev) => {
                 if self.pending_screenshot_button.is_some() {
@@ -3437,22 +3439,6 @@ impl Aurora {
             );
         }
 
-        // Grab Ctrl + Shift + Tab
-        for modifiers in [
-            ModMask::CONTROL | ModMask::SHIFT,
-            ModMask::CONTROL | ModMask::SHIFT | lock,
-            ModMask::CONTROL | ModMask::SHIFT | num_lock,
-            ModMask::CONTROL | ModMask::SHIFT | lock | num_lock,
-        ] {
-            let _ = self.conn.grab_key(
-                false,
-                self.root,
-                modifiers,
-                tab_keycode,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            );
-        }
         Ok(())
     }
 
@@ -7839,11 +7825,18 @@ impl Aurora {
         Ok(())
     }
 
+    fn handle_key_release(&mut self, ev: KeyReleaseEvent) -> AnyResult<()> {
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        if mapping.keysyms.contains(&0xffe9) || mapping.keysyms.contains(&0xffea) {
+            self.reset_alt_tab_sequence();
+        }
+        Ok(())
+    }
+
     fn alt_tab_direction(&self, ev: &KeyPressEvent) -> AnyResult<Option<bool>> {
         let is_alt = u16::from(ev.state) & u16::from(KeyButMask::MOD1) != 0;
         let is_shift = u16::from(ev.state) & u16::from(KeyButMask::SHIFT) != 0;
-        let is_ctrl_shift = (u16::from(ev.state) & u16::from(KeyButMask::CONTROL) != 0) && is_shift;
-        if !is_alt && !is_ctrl_shift {
+        if !is_alt {
             return Ok(None);
         }
         let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
@@ -7872,6 +7865,50 @@ impl Aurora {
         self.alt_tab_windows.clear();
     }
 
+    fn alt_tab_start_window(
+        &self,
+        windows: &[Window],
+        active: Option<Window>,
+        forward: bool,
+    ) -> Option<usize> {
+        if windows.is_empty() {
+            return None;
+        }
+        if let Some(previous) = self
+            .focus_history
+            .iter()
+            .rev()
+            .copied()
+            .find(|&window| Some(window) != active && windows.contains(&window))
+        {
+            return windows.iter().position(|&window| window == previous);
+        }
+        active
+            .and_then(|window| windows.iter().position(|&candidate| candidate == window))
+            .map(|pos| {
+                if forward {
+                    (pos + 1) % windows.len()
+                } else {
+                    (pos + windows.len() - 1) % windows.len()
+                }
+            })
+            .or(Some(0))
+    }
+
+    fn build_alt_tab_sequence(
+        &self,
+        windows: &[Window],
+        active: Option<Window>,
+        forward: bool,
+    ) -> Vec<Window> {
+        let Some(start) = self.alt_tab_start_window(windows, active, forward) else {
+            return Vec::new();
+        };
+        (0..windows.len())
+            .map(|offset| windows[(start + offset) % windows.len()])
+            .collect()
+    }
+
     fn switch_running_app(&mut self, forward: bool) -> AnyResult<()> {
         let windows = self.task_client_windows();
         if windows.is_empty() {
@@ -7880,6 +7917,8 @@ impl Aurora {
         }
         let active = self.active_client;
         let needs_new_sequence = self.alt_tab_windows.is_empty()
+            || self.alt_tab_index >= self.alt_tab_windows.len()
+            || self.alt_tab_windows.len() != windows.len()
             || active.is_some_and(|client| {
                 self.alt_tab_windows.get(self.alt_tab_index) != Some(&client)
             })
@@ -7888,36 +7927,19 @@ impl Aurora {
                 .iter()
                 .any(|window| !windows.contains(window));
         if needs_new_sequence {
-            self.alt_tab_windows = self
-                .focus_history
-                .iter()
-                .rev()
-                .filter(|w| windows.contains(w))
-                .copied()
-                .collect();
-            for w in &windows {
-                if !self.alt_tab_windows.contains(w) {
-                    self.alt_tab_windows.push(*w);
-                }
-            }
-            if let Some(active) = active {
-                if let Some(pos) = self.alt_tab_windows.iter().position(|&w| w == active) {
-                    self.alt_tab_windows.remove(pos);
-                    self.alt_tab_windows.insert(0, active);
-                }
-            }
+            self.alt_tab_windows = self.build_alt_tab_sequence(&windows, active, forward);
             self.alt_tab_index = 0;
-        }
-        let len = self.alt_tab_windows.len();
-        if len == 0 {
-            return Ok(());
-        }
-        self.alt_tab_index = if forward {
-            (self.alt_tab_index + 1) % len
         } else {
-            (self.alt_tab_index + len - 1) % len
+            let len = self.alt_tab_windows.len();
+            self.alt_tab_index = if forward {
+                (self.alt_tab_index + 1) % len
+            } else {
+                (self.alt_tab_index + len - 1) % len
+            };
+        }
+        let Some(&next) = self.alt_tab_windows.get(self.alt_tab_index) else {
+            return Ok(());
         };
-        let next = self.alt_tab_windows[self.alt_tab_index];
         self.focus_window(next)?;
         self.redraw_dock()?;
         self.conn.flush()?;
