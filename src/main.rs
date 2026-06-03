@@ -1,8 +1,10 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::CString;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Read;
 use std::os::fd::RawFd;
@@ -112,6 +114,19 @@ const MINT_LIGHT: Color = Color::rgb(160, 238, 220);
 const BLUE: Color = Color::rgb(73, 156, 231);
 const CARD_LINE: Color = Color::rgba(198, 214, 224, 130);
 const TOPBAR_ICON_SPACING: i32 = 33;
+const TOPBAR_ICON_HIT_RADIUS: i32 = 18;
+const CLIPBOARD_HISTORY_LIMIT: usize = 200;
+const CLIPBOARD_MENU_VISIBLE_ROWS: usize = 10;
+const CLIPBOARD_MENU_WIDTH: u16 = 420;
+const CLIPBOARD_MENU_TEXT_ROW_HEIGHT: i32 = 58;
+const CLIPBOARD_MENU_IMAGE_ROW_HEIGHT: i32 = 62;
+const CLIPBOARD_MENU_IMAGE_PREVIEW_W: i32 = 184;
+const CLIPBOARD_MENU_IMAGE_PREVIEW_H: i32 = 48;
+const CLIPBOARD_MENU_NAV_Y: i32 = 8;
+const CLIPBOARD_MENU_NAV_W: i32 = 36;
+const CLIPBOARD_MENU_NAV_H: i32 = 28;
+const CLIPBOARD_MENU_PREV_X: i32 = 118;
+const CLIPBOARD_MENU_NEXT_X: i32 = 158;
 const DEFAULT_WORKSPACE_COUNT: usize = 2;
 const MAX_WORKSPACE_COUNT: usize = 8;
 const WORKSPACE_STRIDE: i32 = 27;
@@ -415,6 +430,10 @@ fn measure_text(font: &Font<'static>, text: &str, size: f32) -> i32 {
     width.ceil() as i32
 }
 
+fn point_in_rect(px: i32, py: i32, x: i32, y: i32, w: i32, h: i32) -> bool {
+    px >= x && px < x + w && py >= y && py < y + h
+}
+
 #[derive(Clone)]
 struct DisplayMode {
     output: Option<String>,
@@ -707,12 +726,14 @@ struct UiWindows {
     screenshot_overlay: Window,
     app_menu: Window,
     aurora_menu: Window,
+    clipboard_menu: Window,
     media: [Window; MEDIA_SLOT_COUNT],
     dock_more_menu: Window,
 }
 
 #[derive(Clone, Copy)]
 struct TopbarControls {
+    clipboard_x: i32,
     screenshot_x: i32,
     display_x: i32,
     audio_x: i32,
@@ -1081,6 +1102,22 @@ struct PendingScreenshotButton {
     pressed_at: Instant,
 }
 
+#[derive(Clone)]
+enum ClipboardItem {
+    Text(String),
+    Image(PathBuf),
+}
+
+#[derive(Clone)]
+struct ClipboardEntry {
+    item: ClipboardItem,
+}
+
+struct ClipboardImagePreviewResult {
+    path: PathBuf,
+    preview: Option<ImagePreview>,
+}
+
 #[derive(Clone, Copy)]
 enum MediaContextAction {
     Rename,
@@ -1256,6 +1293,16 @@ struct Aurora {
     aurora_menu_visible: bool,
     aurora_menu_about: bool,
     aurora_menu_restart_confirm: bool,
+    clipboard_menu_visible: bool,
+    clipboard_history: Vec<ClipboardEntry>,
+    clipboard_history_page: usize,
+    clipboard_image_previews: HashMap<PathBuf, Option<ImagePreview>>,
+    clipboard_image_preview_pending: HashSet<PathBuf>,
+    clipboard_image_preview_tx: mpsc::Sender<ClipboardImagePreviewResult>,
+    clipboard_image_preview_rx: Receiver<ClipboardImagePreviewResult>,
+    last_clipboard_poll: Instant,
+    last_seen_clipboard_text: Option<String>,
+    last_seen_clipboard_image_sig: Option<u64>,
     wm_s_atom: Atom,
     folder_context_open: bool,
     folder_context_pos: (i32, i32),
@@ -1601,6 +1648,7 @@ impl Aurora {
             screen.width_in_pixels,
             screen.height_in_pixels,
         )?;
+        let (clipboard_image_preview_tx, clipboard_image_preview_rx) = mpsc::channel();
         let mut wallpaper_cache = vec![None; WALLPAPERS.len()];
         wallpaper_cache[0] = Some(wallpaper_pixels.clone());
         let wallpaper_previews = vec![None; WALLPAPERS.len()];
@@ -1617,6 +1665,7 @@ impl Aurora {
             screenshot_overlay: conn.generate_id()?,
             app_menu: conn.generate_id()?,
             aurora_menu: conn.generate_id()?,
+            clipboard_menu: conn.generate_id()?,
             media: [
                 conn.generate_id()?,
                 conn.generate_id()?,
@@ -1713,6 +1762,16 @@ impl Aurora {
             aurora_menu_visible: false,
             aurora_menu_about: false,
             aurora_menu_restart_confirm: false,
+            clipboard_menu_visible: false,
+            clipboard_history: read_clipboard_history_store(),
+            clipboard_history_page: 0,
+            clipboard_image_previews: HashMap::new(),
+            clipboard_image_preview_pending: HashSet::new(),
+            clipboard_image_preview_tx,
+            clipboard_image_preview_rx,
+            last_clipboard_poll: Instant::now(),
+            last_seen_clipboard_text: None,
+            last_seen_clipboard_image_sig: None,
             wm_s_atom,
             folder_context_open: false,
             folder_context_pos: (0, 0),
@@ -1789,6 +1848,12 @@ impl Aurora {
                 handled_event = true;
             }
             if self.poll_wifi_refresh()? {
+                handled_event = true;
+            }
+            if self.poll_clipboard_history()? {
+                handled_event = true;
+            }
+            if self.poll_clipboard_image_previews()? {
                 handled_event = true;
             }
 
@@ -2044,6 +2109,9 @@ impl Aurora {
                 (self.last_media_tick + Duration::from_millis(250)).saturating_duration_since(now),
             );
         }
+        timeout = timeout.min(
+            (self.last_clipboard_poll + Duration::from_millis(1000)).saturating_duration_since(now),
+        );
         if !interactive {
             if self.settings.auto_power_saver_minutes > 0 {
                 timeout = timeout.min(
@@ -2312,6 +2380,26 @@ impl Aurora {
             &aurora_menu_aux,
         )?;
 
+        let clipboard_menu = self.clipboard_menu_geometry();
+        let clipboard_menu_aux = CreateWindowAux::new()
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
+            .cursor(self.cursor)
+            .background_pixel(0);
+        self.conn.create_window(
+            self.depth,
+            self.ui.clipboard_menu,
+            self.root,
+            clipboard_menu.0,
+            clipboard_menu.1,
+            clipboard_menu.2,
+            clipboard_menu.3,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual,
+            &clipboard_menu_aux,
+        )?;
+
         let media_aux = CreateWindowAux::new()
             .override_redirect(1)
             .event_mask(
@@ -2385,6 +2473,7 @@ impl Aurora {
             self.ui.folder_terminal,
             self.ui.app_menu,
             self.ui.aurora_menu,
+            self.ui.clipboard_menu,
             self.ui.dock_more_menu,
         ];
         windows.extend(self.ui.media);
@@ -2559,6 +2648,8 @@ impl Aurora {
             self.redraw_app_menu()?;
         } else if ev.window == self.ui.aurora_menu && self.aurora_menu_visible {
             self.redraw_aurora_menu()?;
+        } else if ev.window == self.ui.clipboard_menu && self.clipboard_menu_visible {
+            self.redraw_clipboard_menu()?;
         } else if ev.window == self.ui.dock_more_menu && self.dock_more_visible {
             self.redraw_dock_more_menu()?;
         } else if let Some(slot) = self.media_slot_for_window(ev.window) {
@@ -2588,6 +2679,25 @@ impl Aurora {
         {
             self.hide_dock_more_menu()?;
         }
+        if self.clipboard_menu_visible && ev.event != self.ui.clipboard_menu {
+            let (mx, my, mw, mh) = self.clipboard_menu_geometry();
+            let rx = i32::from(ev.root_x);
+            let ry = i32::from(ev.root_y);
+            if rx >= i32::from(mx)
+                && rx <= i32::from(mx) + i32::from(mw)
+                && ry >= i32::from(my)
+                && ry <= i32::from(my) + i32::from(mh)
+            {
+                self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+                self.handle_clipboard_menu_press(
+                    ev.detail,
+                    rx - i32::from(mx),
+                    ry - i32::from(my),
+                )?;
+                self.conn.flush()?;
+                return Ok(());
+            }
+        }
         if self.aurora_menu_visible && ev.event != self.ui.topbar && ev.event != self.ui.aurora_menu
         {
             let (mx, my, mw, mh) = self.aurora_menu_geometry();
@@ -2603,6 +2713,14 @@ impl Aurora {
                 return Ok(());
             }
             self.hide_aurora_menu()?;
+        }
+        let topbar_root_click = ev.root_y >= 0 && ev.root_y < TOPBAR_HEIGHT as i16;
+        if self.clipboard_menu_visible
+            && ev.event != self.ui.topbar
+            && ev.event != self.ui.clipboard_menu
+            && !topbar_root_click
+        {
+            self.hide_clipboard_menu()?;
         }
         if self.screenshot_mode && ev.detail == 1 {
             self.start_screenshot_selection(ev.root_x, ev.root_y)?;
@@ -2689,6 +2807,12 @@ impl Aurora {
             self.handle_app_menu_click(ev.detail, i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if ev.event == self.ui.aurora_menu {
             self.handle_aurora_menu_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
+        } else if ev.event == self.ui.clipboard_menu {
+            self.handle_clipboard_menu_press(
+                ev.detail,
+                i32::from(ev.event_x),
+                i32::from(ev.event_y),
+            )?;
         } else if ev.event == self.ui.dock_more_menu {
             self.handle_dock_more_menu_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if let Some(slot) = self.media_slot_for_window(ev.event) {
@@ -3346,6 +3470,7 @@ impl Aurora {
         let aurora_width = measure_text(&self.bold, "Aurora", 16.0);
         let aurora_end = brand_x + 23 + aurora_width;
         if (0..=aurora_end).contains(&x) {
+            self.hide_clipboard_menu()?;
             self.toggle_aurora_menu()?;
             return Ok(true);
         }
@@ -3354,12 +3479,24 @@ impl Aurora {
         });
         if let Some(workspace) = workspace {
             self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
             self.switch_workspace(workspace)?;
         } else if (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE).contains(&x) {
             self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
             self.add_workspace()?;
-        } else if (controls.screenshot_x - 16..=controls.screenshot_x + 16).contains(&x) {
+        } else if (controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS
+            ..=controls.clipboard_x + TOPBAR_ICON_HIT_RADIUS)
+            .contains(&x)
+        {
             self.hide_aurora_menu()?;
+            self.toggle_clipboard_menu()?;
+        } else if (controls.screenshot_x - TOPBAR_ICON_HIT_RADIUS
+            ..=controls.screenshot_x + TOPBAR_ICON_HIT_RADIUS)
+            .contains(&x)
+        {
+            self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
             if self.screenshot_mode {
                 self.capture_screenshot(None)?;
             } else {
@@ -3368,20 +3505,34 @@ impl Aurora {
                 });
                 self.toggle_screenshot_mode()?;
             }
-        } else if (controls.display_x - 16..=controls.display_x + 16).contains(&x) {
+        } else if (controls.display_x - TOPBAR_ICON_HIT_RADIUS
+            ..=controls.display_x + TOPBAR_ICON_HIT_RADIUS)
+            .contains(&x)
+        {
             self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
             self.toggle_settings_tab(SettingsTab::Display)?;
-        } else if (controls.audio_x - 16..=controls.audio_x + 16).contains(&x) {
+        } else if (controls.audio_x - TOPBAR_ICON_HIT_RADIUS
+            ..=controls.audio_x + TOPBAR_ICON_HIT_RADIUS)
+            .contains(&x)
+        {
             self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
             self.toggle_settings_tab(SettingsTab::Audio)?;
-        } else if (controls.network_x - 16..=controls.network_x + 16).contains(&x) {
+        } else if (controls.network_x - TOPBAR_ICON_HIT_RADIUS
+            ..=controls.network_x + TOPBAR_ICON_HIT_RADIUS)
+            .contains(&x)
+        {
             self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
             self.toggle_settings_tab(SettingsTab::Network)?;
         } else if (controls.battery_left..=controls.battery_right).contains(&x) {
             self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
             self.toggle_settings_tab(SettingsTab::Power)?;
         } else {
             self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
             return Ok(false);
         }
         Ok(true)
@@ -4387,7 +4538,9 @@ impl Aurora {
         let audio_x = network_x - TOPBAR_ICON_SPACING;
         let display_x = audio_x - TOPBAR_ICON_SPACING;
         let screenshot_x = display_x - TOPBAR_ICON_SPACING;
+        let clipboard_x = screenshot_x - TOPBAR_ICON_SPACING;
         TopbarControls {
+            clipboard_x,
             screenshot_x,
             display_x,
             audio_x,
@@ -4466,6 +4619,7 @@ impl Aurora {
         );
 
         let controls = self.topbar_controls();
+        draw_clipboard_icon(&mut c, controls.clipboard_x, 20, MINT_LIGHT);
         draw_screenshot_icon(&mut c, controls.screenshot_x, 20, MINT_LIGHT);
         draw_sidebar_display_icon(&mut c, controls.display_x, 20, MINT_LIGHT);
         draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
@@ -4493,6 +4647,254 @@ impl Aurora {
             Color::rgb(239, 252, 250),
         );
         self.upload_canvas(self.ui.topbar, &c)
+    }
+
+    fn redraw_clipboard_menu(&mut self) -> AnyResult<()> {
+        let (_, _, w, h) = self.clipboard_menu_geometry();
+        let mut c = Canvas::new(w, h, Color::rgb(247, 252, 255));
+        c.draw_round_rect(
+            0,
+            0,
+            i32::from(w),
+            i32::from(h),
+            14,
+            Color::rgb(247, 252, 255),
+        );
+        c.draw_text(&self.bold, "Clipboard", 18, 16, 15.0, INK);
+        let page_count = self.clipboard_page_count();
+        let page = self.clamped_clipboard_page();
+        let has_prev = page > 0;
+        let has_next = page + 1 < page_count;
+        self.draw_clipboard_nav_button(&mut c, CLIPBOARD_MENU_PREV_X, "<", has_prev);
+        self.draw_clipboard_nav_button(&mut c, CLIPBOARD_MENU_NEXT_X, ">", has_next);
+        let page_label = if page_count == 0 {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", page + 1, page_count)
+        };
+        c.draw_text_right(
+            &self.bold,
+            &page_label,
+            i32::from(w) - 16,
+            16,
+            12.0,
+            SOFT_INK,
+        );
+        if self.clipboard_history.is_empty() {
+            draw_clipboard_icon(&mut c, i32::from(w) / 2, 78, MUTED);
+            c.draw_text_center(
+                &self.regular,
+                "No clipboard history yet",
+                i32::from(w) / 2,
+                112,
+                13.0,
+                MUTED,
+            );
+            return self.upload_canvas(self.ui.clipboard_menu, &c);
+        }
+
+        let (start, end) = self.clipboard_page_range();
+        let visible_entries = self.clipboard_history[start..end].to_vec();
+        let mut row_y = 46;
+        for entry in visible_entries.iter() {
+            let row_h = clipboard_entry_row_height(entry);
+            c.draw_round_rect(
+                12,
+                row_y - 8,
+                i32::from(w) - 24,
+                row_h - 8,
+                9,
+                Color::rgba(255, 255, 255, 150),
+            );
+            match &entry.item {
+                ClipboardItem::Text(text) => {
+                    draw_text_file_icon(&mut c, 34, row_y + 16, SOFT_INK);
+                    let (line_one, line_two) = clipboard_text_preview_lines(text);
+                    c.draw_text(
+                        &self.regular,
+                        &line_one,
+                        58,
+                        if line_two.is_some() {
+                            row_y + 2
+                        } else {
+                            row_y + 10
+                        },
+                        13.0,
+                        INK,
+                    );
+                    if let Some(line_two) = line_two {
+                        c.draw_text(&self.regular, &line_two, 58, row_y + 21, 13.0, MUTED);
+                    }
+                }
+                ClipboardItem::Image(path) => {
+                    self.ensure_clipboard_image_preview(path);
+                    draw_picture_icon(&mut c, 34, row_y + 18, MINT_DARK);
+                    let info_x = 58;
+                    let preview_x = i32::from(w) / 2;
+                    let preview_y = row_y - 1;
+                    let preview_w = (i32::from(w) - preview_x - 20)
+                        .max(80)
+                        .min(CLIPBOARD_MENU_IMAGE_PREVIEW_W);
+                    let preview_h = (row_h - 14).min(CLIPBOARD_MENU_IMAGE_PREVIEW_H);
+                    c.draw_round_rect(
+                        preview_x,
+                        preview_y,
+                        preview_w,
+                        preview_h,
+                        8,
+                        Color::rgba(255, 255, 255, 220),
+                    );
+                    if let Some(Some(preview)) = self.clipboard_image_previews.get(path) {
+                        paint_cached_image_preview_left(
+                            &mut c, preview, preview_x, preview_y, preview_w, preview_h,
+                        );
+                    }
+                    c.draw_text(&self.bold, "Image", info_x, row_y, 13.0, INK);
+                    let label = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("image");
+                    c.draw_text(
+                        &self.regular,
+                        &compact(label, 22),
+                        info_x,
+                        row_y + 15,
+                        10.5,
+                        MUTED,
+                    );
+                    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    c.draw_text(
+                        &self.regular,
+                        &format!("Size {}", format_size_mb(size)),
+                        info_x,
+                        row_y + 30,
+                        10.5,
+                        SOFT_INK,
+                    );
+                    let kind = clipboard_image_type_label(path);
+                    let resolution = self
+                        .clipboard_image_previews
+                        .get(path)
+                        .and_then(|preview| preview.as_ref())
+                        .and_then(|preview| preview.resolution)
+                        .map(|(iw, ih)| format!("{iw}x{ih}"))
+                        .unwrap_or_else(|| "...".to_string());
+                    c.draw_text(
+                        &self.regular,
+                        &format!("{kind}  {resolution}"),
+                        info_x,
+                        row_y + 45,
+                        10.5,
+                        SOFT_INK,
+                    );
+                }
+            }
+            row_y += row_h;
+        }
+        self.upload_canvas(self.ui.clipboard_menu, &c)
+    }
+
+    fn clipboard_page_count(&self) -> usize {
+        self.clipboard_history
+            .len()
+            .div_ceil(CLIPBOARD_MENU_VISIBLE_ROWS)
+    }
+
+    fn clamped_clipboard_page(&self) -> usize {
+        self.clipboard_history_page
+            .min(self.clipboard_page_count().saturating_sub(1))
+    }
+
+    fn clipboard_page_range(&self) -> (usize, usize) {
+        let start = self.clamped_clipboard_page() * CLIPBOARD_MENU_VISIBLE_ROWS;
+        let end = (start + CLIPBOARD_MENU_VISIBLE_ROWS).min(self.clipboard_history.len());
+        (start, end)
+    }
+
+    fn clipboard_page_content_height(&self) -> i32 {
+        if self.clipboard_history.is_empty() {
+            return 0;
+        }
+        let (start, end) = self.clipboard_page_range();
+        self.clipboard_history[start..end]
+            .iter()
+            .map(clipboard_entry_row_height)
+            .sum()
+    }
+
+    fn configure_clipboard_menu(&self) -> AnyResult<()> {
+        let menu = self.clipboard_menu_geometry();
+        self.conn.configure_window(
+            self.ui.clipboard_menu,
+            &ConfigureWindowAux::new()
+                .x(i32::from(menu.0))
+                .y(i32::from(menu.1))
+                .width(u32::from(menu.2))
+                .height(u32::from(menu.3)),
+        )?;
+        Ok(())
+    }
+
+    fn ensure_clipboard_image_preview(&mut self, path: &Path) {
+        if self.clipboard_image_previews.contains_key(path)
+            || self.clipboard_image_preview_pending.contains(path)
+        {
+            return;
+        }
+        let path = path.to_path_buf();
+        self.clipboard_image_preview_pending.insert(path.clone());
+        let tx = self.clipboard_image_preview_tx.clone();
+        thread::spawn(move || {
+            let preview = render_image_preview(
+                &path,
+                CLIPBOARD_MENU_IMAGE_PREVIEW_W,
+                CLIPBOARD_MENU_IMAGE_PREVIEW_H,
+            );
+            let _ = tx.send(ClipboardImagePreviewResult { path, preview });
+        });
+    }
+
+    fn poll_clipboard_image_previews(&mut self) -> AnyResult<bool> {
+        let mut changed = false;
+        loop {
+            match self.clipboard_image_preview_rx.try_recv() {
+                Ok(result) => {
+                    self.clipboard_image_preview_pending.remove(&result.path);
+                    self.clipboard_image_previews
+                        .insert(result.path, result.preview);
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        if changed && self.clipboard_menu_visible {
+            self.redraw_clipboard_menu()?;
+        }
+        Ok(changed)
+    }
+
+    fn draw_clipboard_nav_button(&self, c: &mut Canvas, x: i32, label: &str, enabled: bool) {
+        c.draw_round_rect(
+            x,
+            CLIPBOARD_MENU_NAV_Y,
+            CLIPBOARD_MENU_NAV_W,
+            CLIPBOARD_MENU_NAV_H,
+            8,
+            if enabled {
+                Color::rgba(225, 246, 241, 210)
+            } else {
+                Color::rgba(226, 234, 239, 130)
+            },
+        );
+        c.draw_text_center(
+            &self.bold,
+            label,
+            x + CLIPBOARD_MENU_NAV_W / 2,
+            CLIPBOARD_MENU_NAV_Y + 5,
+            18.0,
+            if enabled { MINT_DARK } else { MUTED },
+        );
     }
 
     fn redraw_dock(&mut self) -> AnyResult<()> {
@@ -7061,6 +7463,172 @@ impl Aurora {
         self.open_settings_tab(tab)
     }
 
+    fn remember_clipboard_item(&mut self, item: ClipboardItem) -> bool {
+        if matches!(&item, ClipboardItem::Text(text) if text.is_empty()) {
+            return false;
+        }
+        self.clipboard_history
+            .retain(|entry| !clipboard_items_match(&entry.item, &item));
+        self.clipboard_history.insert(0, ClipboardEntry { item });
+        if self.clipboard_history.len() > CLIPBOARD_HISTORY_LIMIT {
+            self.clipboard_history.truncate(CLIPBOARD_HISTORY_LIMIT);
+        }
+        self.clipboard_history_page = self.clamped_clipboard_page();
+        true
+    }
+
+    fn poll_clipboard_history(&mut self) -> AnyResult<bool> {
+        if self.last_clipboard_poll.elapsed() < Duration::from_millis(1000) {
+            return Ok(false);
+        }
+        self.last_clipboard_poll = Instant::now();
+        if let Some((path, sig)) = read_image_clipboard() {
+            if self.last_seen_clipboard_image_sig == Some(sig) {
+                return Ok(false);
+            }
+            self.last_seen_clipboard_image_sig = Some(sig);
+            let item = ClipboardItem::Image(path);
+            append_clipboard_history(&item);
+            self.remember_clipboard_item(item);
+            if self.clipboard_menu_visible {
+                self.configure_clipboard_menu()?;
+                self.redraw_clipboard_menu()?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let Some(text) = read_text_clipboard() else {
+            return Ok(false);
+        };
+        let text = text.trim_end_matches('\0').to_string();
+        if text.is_empty() || text.len() > 1_000_000 {
+            return Ok(false);
+        }
+        if self.last_seen_clipboard_text.as_deref() == Some(text.as_str()) {
+            return Ok(false);
+        }
+        self.last_seen_clipboard_text = Some(text.clone());
+        let item = ClipboardItem::Text(text);
+        append_clipboard_history(&item);
+        self.remember_clipboard_item(item);
+        if self.clipboard_menu_visible {
+            self.configure_clipboard_menu()?;
+            self.redraw_clipboard_menu()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn toggle_clipboard_menu(&mut self) -> AnyResult<()> {
+        if self.clipboard_menu_visible {
+            return self.hide_clipboard_menu();
+        }
+        self.clipboard_menu_visible = true;
+        self.clipboard_history_page = 0;
+        self.configure_clipboard_menu()?;
+        self.conn.map_window(self.ui.clipboard_menu)?;
+        self.redraw_clipboard_menu()?;
+        self.raise_ui()
+    }
+
+    fn hide_clipboard_menu(&mut self) -> AnyResult<()> {
+        if self.clipboard_menu_visible {
+            self.clipboard_menu_visible = false;
+            self.conn.unmap_window(self.ui.clipboard_menu)?;
+        }
+        Ok(())
+    }
+
+    fn handle_clipboard_menu_press(&mut self, detail: u8, x: i32, y: i32) -> AnyResult<()> {
+        if detail == 4 || detail == 5 {
+            return self.handle_clipboard_menu_scroll(detail);
+        }
+        if detail != 1 {
+            return Ok(());
+        }
+        if y < 38 {
+            if point_in_rect(
+                x,
+                y,
+                CLIPBOARD_MENU_PREV_X,
+                CLIPBOARD_MENU_NAV_Y,
+                CLIPBOARD_MENU_NAV_W,
+                CLIPBOARD_MENU_NAV_H,
+            ) {
+                if self.clamped_clipboard_page() > 0 {
+                    self.clipboard_history_page = self.clamped_clipboard_page() - 1;
+                    self.configure_clipboard_menu()?;
+                    self.redraw_clipboard_menu()?;
+                }
+            } else if point_in_rect(
+                x,
+                y,
+                CLIPBOARD_MENU_NEXT_X,
+                CLIPBOARD_MENU_NAV_Y,
+                CLIPBOARD_MENU_NAV_W,
+                CLIPBOARD_MENU_NAV_H,
+            ) {
+                let page = self.clamped_clipboard_page();
+                if page + 1 < self.clipboard_page_count() {
+                    self.clipboard_history_page = page + 1;
+                    self.configure_clipboard_menu()?;
+                    self.redraw_clipboard_menu()?;
+                }
+            }
+            return Ok(());
+        }
+        let (start, end) = self.clipboard_page_range();
+        let mut row_y = 46;
+        let mut selected_idx = None;
+        for (offset, entry) in self.clipboard_history[start..end].iter().enumerate() {
+            let row_h = clipboard_entry_row_height(entry);
+            if y >= row_y - 8 && y < row_y - 8 + row_h - 8 {
+                selected_idx = Some(start + offset);
+                break;
+            }
+            row_y += row_h;
+        }
+        let Some(idx) = selected_idx else {
+            return Ok(());
+        };
+        let Some(entry) = self.clipboard_history.get(idx).cloned() else {
+            return Ok(());
+        };
+        match &entry.item {
+            ClipboardItem::Text(text) => {
+                copy_text_to_clipboard(text);
+                self.last_seen_clipboard_text = Some(text.clone());
+            }
+            ClipboardItem::Image(path) => {
+                copy_image_to_clipboard(path);
+                self.last_seen_clipboard_image_sig = clipboard_file_image_signature(path);
+            }
+        }
+        self.remember_clipboard_item(entry.item);
+        self.hide_clipboard_menu()?;
+        self.redraw_topbar()?;
+        if let Some(client) = self.active_client {
+            let _ = self.focus_window(client);
+        }
+        paste_clipboard_now(&self.display);
+        Ok(())
+    }
+
+    fn handle_clipboard_menu_scroll(&mut self, detail: u8) -> AnyResult<()> {
+        let page = self.clamped_clipboard_page();
+        let next_page = match detail {
+            4 => page.saturating_sub(1),
+            5 if page + 1 < self.clipboard_page_count() => page + 1,
+            _ => page,
+        };
+        if next_page != page {
+            self.clipboard_history_page = next_page;
+            self.configure_clipboard_menu()?;
+            self.redraw_clipboard_menu()?;
+        }
+        Ok(())
+    }
+
     fn ensure_wifi_refresh_started(&mut self, rescan: bool) {
         if self.wifi_refresh_rx.is_some() {
             return;
@@ -8910,6 +9478,8 @@ impl Aurora {
             return Ok(());
         }
         copy_image_to_clipboard(&path);
+        self.last_seen_clipboard_image_sig = clipboard_file_image_signature(&path);
+        self.remember_clipboard_item(ClipboardItem::Image(path.clone()));
         self.set_topbar_notice(
             "Screenshot saved and copied to clipboard",
             Duration::from_secs(3),
@@ -10883,13 +11453,22 @@ impl Aurora {
                 self.media_context_open = None;
             }
             MediaContextAction::CopyImage => {
+                let mut copied_image: Option<PathBuf> = None;
                 if let Some(media) = self.media_slots.get_mut(slot).and_then(|m| m.as_mut()) {
                     if media.entry.kind == FileKind::Image {
                         copy_image_to_clipboard(&media.entry.path);
+                        copied_image = Some(media.entry.path.clone());
                         media.notice = Some("Copied image to clipboard".to_string());
                     } else {
                         copy_text_to_clipboard(&media.entry.path.to_string_lossy());
                         media.notice = Some("Copied path".to_string());
+                    }
+                }
+                if let Some(path) = copied_image {
+                    self.last_seen_clipboard_image_sig = clipboard_file_image_signature(&path);
+                    self.remember_clipboard_item(ClipboardItem::Image(path));
+                    if self.clipboard_menu_visible {
+                        self.redraw_clipboard_menu()?;
                     }
                 }
                 self.media_context_open = None;
@@ -11638,6 +12217,7 @@ impl Aurora {
         let folder = self.folder_geometry();
         let terminal = self.folder_terminal_geometry();
         let menu = self.app_menu_geometry();
+        let clipboard_menu = self.clipboard_menu_geometry();
         self.conn.configure_window(
             self.ui.topbar,
             &ConfigureWindowAux::new()
@@ -11694,6 +12274,14 @@ impl Aurora {
                 .y(i32::from(aurora_menu.1))
                 .width(u32::from(aurora_menu.2))
                 .height(u32::from(aurora_menu.3)),
+        )?;
+        self.conn.configure_window(
+            self.ui.clipboard_menu,
+            &ConfigureWindowAux::new()
+                .x(i32::from(clipboard_menu.0))
+                .y(i32::from(clipboard_menu.1))
+                .width(u32::from(clipboard_menu.2))
+                .height(u32::from(clipboard_menu.3)),
         )?;
         self.conn.configure_window(
             self.ui.screenshot_overlay,
@@ -11782,6 +12370,12 @@ impl Aurora {
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
+        if self.clipboard_menu_visible {
+            self.conn.configure_window(
+                self.ui.clipboard_menu,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
         Ok(())
     }
 
@@ -11799,6 +12393,12 @@ impl Aurora {
         if self.aurora_menu_visible {
             self.conn.configure_window(
                 self.ui.aurora_menu,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
+        if self.clipboard_menu_visible {
+            self.conn.configure_window(
+                self.ui.clipboard_menu,
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
@@ -12048,6 +12648,22 @@ impl Aurora {
         (12, TOPBAR_HEIGHT as i16 + 8, width, height)
     }
 
+    fn clipboard_menu_geometry(&self) -> (i16, i16, u16, u16) {
+        let width = CLIPBOARD_MENU_WIDTH
+            .min(self.screen_width.saturating_sub(24))
+            .max(260.min(self.screen_width));
+        let height = if self.clipboard_history.is_empty() {
+            150
+        } else {
+            (56 + self.clipboard_page_content_height() + 10) as u16
+        };
+        let controls = self.topbar_controls();
+        let mut x = controls.clipboard_x - i32::from(width) / 2;
+        let max_x = i32::from(self.screen_width.saturating_sub(width)).saturating_sub(12);
+        x = x.max(12).min(max_x.max(12));
+        (x as i16, TOPBAR_HEIGHT as i16 + 4, width, height)
+    }
+
     fn media_geometry(&self, slot: usize) -> (i16, i16, u16, u16) {
         let folder = self.folder_geometry();
         let width = MEDIA_WIDTH
@@ -12152,6 +12768,7 @@ impl Aurora {
             || window == self.ui.screenshot_overlay
             || window == self.ui.app_menu
             || window == self.ui.aurora_menu
+            || window == self.ui.clipboard_menu
             || window == self.ui.dock_more_menu
             || self.ui.media.contains(&window)
     }
@@ -12642,10 +13259,13 @@ fn draw_sidebar_display_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
         Color::rgb(82, 196, 180)
     };
 
-    // Monitor casing
-    c.draw_round_rect(cx - 9, cy - 7, 18, 14, 3, base_color);
-    // Inner bezel / screen
-    c.draw_round_rect(cx - 7, cy - 5, 14, 10, 2, accent_color);
+    let (outer_x, outer_y, outer_w, outer_h, inner_x, inner_y, inner_w, inner_h) = if is_topbar {
+        (cx - 11, cy - 10, 22, 20, cx - 8, cy - 7, 16, 14)
+    } else {
+        (cx - 9, cy - 7, 18, 14, cx - 7, cy - 5, 14, 10)
+    };
+    c.draw_round_rect(outer_x, outer_y, outer_w, outer_h, 3, base_color);
+    c.draw_round_rect(inner_x, inner_y, inner_w, inner_h, 2, accent_color);
 }
 
 fn draw_sidebar_wallpaper_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -12987,9 +13607,38 @@ fn draw_screenshot_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
     } else {
         color
     };
-    c.draw_round_rect(cx - 10, cy - 8, 20, 16, 5, fill);
-    c.draw_circle(cx, cy, 4, Color::rgba(255, 255, 255, 210));
-    c.draw_circle(cx, cy, 2, fill);
+    let (x, y, w, h, lens) = if color == MINT_LIGHT {
+        (cx - 11, cy - 10, 22, 21, 6)
+    } else {
+        (cx - 10, cy - 8, 20, 16, 4)
+    };
+    c.draw_round_rect(x, y, w, h, 5, fill);
+    c.draw_circle(cx, cy, lens, Color::rgba(255, 255, 255, 210));
+    c.draw_circle(cx, cy, (lens - 2).max(2), fill);
+}
+
+fn draw_clipboard_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    let fill = if color == MINT_LIGHT {
+        Color::rgb(175, 218, 245)
+    } else {
+        color
+    };
+    let paper = if color == MINT_LIGHT {
+        Color::rgba(23, 34, 42, 118)
+    } else {
+        Color::rgba(255, 255, 255, 150)
+    };
+    if color == MINT_LIGHT {
+        c.draw_round_rect(cx - 10, cy - 7, 20, 18, 5, fill);
+        c.draw_round_rect(cx - 6, cy - 3, 12, 11, 2, paper);
+        c.draw_round_rect(cx - 6, cy - 11, 12, 7, 4, fill);
+        c.draw_round_rect(cx - 3, cy - 9, 6, 2, 1, paper);
+    } else {
+        c.draw_round_rect(cx - 8, cy - 6, 16, 16, 4, fill);
+        c.draw_round_rect(cx - 5, cy - 3, 10, 10, 2, paper);
+        c.draw_round_rect(cx - 5, cy - 9, 10, 6, 3, fill);
+        c.draw_round_rect(cx - 2, cy - 7, 4, 2, 1, paper);
+    }
 }
 
 fn draw_copy_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -13112,12 +13761,15 @@ fn draw_power_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
         Color::rgb(82, 196, 180)
     };
 
-    // Horizontal battery outline
-    c.draw_round_rect(cx - 9, cy - 6, 16, 12, 3, base_color);
-    // Small tip on right
-    c.draw_round_rect(cx + 7, cy - 3, 2, 6, 1, base_color);
-    // Green charge bar on left
-    c.draw_round_rect(cx - 7, cy - 4, 4, 8, 1, accent_color);
+    if is_topbar {
+        c.draw_round_rect(cx - 11, cy - 9, 20, 18, 4, base_color);
+        c.draw_round_rect(cx + 9, cy - 5, 3, 10, 1, base_color);
+        c.draw_round_rect(cx - 8, cy - 6, 6, 12, 1, accent_color);
+    } else {
+        c.draw_round_rect(cx - 9, cy - 6, 16, 12, 3, base_color);
+        c.draw_round_rect(cx + 7, cy - 3, 2, 6, 1, base_color);
+        c.draw_round_rect(cx - 7, cy - 4, 4, 8, 1, accent_color);
+    }
 }
 
 fn draw_wifi_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -13149,24 +13801,27 @@ fn draw_speaker_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
         Color::rgb(60, 75, 96)
     };
 
-    // Speaker flat base
-    c.draw_round_rect(cx - 10, cy - 3, 5, 6, 2, base_color);
+    let (base_x, base_y, base_w, base_h, x_start, x_end, y_start, y_end) = if is_topbar {
+        (cx - 12, cy - 5, 7, 10, cx - 5, cx + 8, cy - 10, cy + 10)
+    } else {
+        (cx - 10, cy - 3, 5, 6, cx - 5, cx + 5, cy - 7, cy + 7)
+    };
+    c.draw_round_rect(base_x, base_y, base_w, base_h, 2, base_color);
 
     // Flared cone in float distance space
-    let x_start = cx - 5;
-    let x_end = cx + 5;
-    let y_start = cy - 7;
-    let y_end = cy + 7;
+    let cone_w = (x_end - x_start).max(1) as f32;
+    let top_left = cy - base_h / 2;
+    let bottom_left = cy + base_h / 2;
 
     for y in y_start..=y_end {
         for x in x_start..=x_end {
             let x_f = x as f32;
             let y_f = y as f32;
 
-            // Top slope line: passes through (cx-5, cy-3) and (cx+5, cy-7)
-            let top_y = (cy - 3) as f32 - (x_f - (cx - 5) as f32) * (4.0 / 10.0);
-            // Bottom slope line: passes through (cx-5, cy+3) and (cx+5, cy+7)
-            let bottom_y = (cy + 3) as f32 + (x_f - (cx - 5) as f32) * (4.0 / 10.0);
+            let top_y =
+                top_left as f32 - (x_f - x_start as f32) * ((top_left - y_start) as f32 / cone_w);
+            let bottom_y = bottom_left as f32
+                + (x_f - x_start as f32) * ((y_end - bottom_left) as f32 / cone_w);
 
             let coverage_top = (y_f - top_y + 0.5).clamp(0.0, 1.0);
             let coverage_bottom = (bottom_y - y_f + 0.5).clamp(0.0, 1.0);
@@ -13642,17 +14297,45 @@ fn paint_cached_image_preview(
     w: i32,
     h: i32,
 ) {
+    paint_cached_image_preview_aligned(c, preview, x, y, w, h, true);
+}
+
+fn paint_cached_image_preview_left(
+    c: &mut Canvas,
+    preview: &ImagePreview,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
+    paint_cached_image_preview_aligned(c, preview, x, y, w, h, false);
+}
+
+fn paint_cached_image_preview_aligned(
+    c: &mut Canvas,
+    preview: &ImagePreview,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    center_x: bool,
+) {
     let pw = i32::from(preview.width);
     let ph = i32::from(preview.height);
-    let dx = x + (w - pw) / 2;
+    let dx = if center_x { x + (w - pw) / 2 } else { x };
     let dy = y + (h - ph) / 2;
     for yy in 0..ph {
         for xx in 0..pw {
+            let px = dx + xx;
+            let py = dy + yy;
+            if px < x || py < y || px >= x + w || py >= y + h {
+                continue;
+            }
             let idx = ((yy * pw + xx) * 4) as usize;
             if idx + 3 < preview.pixels.len() {
                 c.blend_pixel(
-                    dx + xx,
-                    dy + yy,
+                    px,
+                    py,
                     Color::rgba(
                         preview.pixels[idx],
                         preview.pixels[idx + 1],
@@ -14864,6 +15547,38 @@ fn compact(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn clipboard_text_preview_lines(text: &str) -> (String, Option<String>) {
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let total_chars = cleaned.chars().count();
+    if total_chars > 60 {
+        let first = cleaned.chars().take(40).collect::<String>();
+        let mut second = String::from("...");
+        second.extend(cleaned.chars().skip(total_chars - 20));
+        return (first, Some(second));
+    }
+    if total_chars > 40 {
+        let first = cleaned.chars().take(40).collect::<String>();
+        let second = cleaned.chars().skip(40).collect::<String>();
+        return (first, Some(second));
+    }
+    (cleaned, None)
+}
+
+fn clipboard_entry_row_height(entry: &ClipboardEntry) -> i32 {
+    match entry.item {
+        ClipboardItem::Text(_) => CLIPBOARD_MENU_TEXT_ROW_HEIGHT,
+        ClipboardItem::Image(_) => CLIPBOARD_MENU_IMAGE_ROW_HEIGHT,
+    }
+}
+
+fn clipboard_image_type_label(path: &Path) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_uppercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "IMAGE".to_string())
+}
+
 fn format_size_mb(bytes: u64) -> String {
     format!("{:.2} MB", bytes as f64 / 1024.0 / 1024.0)
 }
@@ -15479,6 +16194,7 @@ fn copy_text_to_clipboard(text: &str) {
                 let _ = stdin.write_all(text.as_bytes());
             }
             let _ = child.wait();
+            append_clipboard_history(&ClipboardItem::Text(text.to_string()));
             break;
         }
     }
@@ -15503,17 +16219,258 @@ fn read_text_clipboard() -> Option<String> {
     None
 }
 
+fn read_image_clipboard() -> Option<(PathBuf, u64)> {
+    let target = clipboard_image_target()?;
+    let output = Command::new("xclip")
+        .args(["-selection", "clipboard", "-target", target, "-o"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    let sig = clipboard_image_signature(target, &output.stdout);
+    let img = image::load_from_memory(&output.stdout).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    let dir = clipboard_image_history_dir();
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join(format!("clipboard-{sig:016x}-{width}x{height}.png"));
+    if !path.exists()
+        && image::save_buffer_with_format(
+            &path,
+            img.as_raw(),
+            width,
+            height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .is_err()
+    {
+        return None;
+    }
+    Some((path, sig))
+}
+
+fn clipboard_image_target() -> Option<&'static str> {
+    if !command_exists("xclip") {
+        return None;
+    }
+    let output = Command::new("xclip")
+        .args(["-selection", "clipboard", "-target", "TARGETS", "-o"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let targets = String::from_utf8_lossy(&output.stdout);
+    [
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/bmp",
+        "image/tiff",
+    ]
+    .into_iter()
+    .find(|target| targets.lines().any(|line| line.trim() == *target))
+}
+
+fn clipboard_image_signature(target: &str, bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    target.hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn clipboard_file_image_signature(path: &Path) -> Option<u64> {
+    let bytes = fs::read(path).ok()?;
+    Some(clipboard_image_signature("image/png", &bytes))
+}
+
+fn clipboard_image_history_dir() -> PathBuf {
+    if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("aurora-clipboard-images");
+    }
+    PathBuf::from(format!("/tmp/aurora-clipboard-images-{}", unsafe {
+        libc::geteuid()
+    }))
+}
+
 fn copy_image_to_clipboard(path: &Path) {
     if command_exists("xclip") {
-        let _ = Command::new("xclip")
+        let copied = Command::new("xclip")
             .args(["-selection", "clipboard", "-target", "image/png", "-i"])
             .arg(path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .is_ok_and(|status| status.success());
+        if copied {
+            append_clipboard_history(&ClipboardItem::Image(path.to_path_buf()));
+        }
     } else {
         copy_text_to_clipboard(&path.to_string_lossy());
     }
+}
+
+fn paste_clipboard_now(display: &str) {
+    if !command_exists("xdotool") {
+        return;
+    }
+    let mut cmd = Command::new("sh");
+    cmd.env("DISPLAY", display)
+        .arg("-c")
+        .arg("sleep 0.08; xdotool key ctrl+v")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    spawn_detached(cmd);
+}
+
+fn clipboard_history_path() -> PathBuf {
+    if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("aurora-clipboard-history");
+    }
+    PathBuf::from(format!("/tmp/aurora-clipboard-history-{}", unsafe {
+        libc::geteuid()
+    }))
+}
+
+fn append_clipboard_history(item: &ClipboardItem) {
+    let path = clipboard_history_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let line = match item {
+        ClipboardItem::Text(text) if text.is_empty() || text.len() > 1_000_000 => return,
+        ClipboardItem::Text(text) => format!("T\t{}\n", escape_history_field(text)),
+        ClipboardItem::Image(path) => {
+            format!("I\t{}\n", escape_history_field(&path.to_string_lossy()))
+        }
+    };
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
+    }
+    compact_clipboard_history_store(&path);
+}
+
+fn compact_clipboard_history_store(path: &Path) {
+    let entries = read_clipboard_history_store_from(path);
+    let mut out = String::new();
+    for entry in entries.iter().rev() {
+        match &entry.item {
+            ClipboardItem::Text(text) => {
+                out.push_str("T\t");
+                out.push_str(&escape_history_field(text));
+                out.push('\n');
+            }
+            ClipboardItem::Image(path) => {
+                out.push_str("I\t");
+                out.push_str(&escape_history_field(&path.to_string_lossy()));
+                out.push('\n');
+            }
+        }
+    }
+    let _ = fs::write(path, out);
+}
+
+fn read_clipboard_history_store() -> Vec<ClipboardEntry> {
+    read_clipboard_history_store_from(&clipboard_history_path())
+}
+
+fn read_clipboard_history_store_from(path: &Path) -> Vec<ClipboardEntry> {
+    let Ok(data) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<ClipboardEntry> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in data.lines().rev() {
+        let Some((kind, value)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(value) = unescape_history_field(value) else {
+            continue;
+        };
+        let item = match kind {
+            "T" if !value.is_empty() => ClipboardItem::Text(value),
+            "I" => {
+                let path = PathBuf::from(value);
+                if !path.exists() {
+                    continue;
+                }
+                ClipboardItem::Image(path)
+            }
+            _ => continue,
+        };
+        let key = clipboard_item_key(&item);
+        if !seen.insert(key) {
+            continue;
+        }
+        entries.push(ClipboardEntry { item });
+        if entries.len() >= CLIPBOARD_HISTORY_LIMIT {
+            break;
+        }
+    }
+    entries
+}
+
+fn clipboard_item_key(item: &ClipboardItem) -> String {
+    match item {
+        ClipboardItem::Text(text) => {
+            let mut key = String::with_capacity(text.len() + 2);
+            key.push_str("T\t");
+            key.push_str(text);
+            key
+        }
+        ClipboardItem::Image(path) => {
+            let value = path.to_string_lossy();
+            let mut key = String::with_capacity(value.len() + 2);
+            key.push_str("I\t");
+            key.push_str(&value);
+            key
+        }
+    }
+}
+
+fn clipboard_items_match(a: &ClipboardItem, b: &ClipboardItem) -> bool {
+    match (a, b) {
+        (ClipboardItem::Text(left), ClipboardItem::Text(right)) => left == right,
+        (ClipboardItem::Image(left), ClipboardItem::Image(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn escape_history_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'%' | b'\t' | b'\n' | b'\r' => out.push_str(&format!("%{byte:02X}")),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn unescape_history_field(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn move_to_trash(path: &Path) -> AnyResult<()> {
