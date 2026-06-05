@@ -24,6 +24,7 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ReplyError;
 use x11rb::image::{BitsPerPixel, Image, ImageOrder as XrbImageOrder, ScanlinePad};
 use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
+use x11rb::protocol::screensaver::{self, ConnectionExt as ScreenSaverConnectionExt};
 use x11rb::protocol::shape::{self, ConnectionExt as ShapeConnectionExt};
 use x11rb::protocol::xfixes::{self, ConnectionExt as XFixesConnectionExt};
 use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
@@ -37,6 +38,7 @@ type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 const TOPBAR_HEIGHT: u16 = 40;
 const DOCK_HEIGHT: u16 = 76;
 const TITLEBAR_HEIGHT: u16 = 34;
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const FRAME_CORNER_RADIUS: i32 = 8;
 const TERMINAL_HISTORY_LIMIT: usize = 1000;
 const SETTINGS_MIN_WIDTH: u16 = 420;
@@ -553,6 +555,15 @@ impl PowerMode {
             Self::Performance => "performance",
         }
     }
+
+    fn from_command_value(value: &str) -> Option<Self> {
+        match value.trim() {
+            "power-saver" => Some(Self::Saver),
+            "balanced" => Some(Self::Balanced),
+            "performance" => Some(Self::Performance),
+            _ => None,
+        }
+    }
 }
 
 struct SettingsState {
@@ -560,6 +571,7 @@ struct SettingsState {
     sleep_after_secs: u32,
     brightness_percent: u8,
     power_mode: PowerMode,
+    auto_power_saver_enabled: bool,
     auto_power_saver_minutes: u32,
     auto_power_saver_input: String,
     auto_power_saver_editing: bool,
@@ -588,11 +600,14 @@ struct SettingsState {
 impl Default for SettingsState {
     fn default() -> Self {
         let auto_power_saver_minutes = read_u32_setting("auto_power_saver_minutes", 10).min(240);
+        let auto_power_saver_enabled =
+            read_bool_setting("auto_power_saver_enabled", auto_power_saver_minutes > 0);
         Self {
             tab: SettingsTab::Display,
             sleep_after_secs: read_u32_setting("sleep_after_secs", 600).min(7200),
             brightness_percent: read_u32_setting("brightness_percent", 100).clamp(10, 100) as u8,
-            power_mode: PowerMode::Balanced,
+            power_mode: read_current_power_mode().unwrap_or(PowerMode::Balanced),
+            auto_power_saver_enabled,
             auto_power_saver_minutes,
             auto_power_saver_input: auto_power_saver_minutes.to_string(),
             auto_power_saver_editing: false,
@@ -1301,6 +1316,8 @@ struct Aurora {
     clipboard_image_preview_tx: mpsc::Sender<ClipboardImagePreviewResult>,
     clipboard_image_preview_rx: Receiver<ClipboardImagePreviewResult>,
     last_clipboard_poll: Instant,
+    clipboard_watch_supported: bool,
+    clipboard_dirty: bool,
     last_seen_clipboard_text: Option<String>,
     last_seen_clipboard_image_sig: Option<u64>,
     wm_s_atom: Atom,
@@ -1319,7 +1336,6 @@ struct Aurora {
     last_clock_label: String,
     last_tick: Instant,
     last_media_tick: Instant,
-    last_power_saver_check: Instant,
     last_pointer_pos: Option<(i16, i16)>,
     last_pointer_activity: Instant,
     pending_auto_power_saver_apply: Option<Instant>,
@@ -1770,6 +1786,8 @@ impl Aurora {
             clipboard_image_preview_tx,
             clipboard_image_preview_rx,
             last_clipboard_poll: Instant::now(),
+            clipboard_watch_supported: false,
+            clipboard_dirty: true,
             last_seen_clipboard_text: None,
             last_seen_clipboard_image_sig: None,
             wm_s_atom,
@@ -1788,7 +1806,6 @@ impl Aurora {
             last_clock_label: format_clock(),
             last_tick: Instant::now(),
             last_media_tick: Instant::now(),
-            last_power_saver_check: Instant::now(),
             last_pointer_pos: None,
             last_pointer_activity: Instant::now(),
             pending_auto_power_saver_apply: None,
@@ -1807,11 +1824,14 @@ impl Aurora {
             choose_file_mode: false,
         };
         app.apply_sleep_timeout();
-        if app.settings.auto_power_saver_minutes > 0 {
+        if app.settings.auto_power_saver_enabled && app.settings.auto_power_saver_minutes > 0 {
             let _ = app.set_power_mode(PowerMode::Performance);
         }
         let _ = save_app_commands(&app.settings);
         app.create_ui_windows()?;
+        if let Err(err) = app.init_clipboard_watcher() {
+            eprintln!("aurora-wm: clipboard watcher unavailable, using polling: {err}");
+        }
         Ok(app)
     }
 
@@ -1845,15 +1865,6 @@ impl Aurora {
                 handled_event = true;
             }
             if self.folder_terminal.visible && self.sync_folder_to_terminal_cwd()? {
-                handled_event = true;
-            }
-            if self.poll_wifi_refresh()? {
-                handled_event = true;
-            }
-            if self.poll_clipboard_history()? {
-                handled_event = true;
-            }
-            if self.poll_clipboard_image_previews()? {
                 handled_event = true;
             }
 
@@ -2002,32 +2013,53 @@ impl Aurora {
                 || self.pending_client_drag.is_some()
                 || self.pending_screenshot_button.is_some();
 
-            if !interactive
-                && self.settings.auto_power_saver_minutes > 0
-                && self.last_power_saver_check.elapsed() >= Duration::from_secs(5)
-            {
-                self.last_power_saver_check = Instant::now();
-                if self.update_auto_power_saver()? {
-                    self.conn.flush()?;
-                }
-            }
-
-            if !interactive && self.last_tick.elapsed() >= Duration::from_millis(3000) {
+            if !interactive && self.last_tick.elapsed() >= IDLE_CHECK_INTERVAL {
                 self.last_tick = Instant::now();
-                self.metrics = self.sampler.sample();
+                let mut idle_changed = false;
+
+                if self.poll_wifi_refresh()? {
+                    idle_changed = true;
+                }
+                if self.poll_clipboard_history()? {
+                    idle_changed = true;
+                }
+                if self.poll_clipboard_image_previews()? {
+                    idle_changed = true;
+                }
+                if self.sync_current_power_mode()? {
+                    idle_changed = true;
+                }
+                if self.settings.auto_power_saver_enabled
+                    && self.settings.auto_power_saver_minutes > 0
+                    && self.update_auto_power_saver()?
+                {
+                    idle_changed = true;
+                }
+
                 let clock_label = format_clock();
-                if clock_label != self.last_clock_label {
+                let clock_changed = clock_label != self.last_clock_label;
+                let metrics_visible = self.settings_visible
+                    && matches!(self.settings.tab, SettingsTab::Power | SettingsTab::About);
+                if clock_changed || metrics_visible {
+                    self.metrics = self.sampler.sample();
+                }
+                if clock_changed {
                     self.last_clock_label = clock_label;
                     self.redraw_topbar()?;
+                    idle_changed = true;
                 }
                 if self.settings_visible {
                     if self.settings.tab == SettingsTab::Network {
                         self.redraw_settings()?;
+                        idle_changed = true;
                     } else if matches!(self.settings.tab, SettingsTab::Power | SettingsTab::About) {
                         self.redraw_settings()?;
+                        idle_changed = true;
                     }
                 }
-                self.conn.flush()?;
+                if idle_changed {
+                    self.conn.flush()?;
+                }
             }
 
             if trace_events && Instant::now() >= next_trace_log {
@@ -2075,7 +2107,7 @@ impl Aurora {
         } else if interactive {
             Duration::from_millis(16)
         } else {
-            Duration::from_millis(250)
+            IDLE_CHECK_INTERVAL
         };
 
         if needs_pointer_poll {
@@ -2109,41 +2141,24 @@ impl Aurora {
                 (self.last_media_tick + Duration::from_millis(250)).saturating_duration_since(now),
             );
         }
-        timeout = timeout.min(
-            (self.last_clipboard_poll + Duration::from_millis(1000)).saturating_duration_since(now),
-        );
         if !interactive {
-            if self.settings.auto_power_saver_minutes > 0 {
-                timeout = timeout.min(
-                    (self.last_power_saver_check + Duration::from_secs(5))
-                        .saturating_duration_since(now),
-                );
-            }
-            timeout = timeout
-                .min((self.last_tick + Duration::from_millis(3000)).saturating_duration_since(now));
+            timeout =
+                timeout.min((self.last_tick + IDLE_CHECK_INTERVAL).saturating_duration_since(now));
         }
         timeout
     }
 
     fn update_auto_power_saver(&mut self) -> AnyResult<bool> {
-        let pointer = self.conn.query_pointer(self.root)?.reply()?;
-        let pos = (pointer.root_x, pointer.root_y);
-        let moved = self.last_pointer_pos.is_some_and(|last| last != pos);
-        self.last_pointer_pos = Some(pos);
-        if moved {
-            self.last_pointer_activity = Instant::now();
-            if self.settings.power_mode != PowerMode::Performance {
-                self.set_power_mode(PowerMode::Performance)?;
-                if self.settings_visible && self.settings.tab == SettingsTab::Power {
-                    self.redraw_settings()?;
-                }
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-        let idle_for = self.last_pointer_activity.elapsed();
+        let idle_for = self.current_user_idle_duration()?;
         let threshold =
             Duration::from_secs(u64::from(self.settings.auto_power_saver_minutes.max(1)) * 60);
+        if idle_for < IDLE_CHECK_INTERVAL && self.settings.power_mode != PowerMode::Performance {
+            self.set_power_mode(PowerMode::Performance)?;
+            if self.settings_visible && self.settings.tab == SettingsTab::Power {
+                self.redraw_settings()?;
+            }
+            return Ok(true);
+        }
         if idle_for >= threshold && self.settings.power_mode != PowerMode::Saver {
             self.set_power_mode(PowerMode::Saver)?;
             if self.settings_visible && self.settings.tab == SettingsTab::Power {
@@ -2152,6 +2167,38 @@ impl Aurora {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn current_user_idle_duration(&mut self) -> AnyResult<Duration> {
+        if self
+            .conn
+            .extension_information(screensaver::X11_EXTENSION_NAME)?
+            .is_some()
+        {
+            if let Ok(reply) = self.conn.screensaver_query_info(self.root)?.reply() {
+                return Ok(Duration::from_millis(u64::from(reply.ms_since_user_input)));
+            }
+        }
+
+        let pointer = self.conn.query_pointer(self.root)?.reply()?;
+        let pos = (pointer.root_x, pointer.root_y);
+        let moved = self.last_pointer_pos.is_some_and(|last| last != pos);
+        self.last_pointer_pos = Some(pos);
+        if moved {
+            self.last_pointer_activity = Instant::now();
+        }
+        Ok(self.last_pointer_activity.elapsed())
+    }
+
+    fn sync_current_power_mode(&mut self) -> AnyResult<bool> {
+        let Some(mode) = read_current_power_mode() else {
+            return Ok(false);
+        };
+        if mode == self.settings.power_mode {
+            return Ok(false);
+        }
+        self.settings.power_mode = mode;
+        Ok(true)
     }
 
     fn apply_auto_power_saver_setting(&mut self) -> AnyResult<bool> {
@@ -2164,16 +2211,40 @@ impl Aurora {
             .min(240);
         if self.settings.auto_power_saver_minutes == 0 {
             self.settings.auto_power_saver_input = "0".to_string();
+            self.settings.auto_power_saver_enabled = false;
             self.last_pointer_pos = None;
             save_app_commands(&self.settings)?;
-            return Ok(false);
+            return Ok(true);
         }
         self.settings.auto_power_saver_input = self.settings.auto_power_saver_minutes.to_string();
         self.last_pointer_activity = Instant::now();
         self.last_pointer_pos = None;
-        self.set_power_mode(PowerMode::Performance)?;
+        if self.settings.auto_power_saver_enabled {
+            self.set_power_mode(PowerMode::Performance)?;
+        }
         save_app_commands(&self.settings)?;
         Ok(true)
+    }
+
+    fn init_clipboard_watcher(&mut self) -> AnyResult<()> {
+        if self
+            .conn
+            .extension_information(xfixes::X11_EXTENSION_NAME)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        self.conn.xfixes_query_version(5, 0)?.reply()?;
+        let clipboard = self.atom(b"CLIPBOARD")?;
+        let mask = xfixes::SelectionEventMask::SET_SELECTION_OWNER
+            | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+            | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE;
+        self.conn
+            .xfixes_select_selection_input(self.root, clipboard, mask)?
+            .check()?;
+        self.clipboard_watch_supported = true;
+        self.clipboard_dirty = true;
+        Ok(())
     }
 
     fn create_ui_windows(&mut self) -> AnyResult<()> {
@@ -2567,6 +2638,7 @@ impl Aurora {
             Event::ClientMessage(ev) => self.handle_client_message(ev)?,
             Event::SelectionRequest(ev) => self.handle_selection_request(ev)?,
             Event::SelectionNotify(ev) => self.handle_selection_notify(ev)?,
+            Event::XfixesSelectionNotify(ev) => self.handle_xfixes_selection_notify(ev)?,
             Event::SelectionClear(ev) => {
                 if ev.selection == self.wm_s_atom {
                     std::process::exit(0);
@@ -2595,6 +2667,16 @@ impl Aurora {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_xfixes_selection_notify(
+        &mut self,
+        ev: xfixes::SelectionNotifyEvent,
+    ) -> AnyResult<()> {
+        if ev.selection == self.atom(b"CLIPBOARD")? {
+            self.clipboard_dirty = true;
         }
         Ok(())
     }
@@ -2675,6 +2757,7 @@ impl Aurora {
     }
 
     fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
+        self.last_pointer_activity = Instant::now();
         if self.dock_more_visible && ev.event != self.ui.dock_more_menu && ev.event != self.ui.dock
         {
             self.hide_dock_more_menu()?;
@@ -2855,6 +2938,7 @@ impl Aurora {
     }
 
     fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<bool> {
+        self.last_pointer_activity = Instant::now();
         if self.drag.is_none() {
             if self.screenshot_mode {
                 if let Some(selection) = self.screenshot_selection.as_mut() {
@@ -6289,21 +6373,46 @@ impl Aurora {
         );
         draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 196);
         c.draw_text(&self.bold, "Auto power saver", sx + 16, 106, 15.0, INK);
-        let input_x = i32::from(c.width) - 170;
+        let switch_x = i32::from(c.width) - 78;
+        let switch_y = 98;
+        if self.settings.auto_power_saver_enabled {
+            c.draw_round_rect(
+                switch_x,
+                switch_y,
+                40,
+                24,
+                12,
+                Color::rgba(160, 238, 220, 210),
+            );
+            c.draw_circle(switch_x + 28, switch_y + 12, 8, Color::rgb(255, 255, 255));
+        } else {
+            c.draw_round_rect(
+                switch_x,
+                switch_y,
+                40,
+                24,
+                12,
+                Color::rgba(200, 200, 200, 180),
+            );
+            c.draw_circle(switch_x + 12, switch_y + 12, 8, Color::rgb(255, 255, 255));
+        }
+        let input_x = sx + 16;
         c.draw_round_rect(
             input_x,
-            96,
+            132,
             118,
             30,
             9,
             if self.settings.auto_power_saver_editing {
                 Color::rgba(188, 224, 255, 245)
-            } else {
+            } else if self.settings.auto_power_saver_enabled {
                 Color::rgba(255, 255, 255, 190)
+            } else {
+                Color::rgba(235, 235, 235, 145)
             },
         );
         if self.settings.auto_power_saver_editing {
-            c.draw_round_rect(input_x, 96, 118, 30, 9, Color::rgba(73, 156, 231, 45));
+            c.draw_round_rect(input_x, 132, 118, 30, 9, Color::rgba(73, 156, 231, 45));
         }
         let minutes = if self.settings.auto_power_saver_editing {
             self.settings.auto_power_saver_input.as_str()
@@ -6314,26 +6423,22 @@ impl Aurora {
             &self.regular,
             if minutes.is_empty() { "0" } else { minutes },
             input_x + 14,
-            104,
+            140,
             14.0,
-            INK,
+            if self.settings.auto_power_saver_enabled {
+                INK
+            } else {
+                MUTED
+            },
         );
-        c.draw_text(&self.regular, "min", input_x + 72, 104, 13.0, MUTED);
+        c.draw_text(&self.regular, "min", input_x + 72, 140, 13.0, MUTED);
         c.draw_text(
             &self.regular,
             "idle minutes before battery saver",
-            sx + 16,
-            138,
+            input_x + 136,
+            140,
             12.0,
             MUTED,
-        );
-        c.draw_text_right(
-            &self.regular,
-            "Use 0 to disable",
-            input_x + 118,
-            138,
-            12.0,
-            BLUE,
         );
 
         c.draw_text(&self.bold, "Power profile", sx + 16, 174, 15.0, INK);
@@ -7478,7 +7583,12 @@ impl Aurora {
     }
 
     fn poll_clipboard_history(&mut self) -> AnyResult<bool> {
-        if self.last_clipboard_poll.elapsed() < Duration::from_millis(1000) {
+        if self.clipboard_watch_supported {
+            if !self.clipboard_dirty {
+                return Ok(false);
+            }
+            self.clipboard_dirty = false;
+        } else if self.last_clipboard_poll.elapsed() < IDLE_CHECK_INTERVAL {
             return Ok(false);
         }
         self.last_clipboard_poll = Instant::now();
@@ -7767,8 +7877,9 @@ impl Aurora {
 
     fn handle_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         if self.settings.tab == SettingsTab::Power && self.settings.auto_power_saver_editing {
-            let input_x = i32::from(self.settings_geometry().2) - 170;
-            let inside_input = y >= 96 && y <= 126 && x >= input_x && x <= input_x + 118;
+            let sx = SIDEBAR_WIDTH + 24;
+            let input_x = sx + 16;
+            let inside_input = y >= 132 && y <= 162 && x >= input_x && x <= input_x + 118;
             if !inside_input {
                 self.settings.auto_power_saver_editing = false;
                 self.conn
@@ -8142,8 +8253,29 @@ impl Aurora {
 
     fn handle_power_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let width = i32::from(self.settings_geometry().2);
-        let input_x = width - 170;
-        if y >= 96 && y <= 126 && x >= input_x && x <= input_x + 118 {
+        let switch_x = width - 78;
+        if y >= 98 && y <= 122 && x >= switch_x && x <= switch_x + 40 {
+            self.settings.auto_power_saver_enabled = !self.settings.auto_power_saver_enabled;
+            self.settings.auto_power_saver_editing = false;
+            self.pending_auto_power_saver_apply = None;
+            self.last_pointer_activity = Instant::now();
+            self.last_pointer_pos = None;
+            if self.settings.auto_power_saver_enabled && self.settings.auto_power_saver_minutes == 0
+            {
+                self.settings.auto_power_saver_minutes = 10;
+                self.settings.auto_power_saver_input = "10".to_string();
+            }
+            if self.settings.auto_power_saver_enabled && self.settings.auto_power_saver_minutes > 0
+            {
+                self.set_power_mode(PowerMode::Performance)?;
+            }
+            save_app_commands(&self.settings)?;
+            self.redraw_settings()?;
+            return Ok(());
+        }
+        let sx = SIDEBAR_WIDTH + 24;
+        let input_x = sx + 16;
+        if y >= 132 && y <= 162 && x >= input_x && x <= input_x + 118 {
             self.settings.auto_power_saver_editing = true;
             self.settings.auto_power_saver_input.clear();
             self.conn
@@ -8247,6 +8379,7 @@ impl Aurora {
     }
 
     fn handle_key_press(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
+        self.last_pointer_activity = Instant::now();
         if let Some(forward) = self.alt_tab_direction(&ev)? {
             self.switch_running_app(forward)?;
             return Ok(());
@@ -15290,6 +15423,16 @@ fn read_u32_setting(key: &str, fallback: u32) -> u32 {
         .unwrap_or(fallback)
 }
 
+fn read_bool_setting(key: &str, fallback: bool) -> bool {
+    read_setting_value(key)
+        .and_then(|value| match value.trim() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(fallback)
+}
+
 fn read_app_command(kind: DefaultAppKind) -> String {
     read_setting_value(kind.key()).unwrap_or_default()
 }
@@ -15303,17 +15446,27 @@ fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
     fs::write(
         path,
         format!(
-            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\nauto_power_saver_minutes={}\n",
+            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\n",
             clean(&settings.terminal_command),
             clean(&settings.browser_command),
             clean(&settings.photo_command),
             clean(&settings.video_command),
             settings.sleep_after_secs.min(7200),
             settings.brightness_percent.clamp(10, 100),
+            u8::from(settings.auto_power_saver_enabled),
             settings.auto_power_saver_minutes.min(240),
         ),
     )?;
     Ok(())
+}
+
+fn read_current_power_mode() -> Option<PowerMode> {
+    let output = Command::new("powerprofilesctl").arg("get").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout);
+    PowerMode::from_command_value(value.trim())
 }
 
 fn read_desktop_entries() -> Vec<DesktopEntry> {
