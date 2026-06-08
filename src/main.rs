@@ -24,7 +24,6 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ReplyError;
 use x11rb::image::{BitsPerPixel, Image, ImageOrder as XrbImageOrder, ScanlinePad};
 use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
-use x11rb::protocol::screensaver::{self, ConnectionExt as ScreenSaverConnectionExt};
 use x11rb::protocol::shape::{self, ConnectionExt as ShapeConnectionExt};
 use x11rb::protocol::xfixes::{self, ConnectionExt as XFixesConnectionExt};
 use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
@@ -39,6 +38,11 @@ const TOPBAR_HEIGHT: u16 = 40;
 const DOCK_HEIGHT: u16 = 76;
 const TITLEBAR_HEIGHT: u16 = 34;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const COMPOSITED_MOVE_INTERVAL: Duration = Duration::from_millis(16);
+const NON_COMPOSITED_MOVE_INTERVAL: Duration = Duration::from_millis(8);
+const NOT_IDLE_MARKER_PATH: &str = "/tmp/notidle";
+const POWER_PROFILE_CACHE_PATH: &str = "/tmp/aurora-power-profile";
+const POWER_PROFILE_LOCK_PATH: &str = "/tmp/aurora-power-profile.lock";
 const FRAME_CORNER_RADIUS: i32 = 8;
 const TERMINAL_HISTORY_LIMIT: usize = 1000;
 const SETTINGS_MIN_WIDTH: u16 = 420;
@@ -570,6 +574,7 @@ struct SettingsState {
     tab: SettingsTab,
     sleep_after_secs: u32,
     brightness_percent: u8,
+    compositor_enabled: bool,
     power_mode: PowerMode,
     auto_power_saver_enabled: bool,
     auto_power_saver_minutes: u32,
@@ -606,6 +611,7 @@ impl Default for SettingsState {
             tab: SettingsTab::Display,
             sleep_after_secs: read_u32_setting("sleep_after_secs", 600).min(7200),
             brightness_percent: read_u32_setting("brightness_percent", 100).clamp(10, 100) as u8,
+            compositor_enabled: read_bool_setting("compositor_enabled", false),
             power_mode: read_current_power_mode().unwrap_or(PowerMode::Balanced),
             auto_power_saver_enabled,
             auto_power_saver_minutes,
@@ -1248,6 +1254,7 @@ struct Aurora {
     wallpaper_cache: Vec<Option<Vec<u8>>>,
     wallpaper_previews: Vec<Option<Vec<u8>>>,
     wallpaper_pixmap: Option<Pixmap>,
+    compositor_active: bool,
     shape_supported: bool,
     ui: UiWindows,
     regular: Font<'static>,
@@ -1457,6 +1464,7 @@ fn run() -> AnyResult<()> {
     }
 
     let replace = args.iter().any(|arg| arg == "--replace");
+    let compositor_override = parse_compositor_arg(&args)?;
 
     let display = env::var("DISPLAY").unwrap_or_else(|_| ":111".to_string());
     let (conn, screen_num) = RustConnection::connect(Some(&display))?;
@@ -1528,7 +1536,7 @@ fn run() -> AnyResult<()> {
         conn.set_selection_owner(wm_window, wm_s_atom, CURRENT_TIME)?;
     }
 
-    let mut app = Aurora::new(conn, display, &screen, screen_num)?;
+    let mut app = Aurora::new(conn, display, &screen, screen_num, compositor_override)?;
     app.scan_existing_windows()?;
     app.redraw_everything()?;
     app.run_loop()
@@ -1538,6 +1546,7 @@ fn become_wm(conn: &RustConnection, screen: &Screen) -> Result<(), ReplyError> {
     let mask = EventMask::SUBSTRUCTURE_REDIRECT
         | EventMask::SUBSTRUCTURE_NOTIFY
         | EventMask::STRUCTURE_NOTIFY
+        | EventMask::EXPOSURE
         | EventMask::PROPERTY_CHANGE
         | EventMask::BUTTON_PRESS
         | EventMask::KEY_RELEASE;
@@ -1601,6 +1610,33 @@ fn wait_for_x_event_or_timeout(conn: &RustConnection, timeout: Duration) {
     }
 }
 
+fn parse_compositor_arg(args: &[String]) -> AnyResult<Option<bool>> {
+    let mut override_value = None;
+    let mut idx = 1;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--compositor" {
+            let value = args.get(idx + 1).ok_or("--compositor requires yes or no")?;
+            override_value = Some(parse_compositor_value(value)?);
+            idx += 2;
+        } else if let Some(value) = arg.strip_prefix("--compositor=") {
+            override_value = Some(parse_compositor_value(value)?);
+            idx += 1;
+        } else {
+            idx += 1;
+        }
+    }
+    Ok(override_value)
+}
+
+fn parse_compositor_value(value: &str) -> AnyResult<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "on" | "true" | "1" => Ok(true),
+        "no" | "off" | "false" | "0" => Ok(false),
+        _ => Err(format!("invalid --compositor value {value:?}; use yes or no").into()),
+    }
+}
+
 fn init_light_compositor(conn: &RustConnection, root: Window) -> bool {
     let Ok(Some(_)) = conn.extension_information(composite::X11_EXTENSION_NAME) else {
         eprintln!("aurora-wm: Composite extension unavailable; compositor disabled");
@@ -1631,12 +1667,21 @@ fn init_light_compositor(conn: &RustConnection, root: Window) -> bool {
     }
 }
 
+fn disable_light_compositor(conn: &RustConnection, root: Window) -> AnyResult<()> {
+    conn.composite_unredirect_subwindows(root, composite::Redirect::AUTOMATIC)?
+        .check()?;
+    conn.flush()?;
+    eprintln!("aurora-wm: light compositor disabled");
+    Ok(())
+}
+
 impl Aurora {
     fn new(
         conn: RustConnection,
         display: String,
         screen: &Screen,
         screen_num: usize,
+        compositor_override: Option<bool>,
     ) -> AnyResult<Self> {
         let gc = conn.generate_id()?;
         conn.create_gc(
@@ -1668,7 +1713,17 @@ impl Aurora {
         let mut wallpaper_cache = vec![None; WALLPAPERS.len()];
         wallpaper_cache[0] = Some(wallpaper_pixels.clone());
         let wallpaper_previews = vec![None; WALLPAPERS.len()];
-        init_light_compositor(&conn, screen.root);
+        let mut settings = SettingsState::default();
+        if let Some(enabled) = compositor_override {
+            settings.compositor_enabled = enabled;
+            save_app_commands(&settings)?;
+        }
+        let compositor_active = if settings.compositor_enabled {
+            init_light_compositor(&conn, screen.root)
+        } else {
+            eprintln!("aurora-wm: light compositor disabled by setting");
+            false
+        };
         let shape_supported = conn
             .extension_information(shape::X11_EXTENSION_NAME)?
             .is_some();
@@ -1718,13 +1773,14 @@ impl Aurora {
             wallpaper_cache,
             wallpaper_previews,
             wallpaper_pixmap: None,
+            compositor_active,
             shape_supported,
             ui,
             regular,
             bold,
             terminal_regular,
             terminal_bold,
-            settings: SettingsState::default(),
+            settings,
             terminal_apps,
             browser_apps,
             photo_apps,
@@ -1825,6 +1881,7 @@ impl Aurora {
         };
         app.apply_sleep_timeout();
         if app.settings.auto_power_saver_enabled && app.settings.auto_power_saver_minutes > 0 {
+            let _ = touch_notidle_marker();
             let _ = app.set_power_mode(PowerMode::Performance);
         }
         let _ = save_app_commands(&app.settings);
@@ -1895,8 +1952,16 @@ impl Aurora {
                 || self.pending_screenshot_button.is_some();
             let now = Instant::now();
             let pointer = if needs_pointer_poll && now >= next_pointer_poll {
-                let interval = if self.drag.is_some() || self.ui_resize.is_some() {
-                    Duration::from_millis(16)
+                let interval = if self.ui_resize.is_some() {
+                    COMPOSITED_MOVE_INTERVAL
+                } else if self
+                    .drag
+                    .is_some_and(|drag| matches!(drag.kind, DragKind::Move))
+                    && !self.compositor_active
+                {
+                    NON_COMPOSITED_MOVE_INTERVAL
+                } else if self.drag.is_some() {
+                    COMPOSITED_MOVE_INTERVAL
                 } else {
                     Duration::from_millis(50)
                 };
@@ -2149,17 +2214,18 @@ impl Aurora {
     }
 
     fn update_auto_power_saver(&mut self) -> AnyResult<bool> {
-        let idle_for = self.current_user_idle_duration()?;
+        self.mark_current_display_activity()?;
         let threshold =
             Duration::from_secs(u64::from(self.settings.auto_power_saver_minutes.max(1)) * 60);
-        if idle_for < IDLE_CHECK_INTERVAL && self.settings.power_mode != PowerMode::Performance {
+        let idle_long_enough = notidle_marker_age().is_some_and(|age| age >= threshold);
+        if !idle_long_enough && self.settings.power_mode != PowerMode::Performance {
             self.set_power_mode(PowerMode::Performance)?;
             if self.settings_visible && self.settings.tab == SettingsTab::Power {
                 self.redraw_settings()?;
             }
             return Ok(true);
         }
-        if idle_for >= threshold && self.settings.power_mode != PowerMode::Saver {
+        if idle_long_enough && self.settings.power_mode != PowerMode::Saver {
             self.set_power_mode(PowerMode::Saver)?;
             if self.settings_visible && self.settings.tab == SettingsTab::Power {
                 self.redraw_settings()?;
@@ -2169,29 +2235,28 @@ impl Aurora {
         Ok(false)
     }
 
-    fn current_user_idle_duration(&mut self) -> AnyResult<Duration> {
-        if self
-            .conn
-            .extension_information(screensaver::X11_EXTENSION_NAME)?
-            .is_some()
-        {
-            if let Ok(reply) = self.conn.screensaver_query_info(self.root)?.reply() {
-                return Ok(Duration::from_millis(u64::from(reply.ms_since_user_input)));
-            }
-        }
-
+    fn mark_current_display_activity(&mut self) -> AnyResult<()> {
         let pointer = self.conn.query_pointer(self.root)?.reply()?;
         let pos = (pointer.root_x, pointer.root_y);
-        let moved = self.last_pointer_pos.is_some_and(|last| last != pos);
+        let moved = self.last_pointer_pos.is_none_or(|last| last != pos);
         self.last_pointer_pos = Some(pos);
         if moved {
             self.last_pointer_activity = Instant::now();
         }
-        Ok(self.last_pointer_activity.elapsed())
+        if moved
+            || self
+                .last_pointer_activity
+                .elapsed()
+                .saturating_sub(IDLE_CHECK_INTERVAL)
+                < Duration::from_millis(250)
+        {
+            touch_notidle_marker()?;
+        }
+        Ok(())
     }
 
     fn sync_current_power_mode(&mut self) -> AnyResult<bool> {
-        let Some(mode) = read_current_power_mode() else {
+        let Some(mode) = current_power_mode_cached_or_refresh() else {
             return Ok(false);
         };
         if mode == self.settings.power_mode {
@@ -2220,6 +2285,7 @@ impl Aurora {
         self.last_pointer_activity = Instant::now();
         self.last_pointer_pos = None;
         if self.settings.auto_power_saver_enabled {
+            touch_notidle_marker()?;
             self.set_power_mode(PowerMode::Performance)?;
         }
         save_app_commands(&self.settings)?;
@@ -2300,7 +2366,10 @@ impl Aurora {
                     | EventMask::KEY_PRESS,
             )
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .bit_gravity(Gravity::NORTH_WEST)
+            .backing_store(BackingStore::WHEN_MAPPED)
+            .save_under(1);
         self.conn.create_window(
             self.depth,
             self.ui.settings,
@@ -2325,7 +2394,10 @@ impl Aurora {
                     | EventMask::POINTER_MOTION,
             )
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .bit_gravity(Gravity::NORTH_WEST)
+            .backing_store(BackingStore::WHEN_MAPPED)
+            .save_under(1);
         self.conn.create_window(
             self.depth,
             self.ui.folder,
@@ -2352,7 +2424,10 @@ impl Aurora {
                     | EventMask::KEY_PRESS,
             )
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .bit_gravity(Gravity::NORTH_WEST)
+            .backing_store(BackingStore::WHEN_MAPPED)
+            .save_under(1);
         self.conn.create_window(
             self.depth,
             self.ui.folder_terminal,
@@ -2711,6 +2786,16 @@ impl Aurora {
     }
 
     fn handle_expose(&mut self, ev: ExposeEvent) -> AnyResult<()> {
+        if ev.window == self.root {
+            self.clear_root_region(
+                i32::from(ev.x),
+                i32::from(ev.y),
+                u32::from(ev.width),
+                u32::from(ev.height),
+            )?;
+            self.conn.flush()?;
+            return Ok(());
+        }
         if ev.count != 0 {
             return Ok(());
         }
@@ -3029,7 +3114,8 @@ impl Aurora {
         };
         let now = Instant::now();
         let min_interval = match drag.kind {
-            DragKind::Move => Duration::from_millis(16),
+            DragKind::Move if self.compositor_active => COMPOSITED_MOVE_INTERVAL,
+            DragKind::Move => NON_COMPOSITED_MOVE_INTERVAL,
             DragKind::Resize => Duration::from_millis(33),
         };
         if !force && now.duration_since(drag.last_update_at) < min_interval {
@@ -3039,6 +3125,7 @@ impl Aurora {
             self.drag = None;
             return Ok(true);
         };
+        let old_info = info;
         match drag.kind {
             DragKind::Move => {
                 info.x = root_x.saturating_sub(drag.offset_x);
@@ -3056,6 +3143,16 @@ impl Aurora {
                         .x(i32::from(info.x))
                         .y(i32::from(info.y)),
                 )?;
+                if !self.compositor_active {
+                    let old_h = old_info.height + self.titlebar_height(&old_info);
+                    self.clear_root_region(
+                        i32::from(old_info.x),
+                        i32::from(old_info.y),
+                        u32::from(old_info.width),
+                        u32::from(old_h),
+                    )?;
+                    self.conn.flush()?;
+                }
             }
             DragKind::Resize => {
                 let dx = i32::from(root_x) - i32::from(drag.start_root_x);
@@ -4025,8 +4122,22 @@ impl Aurora {
         self.pending_resize = None;
         self.pending_ui_resize = None;
         self.ui_resize = None;
-        if self.drag.take().is_some() {
+        if let Some(drag) = self.drag.take() {
             self.conn.ungrab_pointer(CURRENT_TIME)?;
+            if matches!(drag.kind, DragKind::Move) {
+                if let Some(info) = self.clients.get(&drag.client).copied() {
+                    if !self.compositor_active {
+                        let frame_h = info.height + self.titlebar_height(&info);
+                        self.clear_root_region(
+                            i32::from(info.x),
+                            i32::from(info.y),
+                            u32::from(info.width),
+                            u32::from(frame_h),
+                        )?;
+                    }
+                    self.redraw_frame_titlebar(drag.client)?;
+                }
+            }
         } else {
             let _ = self.conn.ungrab_pointer(CURRENT_TIME);
         }
@@ -4127,7 +4238,10 @@ impl Aurora {
                     | EventMask::SUBSTRUCTURE_NOTIFY,
             )
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .bit_gravity(Gravity::NORTH_WEST)
+            .backing_store(BackingStore::WHEN_MAPPED)
+            .save_under(1);
         self.conn.create_window(
             self.depth,
             frame,
@@ -4610,6 +4724,31 @@ impl Aurora {
         self.install_pointer_cursor()?;
         if let Some(old) = self.wallpaper_pixmap.replace(pixmap) {
             let _ = self.conn.free_pixmap(old);
+        }
+        Ok(())
+    }
+
+    fn clear_root_region(&self, x: i32, y: i32, width: u32, height: u32) -> AnyResult<()> {
+        let x0 = x.clamp(0, i32::from(self.screen_width));
+        let y0 = y.clamp(0, i32::from(self.screen_height));
+        let x1 = (x.saturating_add(width.min(i32::MAX as u32) as i32))
+            .clamp(0, i32::from(self.screen_width));
+        let y1 = (y.saturating_add(height.min(i32::MAX as u32) as i32))
+            .clamp(0, i32::from(self.screen_height));
+        let clear_w = x1.saturating_sub(x0);
+        let clear_h = y1.saturating_sub(y0);
+        if clear_w <= 0 || clear_h <= 0 {
+            return Ok(());
+        }
+        let x = x0 as i16;
+        let y = y0 as i16;
+        let w = clear_w.min(i32::from(u16::MAX)) as u16;
+        let h = clear_h.min(i32::from(u16::MAX)) as u16;
+        if let Some(pixmap) = self.wallpaper_pixmap {
+            self.conn
+                .copy_area(pixmap, self.root, self.gc, x, y, x, y, w, h)?;
+        } else {
+            self.conn.clear_area(false, self.root, x, y, w, h)?;
         }
         Ok(())
     }
@@ -6314,6 +6453,59 @@ impl Aurora {
             MINT_DARK,
         );
         c.draw_text(&self.regular, "xrandr mode list", sx + 92, 310, 11.0, MUTED);
+        let compositor_switch_x = i32::from(c.width) - 78;
+        let compositor_switch_y = 276;
+        let compositor_label_x = (i32::from(c.width) - 180).max(sx + 150);
+        c.draw_text(&self.bold, "Compositor", compositor_label_x, 276, 15.0, INK);
+        if self.settings.compositor_enabled {
+            c.draw_round_rect(
+                compositor_switch_x,
+                compositor_switch_y,
+                40,
+                24,
+                12,
+                Color::rgba(160, 238, 220, 210),
+            );
+            c.draw_circle(
+                compositor_switch_x + 28,
+                compositor_switch_y + 12,
+                8,
+                Color::rgb(255, 255, 255),
+            );
+        } else {
+            c.draw_round_rect(
+                compositor_switch_x,
+                compositor_switch_y,
+                40,
+                24,
+                12,
+                Color::rgba(200, 200, 200, 180),
+            );
+            c.draw_circle(
+                compositor_switch_x + 12,
+                compositor_switch_y + 12,
+                8,
+                Color::rgb(255, 255, 255),
+            );
+        }
+        c.draw_text(
+            &self.regular,
+            if self.compositor_active {
+                "active"
+            } else if self.settings.compositor_enabled {
+                "saved"
+            } else {
+                "off"
+            },
+            compositor_label_x,
+            306,
+            11.0,
+            if self.settings.compositor_enabled {
+                MINT_DARK
+            } else {
+                MUTED
+            },
+        );
         if let Some(status) = self.settings.display_status.as_deref() {
             c.draw_text(
                 &self.regular,
@@ -8020,6 +8212,12 @@ impl Aurora {
                 }
             }
         }
+        let compositor_switch_x = i32::from(self.settings_geometry().2) - 78;
+        if y >= 274 && y <= 302 && x >= compositor_switch_x && x <= compositor_switch_x + 40 {
+            self.set_compositor_enabled(!self.settings.compositor_enabled)?;
+            self.redraw_settings()?;
+            return Ok(());
+        }
         let bar_x = sx + 16;
         let bar_w = 230;
         if x >= bar_x && x <= bar_x + bar_w && (404..=432).contains(&y) {
@@ -8267,6 +8465,7 @@ impl Aurora {
             }
             if self.settings.auto_power_saver_enabled && self.settings.auto_power_saver_minutes > 0
             {
+                touch_notidle_marker()?;
                 self.set_power_mode(PowerMode::Performance)?;
             }
             save_app_commands(&self.settings)?;
@@ -12202,10 +12401,54 @@ impl Aurora {
         spawn_detached(cmd);
     }
 
+    fn set_compositor_enabled(&mut self, enabled: bool) -> AnyResult<()> {
+        if enabled {
+            if self.compositor_active || init_light_compositor(&self.conn, self.root) {
+                self.compositor_active = true;
+                self.settings.compositor_enabled = true;
+                self.settings.display_status = Some("Compositor enabled".to_string());
+            } else {
+                self.settings.compositor_enabled = false;
+                self.settings.display_status =
+                    Some("Composite extension unavailable or already owned".to_string());
+            }
+        } else {
+            self.settings.compositor_enabled = false;
+            if self.compositor_active {
+                match disable_light_compositor(&self.conn, self.root) {
+                    Ok(()) => {
+                        self.compositor_active = false;
+                        self.settings.display_status = Some("Compositor disabled".to_string());
+                    }
+                    Err(err) => {
+                        self.settings.display_status =
+                            Some(format!("Compositor off after restart: {err}"));
+                    }
+                }
+            } else {
+                self.settings.display_status = Some("Compositor disabled".to_string());
+            }
+        }
+        save_app_commands(&self.settings)?;
+        Ok(())
+    }
+
     fn set_power_mode(&mut self, mode: PowerMode) -> AnyResult<()> {
-        let mut cmd = Command::new("powerprofilesctl");
-        cmd.args(["set", mode.command_value()]);
-        spawn_detached(cmd);
+        if read_cached_power_mode() == Some(mode) {
+            self.settings.power_mode = mode;
+            return Ok(());
+        }
+        if let Some(_lock) = try_tmp_file_lock(
+            POWER_PROFILE_LOCK_PATH,
+            IDLE_CHECK_INTERVAL + Duration::from_secs(5),
+        ) {
+            if read_cached_power_mode() != Some(mode) {
+                write_power_mode_cache(mode)?;
+                let mut cmd = Command::new("powerprofilesctl");
+                cmd.args(["set", mode.command_value()]);
+                spawn_detached(cmd);
+            }
+        }
         self.settings.power_mode = mode;
         Ok(())
     }
@@ -15446,13 +15689,14 @@ fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
     fs::write(
         path,
         format!(
-            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\n",
+            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\ncompositor_enabled={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\n",
             clean(&settings.terminal_command),
             clean(&settings.browser_command),
             clean(&settings.photo_command),
             clean(&settings.video_command),
             settings.sleep_after_secs.min(7200),
             settings.brightness_percent.clamp(10, 100),
+            u8::from(settings.compositor_enabled),
             u8::from(settings.auto_power_saver_enabled),
             settings.auto_power_saver_minutes.min(240),
         ),
@@ -15467,6 +15711,98 @@ fn read_current_power_mode() -> Option<PowerMode> {
     }
     let value = String::from_utf8_lossy(&output.stdout);
     PowerMode::from_command_value(value.trim())
+}
+
+fn current_power_mode_cached_or_refresh() -> Option<PowerMode> {
+    if power_mode_cache_fresh() {
+        return read_cached_power_mode();
+    }
+
+    if let Some(_lock) = try_tmp_file_lock(
+        POWER_PROFILE_LOCK_PATH,
+        IDLE_CHECK_INTERVAL + Duration::from_secs(5),
+    ) {
+        if power_mode_cache_fresh() {
+            return read_cached_power_mode();
+        }
+        if let Some(mode) = read_current_power_mode() {
+            let _ = write_power_mode_cache(mode);
+            return Some(mode);
+        }
+    }
+
+    read_cached_power_mode()
+}
+
+fn power_mode_cache_fresh() -> bool {
+    file_age(POWER_PROFILE_CACHE_PATH).is_some_and(|age| age < IDLE_CHECK_INTERVAL)
+}
+
+fn read_cached_power_mode() -> Option<PowerMode> {
+    let text = fs::read_to_string(POWER_PROFILE_CACHE_PATH).ok()?;
+    PowerMode::from_command_value(text.trim())
+}
+
+fn write_power_mode_cache(mode: PowerMode) -> AnyResult<()> {
+    fs::write(
+        POWER_PROFILE_CACHE_PATH,
+        format!("{}\n", mode.command_value()),
+    )?;
+    Ok(())
+}
+
+struct TmpFileLock {
+    path: &'static str,
+}
+
+impl Drop for TmpFileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path);
+    }
+}
+
+fn try_tmp_file_lock(path: &'static str, stale_after: Duration) -> Option<TmpFileLock> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Some(TmpFileLock { path }),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if file_age(path).is_some_and(|age| age > stale_after) {
+                let _ = fs::remove_file(path);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .ok()
+                    .map(|_| TmpFileLock { path })
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn touch_notidle_marker() -> AnyResult<()> {
+    if file_age(NOT_IDLE_MARKER_PATH).is_some_and(|age| age < Duration::from_secs(1)) {
+        return Ok(());
+    }
+    fs::write(NOT_IDLE_MARKER_PATH, b"notidle\n")?;
+    Ok(())
+}
+
+fn notidle_marker_age() -> Option<Duration> {
+    file_age(NOT_IDLE_MARKER_PATH)
+}
+
+fn file_age(path: &str) -> Option<Duration> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()?
+        .elapsed()
+        .ok()
 }
 
 fn read_desktop_entries() -> Vec<DesktopEntry> {
