@@ -24,6 +24,7 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ReplyError;
 use x11rb::image::{BitsPerPixel, Image, ImageOrder as XrbImageOrder, ScanlinePad};
 use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
+use x11rb::protocol::screensaver::ConnectionExt as ScreenSaverConnectionExt;
 use x11rb::protocol::shape::{self, ConnectionExt as ShapeConnectionExt};
 use x11rb::protocol::xfixes::{self, ConnectionExt as XFixesConnectionExt};
 use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
@@ -60,6 +61,8 @@ const FOLDER_TERMINAL_DEFAULT_COLS: usize = 90;
 const FOLDER_TERMINAL_DEFAULT_ROWS: usize = 18;
 const FOLDER_TERMINAL_CELL_W: i32 = 8;
 const FOLDER_TERMINAL_CELL_H: i32 = 18;
+const FOLDER_ENTRY_LIMIT: usize = 512;
+const FOLDER_OTHER_ENTRY_LIMIT: usize = 64;
 const CSD_DRAG_TOP_HEIGHT: i16 = 44;
 const TERMINAL_FALLBACKS: [&str; 5] = [
     "xfce4-terminal",
@@ -888,7 +891,7 @@ impl FolderMode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct FolderEntry {
     name: String,
     path: PathBuf,
@@ -2091,6 +2094,10 @@ impl Aurora {
                 if self.poll_clipboard_image_previews()? {
                     idle_changed = true;
                 }
+                if self.refresh_folder_entries() {
+                    self.redraw_folder()?;
+                    idle_changed = true;
+                }
                 if self.sync_current_power_mode()? {
                     idle_changed = true;
                 }
@@ -2217,7 +2224,7 @@ impl Aurora {
         self.mark_current_display_activity()?;
         let threshold =
             Duration::from_secs(u64::from(self.settings.auto_power_saver_minutes.max(1)) * 60);
-        let idle_long_enough = notidle_marker_age().is_some_and(|age| age >= threshold);
+        let idle_long_enough = notidle_marker_age().is_none_or(|age| age > threshold);
         if !idle_long_enough && self.settings.power_mode != PowerMode::Performance {
             self.set_power_mode(PowerMode::Performance)?;
             if self.settings_visible && self.settings.tab == SettingsTab::Power {
@@ -2236,6 +2243,16 @@ impl Aurora {
     }
 
     fn mark_current_display_activity(&mut self) -> AnyResult<()> {
+        let active_window_ms = (IDLE_CHECK_INTERVAL + Duration::from_millis(250)).as_millis();
+        if let Ok(cookie) = self.conn.screensaver_query_info(self.root) {
+            if let Ok(info) = cookie.reply() {
+                if u128::from(info.ms_since_user_input) <= active_window_ms {
+                    touch_notidle_marker()?;
+                }
+                return Ok(());
+            }
+        }
+
         let pointer = self.conn.query_pointer(self.root)?.reply()?;
         let pos = (pointer.root_x, pointer.root_y);
         let moved = self.last_pointer_pos.is_none_or(|last| last != pos);
@@ -3692,25 +3709,25 @@ impl Aurora {
         {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
-            self.toggle_settings_tab(SettingsTab::Display)?;
+            self.open_settings_tab(SettingsTab::Display)?;
         } else if (controls.audio_x - TOPBAR_ICON_HIT_RADIUS
             ..=controls.audio_x + TOPBAR_ICON_HIT_RADIUS)
             .contains(&x)
         {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
-            self.toggle_settings_tab(SettingsTab::Audio)?;
+            self.open_settings_tab(SettingsTab::Audio)?;
         } else if (controls.network_x - TOPBAR_ICON_HIT_RADIUS
             ..=controls.network_x + TOPBAR_ICON_HIT_RADIUS)
             .contains(&x)
         {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
-            self.toggle_settings_tab(SettingsTab::Network)?;
+            self.open_settings_tab(SettingsTab::Network)?;
         } else if (controls.battery_left..=controls.battery_right).contains(&x) {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
-            self.toggle_settings_tab(SettingsTab::Power)?;
+            self.open_settings_tab(SettingsTab::Power)?;
         } else {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
@@ -5364,7 +5381,7 @@ impl Aurora {
                 MUTED,
             );
         } else {
-            let limit = if self.choose_file_mode { 7 } else { 9 };
+            let limit = self.folder_visible_row_count();
             for (idx, entry) in self
                 .folder_entries
                 .iter()
@@ -5483,7 +5500,7 @@ impl Aurora {
                 MUTED,
             );
         }
-        let displayed_count = if self.choose_file_mode { 7 } else { 9 };
+        let displayed_count = self.folder_visible_row_count();
         if self.folder_entries.len() > displayed_count {
             let track_h = i32::from(h) - 100 - if self.choose_file_mode { 42 } else { 0 };
             let track_x = i32::from(w) - 13;
@@ -7750,16 +7767,6 @@ impl Aurora {
         self.redraw_topbar()
     }
 
-    fn toggle_settings_tab(&mut self, tab: SettingsTab) -> AnyResult<()> {
-        if self.settings_visible && self.settings.tab == tab {
-            self.settings_visible = false;
-            self.conn.unmap_window(self.ui.settings)?;
-            self.redraw_topbar()?;
-            return Ok(());
-        }
-        self.open_settings_tab(tab)
-    }
-
     fn remember_clipboard_item(&mut self, item: ClipboardItem) -> bool {
         if matches!(&item, ClipboardItem::Text(text) if text.is_empty()) {
             return false;
@@ -9345,7 +9352,7 @@ impl Aurora {
             return Ok(());
         }
         let idx = (y - 86) / 42;
-        if !(0..9).contains(&idx) {
+        if idx < 0 || idx as usize >= self.folder_visible_row_count() {
             self.folder_info = None;
             self.redraw_folder()?;
             return Ok(());
@@ -9511,7 +9518,7 @@ impl Aurora {
     fn handle_folder_context(&mut self, x: i32, y: i32) -> AnyResult<()> {
         if y >= 86 {
             let idx = (y - 86) / 42;
-            if (0..9).contains(&idx) {
+            if idx >= 0 && (idx as usize) < self.folder_visible_row_count() {
                 if let Some(entry) = self.folder_entries.get(self.folder_scroll + idx as usize) {
                     self.folder_selected = Some(entry.path.clone());
                 }
@@ -9526,7 +9533,10 @@ impl Aurora {
     }
 
     fn handle_folder_scroll(&mut self, button: u8) -> AnyResult<()> {
-        let max_scroll = self.folder_entries.len().saturating_sub(9);
+        let max_scroll = self
+            .folder_entries
+            .len()
+            .saturating_sub(self.folder_visible_row_count());
         let old_scroll = self.folder_scroll;
         if button == 4 {
             self.folder_scroll = self.folder_scroll.saturating_sub(3);
@@ -9555,15 +9565,61 @@ impl Aurora {
         }
     }
 
-    fn refresh_folder_entries(&mut self) {
-        self.folder_entries = folder_entries_in(self.folder_path.clone(), self.folder_sort);
-        self.folder_scroll = self
-            .folder_scroll
-            .min(self.folder_entries.len().saturating_sub(9));
+    fn refresh_folder_entries(&mut self) -> bool {
+        let previous_entries = self.folder_entries.clone();
+        let previous_scroll = self.folder_scroll;
+        let previous_selected = self.folder_selected.clone();
+        let anchor = self
+            .folder_entries
+            .get(self.folder_scroll)
+            .map(|entry| entry.path.clone());
+
+        let new_entries = self.current_folder_entries();
+        if new_entries == self.folder_entries {
+            self.clamp_folder_scroll();
+            return self.folder_scroll != previous_scroll
+                || self.folder_selected != previous_selected;
+        }
+
+        self.folder_entries = new_entries;
+        if let Some(anchor) = anchor {
+            if let Some(idx) = self
+                .folder_entries
+                .iter()
+                .position(|entry| entry.path == anchor)
+            {
+                self.folder_scroll = idx;
+            }
+        }
+        self.clamp_folder_scroll();
         self.folder_selected = self
             .folder_selected
             .take()
             .filter(|path| self.folder_entries.iter().any(|entry| &entry.path == path));
+
+        self.folder_entries != previous_entries
+            || self.folder_scroll != previous_scroll
+            || self.folder_selected != previous_selected
+    }
+
+    fn current_folder_entries(&self) -> Vec<FolderEntry> {
+        if self.folder_path == folder_path_for(self.folder_mode) {
+            folder_entries_for(self.folder_mode, self.folder_sort)
+        } else {
+            folder_entries_in(self.folder_path.clone(), self.folder_sort)
+        }
+    }
+
+    fn clamp_folder_scroll(&mut self) {
+        self.folder_scroll = self.folder_scroll.min(
+            self.folder_entries
+                .len()
+                .saturating_sub(self.folder_visible_row_count()),
+        );
+    }
+
+    fn folder_visible_row_count(&self) -> usize {
+        if self.choose_file_mode { 7 } else { 9 }
     }
 
     fn sync_folder_terminal_cwd(&mut self) {
@@ -17093,6 +17149,7 @@ fn folder_path_for(mode: FolderMode) -> PathBuf {
 
 fn folder_entries_in(path: PathBuf, sort: FolderSort) -> Vec<FolderEntry> {
     let mut entries = Vec::new();
+    let mut other_count = 0usize;
     let Ok(read_dir) = fs::read_dir(&path) else {
         return entries;
     };
@@ -17107,20 +17164,22 @@ fn folder_entries_in(path: PathBuf, sort: FolderSort) -> Vec<FolderEntry> {
         } else {
             file_kind_for(&entry_path)
         };
-        if kind == FileKind::Other && entries.len() > 10 {
-            continue;
+        if kind == FileKind::Other {
+            if other_count >= FOLDER_OTHER_ENTRY_LIMIT {
+                continue;
+            }
+            other_count += 1;
         }
         entries.push(FolderEntry {
             name,
             path: entry_path,
             kind,
         });
-        if entries.len() >= 64 {
+        if entries.len() >= FOLDER_ENTRY_LIMIT {
             break;
         }
     }
     sort_folder_entries(&mut entries, sort);
-    entries.truncate(18);
     entries
 }
 
