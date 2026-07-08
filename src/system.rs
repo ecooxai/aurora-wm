@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -970,7 +971,7 @@ pub(crate) fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
     fs::write(
         path,
         format!(
-            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\ncompositor_enabled={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\n",
+            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\ncompositor_enabled={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\nshortcut_folder={}\nshortcut_terminal={}\nshortcut_clipboard={}\nshortcut_screenshot={}\n",
             clean(&settings.terminal_command),
             clean(&settings.browser_command),
             clean(&settings.photo_command),
@@ -980,6 +981,10 @@ pub(crate) fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
             u8::from(settings.compositor_enabled),
             u8::from(settings.auto_power_saver_enabled),
             settings.auto_power_saver_minutes.min(240),
+            shortcut_setting_string(settings.shortcuts.folder),
+            shortcut_setting_string(settings.shortcuts.terminal),
+            shortcut_setting_string(settings.shortcuts.clipboard),
+            shortcut_setting_string(settings.shortcuts.screenshot),
         ),
     )?;
     Ok(())
@@ -1279,7 +1284,31 @@ pub(crate) fn read_battery() -> Option<String> {
         }
         let cap = fs::read_to_string(entry.path().join("capacity")).ok()?;
         let status = fs::read_to_string(entry.path().join("status")).unwrap_or_default();
-        return Some(format!("{}% {}", cap.trim(), status.trim()));
+        let mut label = format!("{}% {}", cap.trim(), status.trim());
+        // Optional detail: current draw in watts and a rough time estimate.
+        let read_u64 = |name: &str| {
+            fs::read_to_string(entry.path().join(name))
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        let power_uw = read_u64("power_now")
+            .or_else(|| Some(read_u64("current_now")? * read_u64("voltage_now")? / 1_000_000));
+        if let Some(power_uw) = power_uw.filter(|&p| p > 0) {
+            label.push_str(&format!(" - {:.1} W", power_uw as f64 / 1_000_000.0));
+            let energy_uwh = read_u64("energy_now")
+                .or_else(|| Some(read_u64("charge_now")? * read_u64("voltage_now")? / 1_000_000));
+            if status.trim() == "Discharging" {
+                if let Some(energy) = energy_uwh.filter(|&e| e > 0) {
+                    let hours = energy as f64 / power_uw as f64;
+                    label.push_str(&format!(
+                        ", ~{}h {:02}m left",
+                        hours as u64,
+                        ((hours * 60.0) as u64) % 60
+                    ));
+                }
+            }
+        }
+        return Some(label);
     }
     None
 }

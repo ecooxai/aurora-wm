@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -72,6 +73,7 @@ impl Aurora {
             SettingsTab::Bluetooth,
             SettingsTab::Startup,
             SettingsTab::Apps,
+            SettingsTab::Shortcuts,
             SettingsTab::About,
         ];
         for (idx, tab) in items.iter().enumerate() {
@@ -379,17 +381,36 @@ impl Aurora {
             self.metrics.cpu_usage,
             "%",
         );
-        c.draw_text(&self.regular, "CPU frequency", sx + 16, 390, 12.0, MUTED);
-        let freq_lines = cpu_frequency_lines(&self.metrics.cpu_frequencies, 46);
-        for (idx, line) in freq_lines.iter().take(3).enumerate() {
+        let mut bar_y = 354;
+        for gpu in self.metrics.gpu_usage.iter().take(2) {
+            bar_y += 38;
+            draw_metric_bar(
+                c,
+                &self.regular,
+                sx + 16,
+                bar_y,
+                &compact(&gpu.name, 9),
+                gpu.percent,
+                "%",
+            );
+        }
+        if self.metrics.gpu_usage.is_empty() {
+            bar_y += 20;
             c.draw_text(
                 &self.regular,
-                line,
+                "GPU usage unavailable (no driver metric exposed)",
                 sx + 16,
-                412 + idx as i32 * 16,
+                bar_y,
                 11.0,
-                INK,
+                MUTED,
             );
+        }
+        let freq_lines = cpu_frequency_lines(&self.metrics.cpu_frequencies, 46);
+        if let Some(line) = freq_lines.first() {
+            if bar_y + 38 <= 440 {
+                c.draw_text(&self.regular, "CPU frequency", sx + 16, bar_y + 28, 11.0, MUTED);
+                c.draw_text(&self.regular, line, sx + 110, bar_y + 28, 11.0, INK);
+            }
         }
 
         draw_card(c, sx, 476, i32::from(c.width) - sx - 24, 76);

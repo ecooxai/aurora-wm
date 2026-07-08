@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -670,6 +671,7 @@ impl Aurora {
             SettingsTab::Bluetooth => self.draw_bluetooth_tab(&mut c),
             SettingsTab::Startup => self.draw_startup_tab(&mut c),
             SettingsTab::Apps => self.draw_apps_tab(&mut c),
+            SettingsTab::Shortcuts => self.draw_shortcuts_tab(&mut c),
             SettingsTab::About => self.draw_about_tab(&mut c),
         }
         self.upload_canvas(self.ui.settings, &c)

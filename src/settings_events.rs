@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -86,7 +87,8 @@ impl Aurora {
                 5 => Some(SettingsTab::Bluetooth),
                 6 => Some(SettingsTab::Startup),
                 7 => Some(SettingsTab::Apps),
-                8 => Some(SettingsTab::About),
+                8 => Some(SettingsTab::Shortcuts),
+                9 => Some(SettingsTab::About),
                 _ => None,
             };
             if let Some(tab) = tab {
@@ -110,6 +112,7 @@ impl Aurora {
                 self.spawn_first_available(&["blueman-manager", "bluetoothctl"], &[]);
             }
             SettingsTab::Apps => self.handle_apps_click(x, y)?,
+            SettingsTab::Shortcuts => self.handle_shortcuts_click(x, y)?,
             SettingsTab::Network => self.handle_network_click(x, y)?,
             SettingsTab::Bluetooth | SettingsTab::Startup => {}
             SettingsTab::About => {}
@@ -132,6 +135,7 @@ impl Aurora {
                 (lines.saturating_sub(4) * 24) as i32
             }
             SettingsTab::Startup | SettingsTab::About => 180,
+            SettingsTab::Shortcuts => 0,
             SettingsTab::Audio | SettingsTab::Wallpaper => 80,
             SettingsTab::Apps => self
                 .available_apps(self.settings.app_kind)
@@ -218,11 +222,7 @@ impl Aurora {
         if x >= bar_x && x <= bar_x + bar_w && (404..=432).contains(&y) {
             let percent = (10 + ((x - bar_x) * 90) / bar_w).clamp(10, 100) as u8;
             self.settings.brightness_percent = percent;
-            self.settings.display_status = match apply_xrandr_brightness(
-                &self.display,
-                self.current_display_output(),
-                percent,
-            ) {
+            self.settings.display_status = match self.apply_brightness_all(percent) {
                 Ok(()) => Some(format!("Brightness set to {percent}%")),
                 Err(err) => Some(err),
             };

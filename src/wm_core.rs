@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::events::*;
@@ -131,6 +132,9 @@ impl Aurora {
                 conn.generate_id()?,
             ],
             dock_more_menu: conn.generate_id()?,
+            title_menu: conn.generate_id()?,
+            confirm_dialog: conn.generate_id()?,
+            tooltip: conn.generate_id()?,
         };
         let mut sampler = SystemSampler::new();
         let metrics = sampler.sample();
@@ -265,6 +269,9 @@ impl Aurora {
             alt_tab_index: 0,
             alt_tab_windows: Vec::new(),
             choose_file_mode: false,
+            title_menu_open: None,
+            confirm_close: None,
+            tooltip_shown: None,
         };
         app.apply_sleep_timeout();
         if app.settings.auto_power_saver_enabled && app.settings.auto_power_saver_minutes > 0 {
@@ -718,9 +725,18 @@ impl Aurora {
         self.grab_root_button1()?;
         self.grab_alt_tab()?;
         self.grab_workspace_keys()?;
+        self.grab_configured_shortcuts()?;
+        self.publish_ewmh_support()?;
+        self.create_extra_ui_windows()?;
         let top_aux = CreateWindowAux::new()
             .override_redirect(1)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::POINTER_MOTION
+                    | EventMask::LEAVE_WINDOW,
+            )
             .cursor(self.cursor)
             .background_pixel(0);
         self.conn.create_window(

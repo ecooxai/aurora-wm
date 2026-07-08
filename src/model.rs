@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::wm_core::*;
 use crate::events::*;
@@ -147,6 +148,7 @@ pub(crate) enum SettingsTab {
     Bluetooth,
     Startup,
     Apps,
+    Shortcuts,
     About,
 }
 
@@ -242,6 +244,25 @@ pub(crate) struct SettingsState {
     pub(crate) wifi_disconnect_confirm: bool,
     pub(crate) wifi_radio_enabled: Option<bool>,
     pub(crate) wifi_connected: Option<Option<WifiConnection>>,
+    pub(crate) shortcuts: ShortcutConfig,
+    pub(crate) shortcut_capture: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShortcutSpec {
+    pub(crate) ctrl: bool,
+    pub(crate) alt: bool,
+    pub(crate) shift: bool,
+    pub(crate) super_key: bool,
+    pub(crate) keysym: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShortcutConfig {
+    pub(crate) folder: ShortcutSpec,
+    pub(crate) terminal: ShortcutSpec,
+    pub(crate) clipboard: ShortcutSpec,
+    pub(crate) screenshot: ShortcutSpec,
 }
 
 impl Default for SettingsState {
@@ -279,6 +300,8 @@ impl Default for SettingsState {
             wifi_disconnect_confirm: false,
             wifi_radio_enabled: None,
             wifi_connected: None,
+            shortcuts: read_shortcut_config(),
+            shortcut_capture: None,
         }
     }
 }
@@ -294,10 +317,17 @@ pub(crate) struct Metrics {
     pub(crate) swap_total_kb: u64,
     pub(crate) swap_used_kb: u64,
     pub(crate) gpus: Vec<String>,
+    pub(crate) gpu_usage: Vec<GpuUsage>,
     pub(crate) nics: Vec<String>,
     pub(crate) net_rx_bps: f64,
     pub(crate) net_tx_bps: f64,
     pub(crate) battery: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GpuUsage {
+    pub(crate) name: String,
+    pub(crate) percent: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -371,6 +401,7 @@ impl SystemSampler {
             swap_total_kb,
             swap_used_kb,
             gpus: self.gpus.clone(),
+            gpu_usage: read_gpu_usage(),
             nics: self.nics.clone(),
             net_rx_bps,
             net_tx_bps,
@@ -392,6 +423,9 @@ pub(crate) struct UiWindows {
     pub(crate) clipboard_menu: Window,
     pub(crate) media: [Window; MEDIA_SLOT_COUNT],
     pub(crate) dock_more_menu: Window,
+    pub(crate) title_menu: Window,
+    pub(crate) confirm_dialog: Window,
+    pub(crate) tooltip: Window,
 }
 
 #[derive(Clone, Copy)]
@@ -417,6 +451,12 @@ pub(crate) struct ClientInfo {
     pub(crate) height: u16,
     pub(crate) titlebar: bool,
     pub(crate) saved: Option<(i16, i16, u16, u16)>,
+    /// Visible on every workspace.
+    pub(crate) sticky: bool,
+    /// _NET_WM_STATE_FULLSCREEN is active.
+    pub(crate) fullscreen: bool,
+    /// Geometry + titlebar flag saved when entering fullscreen.
+    pub(crate) fs_saved: Option<(i16, i16, u16, u16, bool)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1011,4 +1051,10 @@ pub(crate) struct Aurora {
     pub(crate) alt_tab_index: usize,
     pub(crate) alt_tab_windows: Vec<Window>,
     pub(crate) choose_file_mode: bool,
+    /// Client whose title dropdown menu is open.
+    pub(crate) title_menu_open: Option<Window>,
+    /// Client with a pending close-confirmation dialog.
+    pub(crate) confirm_close: Option<Window>,
+    /// Currently shown topbar tooltip: (anchor x, label).
+    pub(crate) tooltip_shown: Option<(i32, String)>,
 }

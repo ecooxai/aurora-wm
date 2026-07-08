@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -64,6 +65,12 @@ use crate::files::*;
 impl Aurora {
     pub(crate) fn handle_key_press(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
         self.last_pointer_activity = Instant::now();
+        if self.capture_shortcut_key(&ev)? {
+            return Ok(());
+        }
+        if self.dispatch_shortcut(&ev)? {
+            return Ok(());
+        }
         if let Some(forward) = self.alt_tab_direction(&ev)? {
             self.switch_running_app(forward)?;
             return Ok(());

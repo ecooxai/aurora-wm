@@ -79,6 +79,7 @@ const FONT_TERMINAL_REGULAR: &[u8] = include_bytes!("../fonts/NotoSansMono-Regul
 const FONT_TERMINAL_BOLD: &[u8] = include_bytes!("../fonts/NotoSansMono-Bold.ttf");
 
 mod canvas;
+mod wm_extras;
 mod model;
 mod wm_core;
 mod events;
@@ -105,6 +106,7 @@ mod textutil;
 mod procutil;
 mod files;
 use canvas::*;
+use wm_extras::*;
 use model::*;
 use wm_core::*;
 use events::*;

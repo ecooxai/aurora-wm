@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -200,6 +201,15 @@ impl Aurora {
             self.redraw_screenshot_overlay()?;
         } else if ev.window == self.ui.app_menu && self.app_menu_visible {
             self.redraw_app_menu()?;
+        } else if ev.window == self.ui.title_menu && self.title_menu_open.is_some() {
+            self.redraw_title_menu()?;
+        } else if ev.window == self.ui.confirm_dialog && self.confirm_close.is_some() {
+            self.redraw_close_confirm()?;
+        } else if ev.window == self.ui.tooltip {
+            if let Some((_, text)) = self.tooltip_shown.clone() {
+                let tw = (measure_text(&self.regular, &text, 12.0) + 22) as u16;
+                self.redraw_tooltip(&text, tw)?;
+            }
         } else if ev.window == self.ui.aurora_menu && self.aurora_menu_visible {
             self.redraw_aurora_menu()?;
         } else if ev.window == self.ui.clipboard_menu && self.clipboard_menu_visible {
@@ -230,6 +240,56 @@ impl Aurora {
 
     pub(crate) fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
         self.last_pointer_activity = Instant::now();
+        // Close-confirmation dialog: route by root coordinates because the
+        // synchronous root button grab reports these presses on the root
+        // window first; the replayed event then reaches the dialog itself.
+        if self.confirm_close.is_some() {
+            let (cx, cy, cw, ch) = self.confirm_geometry();
+            let rx = i32::from(ev.root_x);
+            let ry = i32::from(ev.root_y);
+            let inside = rx >= i32::from(cx)
+                && rx <= i32::from(cx) + i32::from(cw)
+                && ry >= i32::from(cy)
+                && ry <= i32::from(cy) + i32::from(ch);
+            if inside {
+                if ev.event == self.ui.confirm_dialog {
+                    self.handle_confirm_click(rx - i32::from(cx), ry - i32::from(cy))?;
+                    self.conn.flush()?;
+                    return Ok(());
+                }
+                if ev.event == self.root {
+                    self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
+                    self.conn.flush()?;
+                    return Ok(());
+                }
+            } else if ev.event != self.ui.confirm_dialog {
+                self.hide_close_confirm()?;
+            }
+        }
+        // Title dropdown menu: same replay-aware routing.
+        if let Some(menu_client) = self.title_menu_open {
+            let (mx, my, mw, mh) = self.title_menu_geometry(menu_client);
+            let rx = i32::from(ev.root_x);
+            let ry = i32::from(ev.root_y);
+            let inside = rx >= i32::from(mx)
+                && rx <= i32::from(mx) + i32::from(mw)
+                && ry >= i32::from(my)
+                && ry <= i32::from(my) + i32::from(mh);
+            if inside {
+                if ev.event == self.ui.title_menu {
+                    self.handle_title_menu_click(ry - i32::from(my))?;
+                    self.conn.flush()?;
+                    return Ok(());
+                }
+                if ev.event == self.root {
+                    self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
+                    self.conn.flush()?;
+                    return Ok(());
+                }
+            } else {
+                self.hide_title_menu()?;
+            }
+        }
         if self.dock_more_visible && ev.event != self.ui.dock_more_menu && ev.event != self.ui.dock
         {
             self.hide_dock_more_menu()?;
@@ -411,6 +471,9 @@ impl Aurora {
 
     pub(crate) fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<bool> {
         self.last_pointer_activity = Instant::now();
+        if ev.event == self.ui.topbar && self.drag.is_none() {
+            self.update_topbar_tooltip(i32::from(ev.event_x))?;
+        }
         if self.drag.is_none() {
             if self.screenshot_mode {
                 if let Some(selection) = self.screenshot_selection.as_mut() {
@@ -607,6 +670,9 @@ impl Aurora {
     }
 
     pub(crate) fn handle_leave_notify(&mut self, ev: LeaveNotifyEvent) -> AnyResult<()> {
+        if ev.event == self.ui.topbar {
+            self.hide_tooltip()?;
+        }
         let Some((client, _)) = self.title_hover else {
             return Ok(());
         };
@@ -684,6 +750,9 @@ impl Aurora {
             return Ok(());
         }
 
+        if self.handle_net_wm_state_message(&ev)? {
+            return Ok(());
+        }
         let Ok(cookie) = self.conn.intern_atom(false, b"_NET_WM_MOVERESIZE") else {
             return Ok(());
         };
@@ -930,8 +999,17 @@ impl Aurora {
             self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             self.toggle_maximize_client(client)?;
         } else {
+            let title = compact(
+                &self.window_title(info.window),
+                ((info.width / 9).max(8)) as usize,
+            );
+            let title_w = measure_text(&self.bold, &title, 13.0);
             self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
-            self.start_drag(client, ev.root_x, ev.root_y)?;
+            if i32::from(x) >= 88 && i32::from(x) <= 96 + title_w {
+                self.toggle_title_menu(client)?;
+            } else {
+                self.start_drag(client, ev.root_x, ev.root_y)?;
+            }
         }
         Ok(())
     }

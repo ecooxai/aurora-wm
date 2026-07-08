@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -226,13 +227,13 @@ impl Aurora {
         let hidden_frames = self
             .clients
             .values()
-            .filter(|info| info.workspace == previous && info.mapped)
+            .filter(|info| info.workspace == previous && info.mapped && !info.sticky)
             .map(|info| info.frame)
             .collect::<Vec<_>>();
         let shown_frames = self
             .clients
             .values()
-            .filter(|info| info.workspace == workspace && info.mapped)
+            .filter(|info| info.workspace == workspace && info.mapped && !info.sticky)
             .map(|info| info.frame)
             .collect::<Vec<_>>();
         for frame in hidden_frames {
@@ -283,6 +284,12 @@ impl Aurora {
     }
 
     pub(crate) fn open_settings_tab(&mut self, tab: SettingsTab) -> AnyResult<()> {
+        if self.settings_visible && self.settings.tab == tab {
+            self.settings_visible = false;
+            self.conn.unmap_window(self.ui.settings)?;
+            self.redraw_topbar()?;
+            return Ok(());
+        }
         self.settings.tab = tab;
         self.settings.scroll = 0;
         self.settings_visible = true;

@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -417,6 +418,7 @@ pub(crate) fn draw_sidebar_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32, co
         5 => draw_sidebar_bluetooth_icon(c, cx, cy, color),
         6 => draw_sidebar_startup_icon(c, cx, cy, color),
         7 => draw_sidebar_apps_icon(c, cx, cy, color),
+        8 => draw_sidebar_keyboard_icon(c, cx, cy, color),
         _ => draw_sidebar_about_icon(c, cx, cy, color),
     }
 }
@@ -706,6 +708,20 @@ pub(crate) fn draw_sidebar_apps_icon(c: &mut Canvas, cx: i32, cy: i32, color: Co
             c.draw_round_rect(cx - 7 + col * 8, cy - 7 + row * 8, 6, 6, 2, base_color);
         }
     }
+}
+
+pub(crate) fn draw_sidebar_keyboard_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    draw_sidebar_tile(c, cx, cy, color);
+    let is_topbar = color == MINT_LIGHT;
+    let base_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(60, 75, 96) };
+    let accent_color = if is_topbar { Color::rgb(175, 218, 245) } else { Color::rgb(82, 196, 180) };
+    c.draw_round_rect(cx - 10, cy - 7, 20, 14, 3, base_color);
+    for row in 0..2 {
+        for col in 0..4 {
+            c.draw_rect(cx - 7 + col * 4, cy - 4 + row * 4, 2, 2, accent_color);
+        }
+    }
+    c.draw_rect(cx - 5, cy + 3, 10, 2, accent_color);
 }
 
 pub(crate) fn draw_sidebar_about_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {

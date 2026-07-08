@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -564,7 +565,7 @@ impl Aurora {
             .clients
             .iter()
             .filter_map(|(window, info)| {
-                (info.workspace == self.active_workspace).then_some(*window)
+                self.client_on_active_workspace(info).then_some(*window)
             })
             .collect::<Vec<_>>();
         windows.sort_unstable();
@@ -640,6 +641,9 @@ impl Aurora {
             || window == self.ui.aurora_menu
             || window == self.ui.clipboard_menu
             || window == self.ui.dock_more_menu
+            || window == self.ui.title_menu
+            || window == self.ui.confirm_dialog
+            || window == self.ui.tooltip
             || self.ui.media.contains(&window)
     }
 

@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
 use crate::wm_core::*;
@@ -446,7 +447,7 @@ impl Aurora {
         let class = self.window_class(window);
         let title = self.window_title(window);
         let is_ffplay = client_is_ffplay(&class, &title);
-        let titlebar = !client_uses_own_chrome(&class, &title);
+        let titlebar = !client_uses_own_chrome(&class, &title) && !self.window_wants_csd(window);
         let title_h = if titlebar { TITLEBAR_HEIGHT } else { 0 };
         let max_w = self.screen_width.saturating_sub(80).max(300);
         let max_h = self
@@ -549,6 +550,9 @@ impl Aurora {
             height,
             titlebar,
             saved: None,
+            sticky: false,
+            fullscreen: false,
+            fs_saved: None,
         };
         self.apply_frame_shape(&info)?;
         self.clients.insert(window, info);
@@ -654,7 +658,7 @@ impl Aurora {
         let Some(info) = self.clients.get(&client).copied() else {
             return Ok(());
         };
-        if info.workspace != self.active_workspace {
+        if !self.client_on_active_workspace(&info) {
             return Ok(());
         }
         let previous_active = self.active_client;
@@ -694,6 +698,12 @@ impl Aurora {
                 .stack_mode(StackMode::BELOW),
         )?;
         self.raise_chrome()?;
+        if info.fullscreen {
+            self.conn.configure_window(
+                info.frame,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
         self.update_active_window_property()?;
         Ok(())
     }
@@ -739,7 +749,11 @@ impl Aurora {
     }
 
     pub(crate) fn titlebar_height(&self, info: &ClientInfo) -> u16 {
-        if info.titlebar { TITLEBAR_HEIGHT } else { 0 }
+        if info.titlebar && !info.fullscreen {
+            TITLEBAR_HEIGHT
+        } else {
+            0
+        }
     }
 
     pub(crate) fn update_client_chrome(&mut self, client: Window) -> AnyResult<()> {
@@ -747,7 +761,8 @@ impl Aurora {
             return Ok(());
         };
         if !info.titlebar
-            || !client_uses_own_chrome(&self.window_class(client), &self.window_title(client))
+            || !(client_uses_own_chrome(&self.window_class(client), &self.window_title(client))
+                || self.window_wants_csd(client))
         {
             return Ok(());
         }
