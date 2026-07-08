@@ -46,6 +46,7 @@ const POWER_PROFILE_CACHE_PATH: &str = "/tmp/aurora-power-profile";
 const POWER_PROFILE_LOCK_PATH: &str = "/tmp/aurora-power-profile.lock";
 const FRAME_CORNER_RADIUS: i32 = 8;
 const TERMINAL_HISTORY_LIMIT: usize = 1000;
+const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const SETTINGS_MIN_WIDTH: u16 = 420;
 const SETTINGS_TARGET_WIDTH: u16 = 600;
 const SETTINGS_MARGIN: u16 = 24;
@@ -1142,6 +1143,15 @@ struct ClipboardImagePreviewResult {
     preview: Option<ImagePreview>,
 }
 
+enum ClipboardPollItem {
+    Text(String),
+    Image(PathBuf, u64),
+}
+
+struct ClipboardPollResult {
+    item: Option<ClipboardPollItem>,
+}
+
 #[derive(Clone, Copy)]
 enum MediaContextAction {
     Rename,
@@ -1325,6 +1335,7 @@ struct Aurora {
     clipboard_image_preview_pending: HashSet<PathBuf>,
     clipboard_image_preview_tx: mpsc::Sender<ClipboardImagePreviewResult>,
     clipboard_image_preview_rx: Receiver<ClipboardImagePreviewResult>,
+    clipboard_poll_rx: Option<Receiver<ClipboardPollResult>>,
     last_clipboard_poll: Instant,
     clipboard_watch_supported: bool,
     clipboard_dirty: bool,
@@ -1844,6 +1855,7 @@ impl Aurora {
             clipboard_image_preview_pending: HashSet::new(),
             clipboard_image_preview_tx,
             clipboard_image_preview_rx,
+            clipboard_poll_rx: None,
             last_clipboard_poll: Instant::now(),
             clipboard_watch_supported: false,
             clipboard_dirty: true,
@@ -7782,6 +7794,20 @@ impl Aurora {
     }
 
     fn poll_clipboard_history(&mut self) -> AnyResult<bool> {
+        if let Some(rx) = self.clipboard_poll_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.clipboard_poll_rx = None;
+                    return self.apply_clipboard_poll_result(result);
+                }
+                Err(TryRecvError::Empty) => return Ok(false),
+                Err(TryRecvError::Disconnected) => {
+                    self.clipboard_poll_rx = None;
+                    return Ok(false);
+                }
+            }
+        }
+
         if self.clipboard_watch_supported {
             if !self.clipboard_dirty {
                 return Ok(false);
@@ -7791,39 +7817,59 @@ impl Aurora {
             return Ok(false);
         }
         self.last_clipboard_poll = Instant::now();
-        if let Some((path, sig)) = read_image_clipboard() {
-            if self.last_seen_clipboard_image_sig == Some(sig) {
-                return Ok(false);
-            }
-            self.last_seen_clipboard_image_sig = Some(sig);
-            let item = ClipboardItem::Image(path);
-            append_clipboard_history(&item);
-            self.remember_clipboard_item(item);
-            if self.clipboard_menu_visible {
-                self.configure_clipboard_menu()?;
-                self.redraw_clipboard_menu()?;
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-        let Some(text) = read_text_clipboard() else {
+        self.start_clipboard_poll();
+        Ok(false)
+    }
+
+    fn start_clipboard_poll(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let item = read_image_clipboard()
+                .map(|(path, sig)| ClipboardPollItem::Image(path, sig))
+                .or_else(|| read_text_clipboard().map(ClipboardPollItem::Text));
+            let _ = tx.send(ClipboardPollResult { item });
+        });
+        self.clipboard_poll_rx = Some(rx);
+    }
+
+    fn apply_clipboard_poll_result(&mut self, result: ClipboardPollResult) -> AnyResult<bool> {
+        let Some(item) = result.item else {
             return Ok(false);
         };
-        let text = text.trim_end_matches('\0').to_string();
-        if text.is_empty() || text.len() > 1_000_000 {
-            return Ok(false);
-        }
-        if self.last_seen_clipboard_text.as_deref() == Some(text.as_str()) {
-            return Ok(false);
-        }
-        self.last_seen_clipboard_text = Some(text.clone());
-        let item = ClipboardItem::Text(text);
-        append_clipboard_history(&item);
-        self.remember_clipboard_item(item);
-        if self.clipboard_menu_visible {
-            self.configure_clipboard_menu()?;
-            self.redraw_clipboard_menu()?;
-            return Ok(true);
+        match item {
+            ClipboardPollItem::Image(path, sig) => {
+                if self.last_seen_clipboard_image_sig == Some(sig) {
+                    return Ok(false);
+                }
+                self.last_seen_clipboard_image_sig = Some(sig);
+                let item = ClipboardItem::Image(path);
+                append_clipboard_history(&item);
+                self.remember_clipboard_item(item);
+                if self.clipboard_menu_visible {
+                    self.configure_clipboard_menu()?;
+                    self.redraw_clipboard_menu()?;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            ClipboardPollItem::Text(text) => {
+                let text = text.trim_end_matches('\0').to_string();
+                if text.is_empty() || text.len() > 1_000_000 {
+                    return Ok(false);
+                }
+                if self.last_seen_clipboard_text.as_deref() == Some(text.as_str()) {
+                    return Ok(false);
+                }
+                self.last_seen_clipboard_text = Some(text.clone());
+                let item = ClipboardItem::Text(text);
+                append_clipboard_history(&item);
+                self.remember_clipboard_item(item);
+                if self.clipboard_menu_visible {
+                    self.configure_clipboard_menu()?;
+                    self.redraw_clipboard_menu()?;
+                    return Ok(true);
+                }
+            }
         }
         Ok(false)
     }
@@ -16678,6 +16724,22 @@ fn pulse_command_output(program: &str, args: &[&str]) -> Option<std::process::Ou
     cmd.output().ok()
 }
 
+fn command_output_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let mut cmd = if command_exists("timeout") {
+        let mut timeout_cmd = Command::new("timeout");
+        timeout_cmd.arg(format!("{:.3}", timeout.as_secs_f64()));
+        timeout_cmd.arg(program);
+        timeout_cmd
+    } else {
+        Command::new(program)
+    };
+    cmd.args(args).stderr(Stdio::null()).output().ok()
+}
+
 fn apply_pulse_env_defaults(cmd: &mut Command) {
     let runtime_dir = env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| {
         let uid = unsafe { libc::geteuid() };
@@ -16755,7 +16817,7 @@ fn read_text_clipboard() -> Option<String> {
         if !command_exists(name) {
             continue;
         }
-        if let Ok(output) = Command::new(name).args(args).stderr(Stdio::null()).output() {
+        if let Some(output) = command_output_timeout(name, args, CLIPBOARD_COMMAND_TIMEOUT) {
             if output.status.success() {
                 return Some(String::from_utf8_lossy(&output.stdout).to_string());
             }
@@ -16766,11 +16828,11 @@ fn read_text_clipboard() -> Option<String> {
 
 fn read_image_clipboard() -> Option<(PathBuf, u64)> {
     let target = clipboard_image_target()?;
-    let output = Command::new("xclip")
-        .args(["-selection", "clipboard", "-target", target, "-o"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = command_output_timeout(
+        "xclip",
+        &["-selection", "clipboard", "-target", target, "-o"],
+        CLIPBOARD_COMMAND_TIMEOUT,
+    )?;
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
@@ -16800,11 +16862,11 @@ fn clipboard_image_target() -> Option<&'static str> {
     if !command_exists("xclip") {
         return None;
     }
-    let output = Command::new("xclip")
-        .args(["-selection", "clipboard", "-target", "TARGETS", "-o"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = command_output_timeout(
+        "xclip",
+        &["-selection", "clipboard", "-target", "TARGETS", "-o"],
+        CLIPBOARD_COMMAND_TIMEOUT,
+    )?;
     if !output.status.success() {
         return None;
     }
