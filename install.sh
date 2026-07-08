@@ -35,11 +35,23 @@ tmp_wrapper="$(mktemp)"
 tmp_desktop="$(mktemp)"
 trap 'rm -f "$tmp_wrapper" "$tmp_desktop"' EXIT
 
-echo "Building $BIN_NAME release binary..."
-cargo build --release
+echo "Building $BIN_NAME and aurora-files release binaries..."
+cargo build --release --bins
 
 echo "Installing $BIN_PATH..."
 as_root install -Dm755 "target/release/$BIN_NAME" "$BIN_PATH"
+
+echo "Installing aurora-files..."
+as_root install -Dm755 "target/release/aurora-files" "$PREFIX/bin/aurora-files"
+as_root install -Dm644 assets/aurora-files.desktop /usr/share/applications/aurora-files.desktop
+as_root install -Dm644 assets/aurora-files-terminal.desktop /usr/share/applications/aurora-files-terminal.desktop
+if command -v update-desktop-database >/dev/null 2>&1; then
+    as_root update-desktop-database /usr/share/applications || true
+fi
+# Register Aurora Files as the default file manager for the current user.
+if command -v xdg-mime >/dev/null 2>&1; then
+    xdg-mime default aurora-files.desktop inode/directory || true
+fi
 
 cat >"$tmp_wrapper" <<EOF
 #!/bin/sh
