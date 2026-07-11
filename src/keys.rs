@@ -65,6 +65,17 @@ use crate::files::*;
 impl Aurora {
     pub(crate) fn handle_key_press(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
         self.last_pointer_activity = Instant::now();
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        let base_keysym = mapping.keysyms.first().copied().unwrap_or(0);
+        let state = u16::from(ev.state);
+        let command = state & u16::from(ModMask::M4) != 0;
+        let ctrl = state & u16::from(ModMask::CONTROL) != 0;
+        let alt = state & u16::from(ModMask::M1) != 0;
+        let shift = state & u16::from(ModMask::SHIFT) != 0;
+        if command && !ctrl && !alt && !shift && matches!(base_keysym, 0x76 | 0x56) {
+            paste_clipboard_now(&self.display);
+            return Ok(());
+        }
         if self.capture_shortcut_key(&ev)? {
             return Ok(());
         }

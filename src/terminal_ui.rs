@@ -474,7 +474,7 @@ impl Aurora {
         if let Some(selection) = self.folder_terminal_selection {
             let rows = self.folder_terminal_display_rows(self.folder_terminal.rows);
             let text = selected_terminal_text(selection, &rows);
-            if !text.is_empty() {
+            if text.chars().count() >= 3 {
                 copy_text_to_clipboard(&text);
             }
         }

@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::canvas::Color;
 
-pub const TERM_FG: Color = Color::rgb(226, 236, 243);
-pub const TERM_BG: Color = Color::rgb(24, 34, 44);
+pub const TERM_FG: Color = Color::rgb(32, 43, 54);
+pub const TERM_BG: Color = Color::rgb(247, 252, 255);
 
 #[derive(Clone, Copy)]
 pub struct Cell {
@@ -50,6 +50,8 @@ pub struct Tab {
     pub cwd: PathBuf,
     pub dead: bool,
     pub wrap_pending: bool,
+    pub bracketed_paste: bool,
+    pub mouse_enabled: bool,
 }
 
 pub enum EscState {
@@ -61,14 +63,14 @@ pub enum EscState {
 
 pub fn ansi_color(idx: usize, bright: bool) -> Color {
     let base: [(u8, u8, u8); 8] = [
-        (40, 50, 60),
-        (235, 110, 115),
-        (120, 205, 150),
-        (235, 200, 120),
-        (110, 165, 235),
-        (195, 135, 220),
-        (105, 210, 210),
-        (226, 236, 243),
+        (32, 43, 54),
+        (190, 58, 66),
+        (35, 132, 86),
+        (156, 112, 18),
+        (45, 105, 185),
+        (145, 76, 165),
+        (28, 126, 135),
+        (92, 105, 118),
     ];
     let (r, g, b) = base[idx.min(7)];
     if bright {
@@ -155,6 +157,8 @@ impl Tab {
             cwd,
             dead: false,
             wrap_pending: false,
+            bracketed_paste: false,
+            mouse_enabled: false,
         })
     }
 
@@ -506,7 +510,12 @@ impl Tab {
             }
             'm' => self.apply_sgr(&params),
             'h' | 'l' => {
-                // Modes: only alt-screen clear behaviour matters for us.
+                let enabled = action == 'h';
+                if buf.starts_with('?') && matches!(p0, 9 | 1000 | 1002 | 1003 | 1006) {
+                    self.mouse_enabled = enabled;
+                } else if buf.starts_with('?') && p0 == 2004 {
+                    self.bracketed_paste = enabled;
+                }
                 if buf.starts_with('?') && (p0 == 1049 || p0 == 47 || p0 == 1047) {
                     for row in self.grid.iter_mut() {
                         for cell in row.iter_mut() {

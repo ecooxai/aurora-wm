@@ -96,22 +96,31 @@ impl Aurora {
                     self.hide_app_menu()?;
                     self.hide_dock_more_menu()?;
                     if i == 1 {
-                        self.show_folder(FolderMode::Pictures, true)?;
+                        if !self.open_file_manager_tab(&folder_path_for(FolderMode::Pictures)) {
+                            self.show_folder(FolderMode::Pictures, true)?;
+                        }
                     } else if i == 2 {
-                        self.show_folder(FolderMode::Music, true)?;
+                        if !self.open_file_manager_tab(&folder_path_for(FolderMode::Music)) {
+                            self.show_folder(FolderMode::Music, true)?;
+                        }
                     } else if i == 3 {
-                        self.show_folder(FolderMode::Videos, true)?;
+                        if !self.open_file_manager_tab(&folder_path_for(FolderMode::Videos)) {
+                            self.show_folder(FolderMode::Videos, true)?;
+                        }
                     } else if i == 4 {
                         self.settings_visible = !self.settings_visible;
                         if self.settings_visible {
                             self.settings_front = true;
+                            self.settings_hidden_at = None;
                             self.folder_front = false;
                             self.media_front = false;
                             self.conn.map_window(self.ui.settings)?;
                             self.raise_ui()?;
+                            self.request_settings_data(self.settings.tab);
                             self.redraw_settings()?;
                             self.redraw_topbar()?;
                         } else {
+                            self.settings_hidden_at = Some(Instant::now());
                             self.conn.unmap_window(self.ui.settings)?;
                             self.redraw_topbar()?;
                         }

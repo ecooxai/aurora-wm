@@ -230,6 +230,9 @@ impl Aurora {
             "Screenshot saved and copied to clipboard",
             Duration::from_secs(3),
         )?;
+        if self.launch_screenshot_viewer(&path) {
+            return Ok(());
+        }
         self.open_media(FolderEntry {
             name: path
                 .file_name()

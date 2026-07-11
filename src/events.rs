@@ -107,11 +107,43 @@ impl Aurora {
                     std::process::exit(0);
                 }
             }
+            Event::CreateNotify(ev) => {
+                if ev.parent == self.root && ev.override_redirect {
+                    // ARGB overlays normally set WM_NAME between CreateWindow
+                    // and MapWindow. Subscribe immediately so an unsupported
+                    // transparent overlay can be shaped before it ever covers
+                    // the desktop.
+                    let _ = self.conn.change_window_attributes(
+                        ev.window,
+                        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+                    );
+                    let _ = self.suppress_uncomposited_cursor_overlay(ev.window);
+                }
+            }
             Event::MapRequest(ev) => self.manage_window(ev.window)?,
             Event::MapNotify(ev) => {
-                if ev.event == self.root && !ev.override_redirect {
-                    // Save-set restoration can map a surviving client after startup scanning.
-                    let _ = self.adopt_mapped_root_window(ev.window);
+                if ev.event == self.root {
+                    if ev.override_redirect {
+                        // Watch for a title assigned just after mapping as well as
+                        // the usual set-title-before-map sequence.
+                        let _ = self.conn.change_window_attributes(
+                            ev.window,
+                            &ChangeWindowAttributesAux::new()
+                                .event_mask(EventMask::PROPERTY_CHANGE),
+                        );
+                        if self
+                            .suppress_uncomposited_cursor_overlay(ev.window)
+                            .unwrap_or(false)
+                        {
+                            // The overlay can cover the screen briefly before its
+                            // empty shape is applied. Repaint regions invalidated
+                            // during that mapping so no black remnants remain.
+                            self.redraw_everything()?;
+                        }
+                    } else {
+                        // Save-set restoration can map a surviving client after startup scanning.
+                        let _ = self.adopt_mapped_root_window(ev.window);
+                    }
                 }
             }
             Event::ConfigureRequest(ev) => self.handle_configure_request(ev)?,
@@ -145,6 +177,12 @@ impl Aurora {
     }
 
     pub(crate) fn handle_property_notify(&mut self, ev: PropertyNotifyEvent) -> AnyResult<()> {
+        if ev.atom == AtomEnum::WM_NAME.into()
+            && self.suppress_uncomposited_cursor_overlay(ev.window)?
+        {
+            self.redraw_everything()?;
+            return Ok(());
+        }
         if !self.clients.contains_key(&ev.window) {
             return Ok(());
         }
@@ -337,18 +375,31 @@ impl Aurora {
         {
             self.hide_clipboard_menu()?;
         }
+        let pointer_target = if ev.event == self.root && ev.detail == 1 {
+            self.conn.query_pointer(self.root)?.reply()?.child
+        } else {
+            ev.event
+        };
         if self.screenshot_mode && ev.detail == 1 {
             self.start_screenshot_selection(ev.root_x, ev.root_y)?;
             if ev.event == self.root {
                 self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             }
-        } else if ev.event == self.ui.settings {
+        } else if ev.event == self.ui.settings || pointer_target == self.ui.settings {
+            let (settings_x, settings_y, _, _) = self.settings_geometry();
+            let (event_x, event_y) = if ev.event == self.ui.settings {
+                (i32::from(ev.event_x), i32::from(ev.event_y))
+            } else {
+                (
+                    i32::from(ev.root_x) - i32::from(settings_x),
+                    i32::from(ev.root_y) - i32::from(settings_y),
+                )
+            };
+            if ev.detail == 1 {
+                self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+            }
             if ev.detail == 4 || ev.detail == 5 {
-                self.handle_settings_scroll(
-                    ev.detail,
-                    i32::from(ev.event_x),
-                    i32::from(ev.event_y),
-                )?;
+                self.handle_settings_scroll(ev.detail, event_x, event_y)?;
                 self.conn.flush()?;
                 return Ok(());
             }
@@ -356,9 +407,21 @@ impl Aurora {
             self.folder_front = false;
             self.media_front = false;
             self.raise_ui()?;
-            self.handle_settings_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
-        } else if ev.event == self.ui.dock {
-            self.handle_dock_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
+            self.handle_settings_click(event_x, event_y)?;
+        } else if ev.event == self.ui.dock || pointer_target == self.ui.dock {
+            let (dock_x, dock_y, _, _) = self.dock_geometry();
+            let (event_x, event_y) = if ev.event == self.ui.dock {
+                (i32::from(ev.event_x), i32::from(ev.event_y))
+            } else {
+                (
+                    i32::from(ev.root_x) - i32::from(dock_x),
+                    i32::from(ev.root_y) - i32::from(dock_y),
+                )
+            };
+            if ev.detail == 1 {
+                self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+            }
+            self.handle_dock_click(event_x, event_y)?;
         } else if ev.event == self.ui.folder {
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_folder_scroll(ev.detail)?;
@@ -721,15 +784,17 @@ impl Aurora {
                     let path_str = String::from_utf8_lossy(&prop.value).into_owned();
                     let path = PathBuf::from(path_str);
                     if path.exists() {
-                        self.folder_path = path.clone();
-                        self.folder_entries = folder_entries_in(path, self.folder_sort);
-                        self.folder_selected = None;
-                        self.folder_scroll = 0;
-                        self.folder_front = true;
-                        self.choose_file_mode = false;
-                        self.conn.map_window(self.ui.folder)?;
-                        self.redraw_folder()?;
-                        self.raise_ui()?;
+                        if !self.launch_file_manager(&path) {
+                            self.folder_path = path.clone();
+                            self.folder_entries = folder_entries_in(path, self.folder_sort);
+                            self.folder_selected = None;
+                            self.folder_scroll = 0;
+                            self.folder_front = true;
+                            self.choose_file_mode = false;
+                            self.conn.map_window(self.ui.folder)?;
+                            self.redraw_folder()?;
+                            self.raise_ui()?;
+                        }
                     }
                 }
             }
@@ -1266,6 +1331,28 @@ impl Aurora {
                     GrabMode::ASYNC,
                 );
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn grab_command_paste(&self) -> AnyResult<()> {
+        let Some(v_keycode) = self.keycode_for_keysym(0x76)? else {
+            return Ok(());
+        };
+        for modifiers in [
+            ModMask::M4,
+            ModMask::M4 | ModMask::LOCK,
+            ModMask::M4 | ModMask::M2,
+            ModMask::M4 | ModMask::LOCK | ModMask::M2,
+        ] {
+            let _ = self.conn.grab_key(
+                false,
+                self.root,
+                modifiers,
+                v_keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            );
         }
         Ok(())
     }

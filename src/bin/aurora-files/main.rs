@@ -13,8 +13,10 @@ mod term;
 mod viewer;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use canvas::*;
@@ -34,12 +36,14 @@ const FONT_REGULAR: &[u8] = include_bytes!("../../../fonts/NotoSans-Regular.ttf"
 const FONT_BOLD: &[u8] = include_bytes!("../../../fonts/NotoSans-Bold.ttf");
 const FONT_MONO: &[u8] = include_bytes!("../../../fonts/NotoSansMono-Regular.ttf");
 
-const HEADER_H: i32 = 52;
+const HEADER_H: i32 = 74;
 const SIDEBAR_W: i32 = 172;
 const TAB_BAR_H: i32 = 30;
 const ROW_H: i32 = 34;
 const CELL_W: i32 = 8;
 const CELL_H: i32 = 17;
+const TERMINAL_COPY_DELAY: Duration = Duration::from_secs(2);
+const TERMINAL_NOTICE_DURATION: Duration = Duration::from_secs(3);
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -50,9 +54,51 @@ enum Focus {
     Editor,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    Name,
+    Date,
+    Size,
+}
+
+impl SortMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Date => "Date",
+            Self::Size => "Size",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalSelection {
+    tab: usize,
+    start: (usize, usize),
+    end: (usize, usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FolderTabRole {
+    Folder,
+    Screenshots,
+}
+
+struct FolderTab {
+    path: PathBuf,
+    role: FolderTabRole,
+    last_file: Option<PathBuf>,
+}
+
+struct TerminalGroup {
+    tabs: Vec<Tab>,
+    active_tab: usize,
+}
+
 struct App {
     conn: RustConnection,
     display: String,
+    root: Window,
     window: Window,
     media_embed: Window,
     gc: Gcontext,
@@ -63,6 +109,12 @@ struct App {
     bold: Font<'static>,
     mono: Font<'static>,
     wm_delete: Atom,
+    current_desktop_atom: Atom,
+    open_screenshot_atom: Atom,
+    screenshot_path_atom: Atom,
+    open_folder_tab_atom: Atom,
+    folder_tab_path_atom: Atom,
+    utf8_string_atom: Atom,
 
     cwd: PathBuf,
     entries: Vec<Entry>,
@@ -71,12 +123,31 @@ struct App {
     last_click: Option<(usize, Instant)>,
     scroll: usize,
     show_hidden: bool,
+    sort_mode: SortMode,
+    sort_open: bool,
+    folder_tabs_open: bool,
+    more_open: bool,
     status: String,
+    folder_tabs: Vec<FolderTab>,
+    active_folder_tab: usize,
+    workspace_tabs: HashMap<u32, usize>,
+    current_workspace: u32,
+    last_workspace_check: Instant,
+    viewer_only: bool,
+    close_at: Option<Instant>,
 
     terminal_visible: bool,
     terminal_h: i32,
     tabs: Vec<Tab>,
     active_tab: usize,
+    terminal_groups: HashMap<u32, TerminalGroup>,
+    last_terminal_cwd_check: Instant,
+    terminal_sync_suppress_until: Instant,
+    suppress_terminal_navigation: bool,
+    terminal_selection: Option<TerminalSelection>,
+    terminal_selecting: bool,
+    terminal_copy_due: Option<Instant>,
+    terminal_notice: Option<(String, Instant)>,
 
     viewer: Option<Viewer>,
     focus: Focus,
@@ -104,13 +175,141 @@ fn register_default() {
     }
 }
 
+fn normalized_terminal_selection(
+    selection: TerminalSelection,
+) -> ((usize, usize), (usize, usize)) {
+    if selection.start <= selection.end {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    }
+}
+
+fn copy_text_to_system_clipboard(text: &str) -> bool {
+    for (program, args) in [
+        ("xclip", &["-selection", "clipboard"][..]),
+        ("xsel", &["--clipboard", "--input"][..]),
+    ] {
+        let Ok(mut child) = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let wrote = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        let succeeded = child.wait().is_ok_and(|status| status.success());
+        if wrote && succeeded {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_text_from_system_clipboard() -> Option<String> {
+    for (program, args) in [
+        (
+            "xclip",
+            &["-selection", "clipboard", "-o", "-target", "UTF8_STRING"][..],
+        ),
+        ("xclip", &["-selection", "clipboard", "-o"][..]),
+        ("xsel", &["--clipboard", "--output"][..]),
+    ] {
+        let Ok(output) = Command::new(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            return String::from_utf8(output.stdout).ok();
+        }
+    }
+    None
+}
+
+fn read_current_desktop(
+    conn: &RustConnection,
+    root: Window,
+    current_desktop_atom: Atom,
+) -> u32 {
+    conn.get_property(
+        false,
+        root,
+        current_desktop_atom,
+        AtomEnum::CARDINAL,
+        0,
+        1,
+    )
+    .ok()
+    .and_then(|cookie| cookie.reply().ok())
+    .and_then(|reply| reply.value32().and_then(|mut values| values.next()))
+    .unwrap_or(0)
+}
+
+fn request_sticky(
+    conn: &RustConnection,
+    root: Window,
+    window: Window,
+) -> AnyResult<()> {
+    let state_atom = conn.intern_atom(false, b"_NET_WM_STATE")?.reply()?.atom;
+    let sticky_atom = conn
+        .intern_atom(false, b"_NET_WM_STATE_STICKY")?
+        .reply()?
+        .atom;
+    let desktop_atom = conn
+        .intern_atom(false, b"_NET_WM_DESKTOP")?
+        .reply()?
+        .atom;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        desktop_atom,
+        AtomEnum::CARDINAL,
+        &[u32::MAX],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        state_atom,
+        AtomEnum::ATOM,
+        &[sticky_atom],
+    )?;
+    let event = ClientMessageEvent::new(
+        32,
+        window,
+        state_atom,
+        [1, sticky_atom, 0, 1, 0],
+    );
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?;
+    Ok(())
+}
+
 fn run(args: &[String]) -> AnyResult<()> {
+    let viewer_only = args.iter().any(|arg| arg == "--image-viewer");
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
     let (conn, screen_num) = RustConnection::connect(None)?;
     let screen = conn.setup().roots[screen_num].clone();
     let window = conn.generate_id()?;
-    let width: u16 = 1020.min(screen.width_in_pixels.saturating_sub(60));
-    let height: u16 = 680.min(screen.height_in_pixels.saturating_sub(80));
+    let compact_size = (screen.width_in_pixels / 3)
+        .clamp(360, 500)
+        .min(screen.height_in_pixels.saturating_sub(80));
+    let width = compact_size;
+    let height = (screen.height_in_pixels * 4 / 5)
+        .max(360)
+        .min(screen.height_in_pixels.saturating_sub(40));
     conn.create_window(
         screen.root_depth,
         window,
@@ -133,7 +332,11 @@ fn run(args: &[String]) -> AnyResult<()> {
                     | EventMask::STRUCTURE_NOTIFY,
             ),
     )?;
-    let title = "Aurora Files";
+    let title = if viewer_only {
+        "Aurora Screenshot"
+    } else {
+        "Aurora Files"
+    };
     conn.change_property8(
         PropMode::REPLACE,
         window,
@@ -150,6 +353,28 @@ fn run(args: &[String]) -> AnyResult<()> {
     )?;
     let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
     let wm_delete = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
+    let current_desktop_atom = conn
+        .intern_atom(false, b"_NET_CURRENT_DESKTOP")?
+        .reply()?
+        .atom;
+    let open_screenshot_atom = conn
+        .intern_atom(false, b"_AURORA_FILES_OPEN_SCREENSHOT")?
+        .reply()?
+        .atom;
+    let screenshot_path_atom = conn
+        .intern_atom(false, b"_AURORA_FILES_SCREENSHOT_PATH")?
+        .reply()?
+        .atom;
+    let open_folder_tab_atom = conn
+        .intern_atom(false, b"_AURORA_FILES_OPEN_FOLDER_TAB")?
+        .reply()?
+        .atom;
+    let folder_tab_path_atom = conn
+        .intern_atom(false, b"_AURORA_FILES_FOLDER_TAB_PATH")?
+        .reply()?
+        .atom;
+    let utf8_string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+    let current_workspace = read_current_desktop(&conn, screen.root, current_desktop_atom);
     conn.change_property32(
         PropMode::REPLACE,
         window,
@@ -175,6 +400,9 @@ fn run(args: &[String]) -> AnyResult<()> {
     let gc = conn.generate_id()?;
     conn.create_gc(gc, window, &CreateGCAux::new().graphics_exposures(0))?;
     conn.map_window(window)?;
+    if !viewer_only {
+        request_sticky(&conn, screen.root, window)?;
+    }
     conn.flush()?;
 
     let start_path = args
@@ -188,10 +416,13 @@ fn run(args: &[String]) -> AnyResult<()> {
     } else {
         start_path.parent().map(Path::to_path_buf).unwrap_or_else(home_dir)
     };
+    let mut workspace_tabs = HashMap::new();
+    workspace_tabs.insert(current_workspace, 0);
 
     let mut app = App {
         conn,
         display,
+        root: screen.root,
         window,
         media_embed,
         gc,
@@ -202,18 +433,47 @@ fn run(args: &[String]) -> AnyResult<()> {
         bold: Font::try_from_bytes(FONT_BOLD).ok_or("font")?,
         mono: Font::try_from_bytes(FONT_MONO).ok_or("font")?,
         wm_delete,
+        current_desktop_atom,
+        open_screenshot_atom,
+        screenshot_path_atom,
+        open_folder_tab_atom,
+        folder_tab_path_atom,
+        utf8_string_atom,
         entries: list_dir(&start_dir, false),
         places: places(),
-        cwd: start_dir,
+        cwd: start_dir.clone(),
         selected: None,
         last_click: None,
         scroll: 0,
         show_hidden: false,
+        sort_mode: SortMode::Name,
+        sort_open: false,
+        folder_tabs_open: false,
+        more_open: false,
         status: String::new(),
-        terminal_visible: true,
-        terminal_h: 236,
+        folder_tabs: vec![FolderTab {
+            path: start_dir.clone(),
+            role: FolderTabRole::Folder,
+            last_file: None,
+        }],
+        active_folder_tab: 0,
+        workspace_tabs,
+        current_workspace,
+        last_workspace_check: Instant::now(),
+        viewer_only,
+        close_at: viewer_only.then(|| Instant::now() + Duration::from_secs(60)),
+        terminal_visible: !viewer_only,
+        terminal_h: i32::from(height) / 2,
         tabs: Vec::new(),
         active_tab: 0,
+        terminal_groups: HashMap::new(),
+        last_terminal_cwd_check: Instant::now(),
+        terminal_sync_suppress_until: Instant::now(),
+        suppress_terminal_navigation: false,
+        terminal_selection: None,
+        terminal_selecting: false,
+        terminal_copy_due: None,
+        terminal_notice: None,
         viewer: None,
         focus: if args.iter().any(|a| a == "--terminal") {
             Focus::Terminal
@@ -221,10 +481,13 @@ fn run(args: &[String]) -> AnyResult<()> {
             Focus::Files
         },
     };
+    app.refresh_entries();
     if !start_path.is_dir() {
         app.open_file_by_path(&start_path.clone());
     }
-    app.new_tab();
+    if !viewer_only {
+        app.new_tab();
+    }
     app.event_loop()
 }
 
@@ -237,6 +500,9 @@ impl App {
     }
 
     fn content_rect(&self) -> (i32, i32, i32, i32) {
+        if self.viewer_only {
+            return (0, 0, i32::from(self.width), i32::from(self.height));
+        }
         let (_, ty, _, th) = self.terminal_rect();
         let _ = th;
         (
@@ -281,6 +547,25 @@ impl App {
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
     }
 
+    fn switch_terminal_group(&mut self, workspace: u32) {
+        self.terminal_groups.insert(
+            self.current_workspace,
+            TerminalGroup {
+                tabs: std::mem::take(&mut self.tabs),
+                active_tab: self.active_tab,
+            },
+        );
+        if let Some(group) = self.terminal_groups.remove(&workspace) {
+            self.tabs = group.tabs;
+            self.active_tab = group.active_tab.min(self.tabs.len().saturating_sub(1));
+        } else {
+            self.active_tab = 0;
+            self.new_tab();
+        }
+        self.clear_terminal_selection();
+        self.terminal_notice = None;
+    }
+
     /// cd the terminal to `path`; keeps busy tabs intact by opening a new one.
     fn terminal_cd(&mut self, path: &Path) {
         if !self.terminal_visible || self.tabs.is_empty() {
@@ -306,20 +591,273 @@ impl App {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/".into());
         }
+        self.terminal_sync_suppress_until = Instant::now() + Duration::from_millis(500);
+    }
+
+    fn sync_folder_to_active_terminal(&mut self) -> bool {
+        if self.viewer_only
+            || self.last_terminal_cwd_check.elapsed() < Duration::from_millis(150)
+            || Instant::now() < self.terminal_sync_suppress_until
+        {
+            return false;
+        }
+        self.last_terminal_cwd_check = Instant::now();
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return false;
+        };
+        let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", tab.pid)) else {
+            return false;
+        };
+        if !path.is_dir() || path == self.cwd {
+            return false;
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.cwd = path.clone();
+            tab.title = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".into());
+        }
+        self.cwd = path.clone();
+        self.refresh_entries();
+        self.selected = None;
+        self.scroll = 0;
+        self.viewer_close();
+        self.focus = Focus::Terminal;
+        if let Some(tab) = self.folder_tabs.get_mut(self.active_folder_tab) {
+            tab.path = path;
+        }
+        if self
+            .folder_tabs
+            .get(self.active_folder_tab)
+            .is_some_and(|tab| tab.role == FolderTabRole::Folder)
+        {
+            self.workspace_tabs
+                .insert(self.current_workspace, self.active_folder_tab);
+        }
+        self.status = "Folder followed terminal directory".into();
+        true
+    }
+
+    // ------------------------------------------------------------ folder tabs
+
+    fn select_folder_tab(&mut self, idx: usize) {
+        let Some((path, role, last_file)) = self
+            .folder_tabs
+            .get(idx)
+            .map(|tab| (tab.path.clone(), tab.role, tab.last_file.clone()))
+        else {
+            return;
+        };
+        self.active_folder_tab = idx;
+        if role == FolderTabRole::Folder {
+            self.workspace_tabs.insert(self.current_workspace, idx);
+        }
+        self.folder_tabs_open = false;
+        self.navigate(&path);
+        if role == FolderTabRole::Screenshots {
+            if let Some(path) = last_file.filter(|path| path.exists()) {
+                self.open_file_by_path(&path);
+            }
+        }
+    }
+
+    fn add_folder_tab(&mut self) {
+        let idx = self.folder_tabs.len();
+        self.folder_tabs.push(FolderTab {
+            path: home_dir(),
+            role: FolderTabRole::Folder,
+            last_file: None,
+        });
+        self.select_folder_tab(idx);
+        self.status = format!("New folder tab for Workspace {}", self.current_workspace + 1);
+    }
+
+    fn open_folder_tab(&mut self, path: PathBuf) {
+        if !path.is_dir() {
+            return;
+        }
+        let idx = self.folder_tabs.len();
+        self.folder_tabs.push(FolderTab {
+            path,
+            role: FolderTabRole::Folder,
+            last_file: None,
+        });
+        self.select_folder_tab(idx);
+        self.status = "Opened folder in a new tab".into();
+    }
+
+    fn open_screenshot(&mut self, path: PathBuf) {
+        if file_kind_for(&path) != FileKind::Image {
+            return;
+        }
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(home_dir);
+        let idx = self
+            .folder_tabs
+            .iter()
+            .position(|tab| tab.role == FolderTabRole::Screenshots)
+            .unwrap_or_else(|| {
+                let idx = self.folder_tabs.len();
+                self.folder_tabs.push(FolderTab {
+                    path: parent.clone(),
+                    role: FolderTabRole::Screenshots,
+                    last_file: None,
+                });
+                idx
+            });
+        if let Some(tab) = self.folder_tabs.get_mut(idx) {
+            tab.path = parent.clone();
+            tab.last_file = Some(path.clone());
+        }
+        self.active_folder_tab = idx;
+        self.folder_tabs_open = false;
+        self.navigate(&parent);
+        self.open_file_by_path(&path);
+        self.status = "Latest screenshot".into();
+    }
+
+    fn handle_screenshot_message(&mut self) {
+        let Ok(cookie) = self.conn.get_property(
+            false,
+            self.window,
+            self.screenshot_path_atom,
+            self.utf8_string_atom,
+            0,
+            65535,
+        ) else {
+            return;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return;
+        };
+        if reply.value.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(String::from_utf8_lossy(&reply.value).into_owned());
+        if path.exists() {
+            self.open_screenshot(path);
+        }
+    }
+
+    fn handle_folder_tab_message(&mut self) {
+        let Ok(cookie) = self.conn.get_property(
+            false,
+            self.window,
+            self.folder_tab_path_atom,
+            self.utf8_string_atom,
+            0,
+            65535,
+        ) else {
+            return;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return;
+        };
+        if reply.value.is_empty() {
+            return;
+        }
+        self.open_folder_tab(PathBuf::from(
+            String::from_utf8_lossy(&reply.value).into_owned(),
+        ));
+    }
+
+    fn sync_workspace_folder_tab(&mut self) -> bool {
+        if self.last_workspace_check.elapsed() < Duration::from_millis(100) {
+            return false;
+        }
+        self.last_workspace_check = Instant::now();
+        let workspace =
+            read_current_desktop(&self.conn, self.root, self.current_desktop_atom);
+        if workspace == self.current_workspace {
+            return false;
+        }
+        self.switch_terminal_group(workspace);
+        self.current_workspace = workspace;
+        let idx = self
+            .workspace_tabs
+            .get(&workspace)
+            .copied()
+            .filter(|idx| *idx < self.folder_tabs.len())
+            .unwrap_or_else(|| {
+                let idx = self.folder_tabs.len();
+                self.folder_tabs.push(FolderTab {
+                    path: home_dir(),
+                    role: FolderTabRole::Folder,
+                    last_file: None,
+                });
+                self.workspace_tabs.insert(workspace, idx);
+                idx
+            });
+        self.suppress_terminal_navigation = true;
+        self.select_folder_tab(idx);
+        self.suppress_terminal_navigation = false;
+        self.terminal_sync_suppress_until = Instant::now() + Duration::from_millis(300);
+        self.status = format!("Workspace {}", workspace + 1);
+        true
     }
 
     // ------------------------------------------------------------ navigation
+
+    fn refresh_entries(&mut self) {
+        self.entries = list_dir(&self.cwd, self.show_hidden);
+        let mode = self.sort_mode;
+        self.entries.sort_by(|a, b| {
+            let folders = (a.kind != FileKind::Directory).cmp(&(b.kind != FileKind::Directory));
+            if folders != std::cmp::Ordering::Equal {
+                return folders;
+            }
+            match mode {
+                SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortMode::Date => b
+                    .modified
+                    .cmp(&a.modified)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortMode::Size => b
+                    .size
+                    .cmp(&a.size)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            }
+        });
+        if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
+            self.entries.insert(
+                0,
+                Entry {
+                    name: "..".into(),
+                    path: parent,
+                    kind: FileKind::Directory,
+                    size: 0,
+                    modified: std::time::SystemTime::UNIX_EPOCH,
+                },
+            );
+        }
+    }
 
     fn navigate(&mut self, path: &Path) {
         if !path.is_dir() {
             return;
         }
         self.cwd = path.to_path_buf();
-        self.entries = list_dir(&self.cwd, self.show_hidden);
+        self.refresh_entries();
         self.selected = None;
         self.scroll = 0;
+        self.sort_open = false;
+        self.folder_tabs_open = false;
+        self.more_open = false;
         self.viewer_close();
-        self.terminal_cd(&path.to_path_buf());
+        if !self.suppress_terminal_navigation {
+            self.terminal_cd(&path.to_path_buf());
+        }
+        if let Some(tab) = self.folder_tabs.get_mut(self.active_folder_tab) {
+            tab.path = path.to_path_buf();
+        }
+        if self
+            .folder_tabs
+            .get(self.active_folder_tab)
+            .is_some_and(|tab| tab.role == FolderTabRole::Folder)
+        {
+            self.workspace_tabs
+                .insert(self.current_workspace, self.active_folder_tab);
+        }
         self.status.clear();
     }
 
@@ -405,12 +943,127 @@ impl App {
         );
     }
 
+    // ------------------------------------------------------------ terminal selection
+
+    fn clear_terminal_selection(&mut self) {
+        self.terminal_selection = None;
+        self.terminal_selecting = false;
+        self.terminal_copy_due = None;
+    }
+
+    fn terminal_cell_at(&self, x: i32, y: i32) -> Option<(usize, usize)> {
+        let tab = self.tabs.get(self.active_tab)?;
+        if tab.rows == 0 || tab.cols == 0 {
+            return None;
+        }
+        let (_, ty, _, th) = self.terminal_rect();
+        let origin_y = ty + TAB_BAR_H + 6;
+        if y < origin_y || y >= ty + th {
+            return None;
+        }
+        let row = ((y - origin_y) / CELL_H).clamp(0, tab.rows as i32 - 1) as usize;
+        let col = ((x - 10) / CELL_W).clamp(0, tab.cols as i32 - 1) as usize;
+        Some((row, col))
+    }
+
+    fn update_terminal_selection(&mut self, x: i32, y: i32) -> bool {
+        if !self.terminal_selecting {
+            return false;
+        }
+        let Some(cell) = self.terminal_cell_at(x, y) else {
+            return false;
+        };
+        let Some(selection) = self.terminal_selection.as_mut() else {
+            return false;
+        };
+        if selection.end == cell {
+            return false;
+        }
+        selection.end = cell;
+        self.terminal_copy_due = None;
+        true
+    }
+
+    fn finish_terminal_selection(&mut self) {
+        if !self.terminal_selecting {
+            return;
+        }
+        self.terminal_selecting = false;
+        if self
+            .terminal_selected_text()
+            .is_some_and(|text| text.chars().count() >= 3)
+        {
+            self.terminal_copy_due = Some(Instant::now() + TERMINAL_COPY_DELAY);
+        } else {
+            self.terminal_copy_due = None;
+        }
+    }
+
+    fn terminal_cell_selected(&self, row: usize, col: usize) -> bool {
+        let Some(selection) = self.terminal_selection else {
+            return false;
+        };
+        if selection.tab != self.active_tab {
+            return false;
+        }
+        let (start, end) = normalized_terminal_selection(selection);
+        (row, col) >= start && (row, col) <= end
+    }
+
+    fn terminal_selected_text(&self) -> Option<String> {
+        let selection = self.terminal_selection?;
+        let tab = self.tabs.get(selection.tab)?;
+        let (start, end) = normalized_terminal_selection(selection);
+        let mut lines = Vec::new();
+        for row in start.0..=end.0.min(tab.grid.len().saturating_sub(1)) {
+            let cells = &tab.grid[row];
+            let first = if row == start.0 { start.1 } else { 0 };
+            let last = if row == end.0 {
+                end.1.min(cells.len().saturating_sub(1))
+            } else {
+                cells.len().saturating_sub(1)
+            };
+            let line: String = if first <= last {
+                cells[first..=last].iter().map(|cell| cell.ch).collect()
+            } else {
+                String::new()
+            };
+            lines.push(line.trim_end().to_string());
+        }
+        Some(lines.join("\n").trim_end().to_string())
+    }
+
+    fn copy_terminal_selection_if_due(&mut self) -> bool {
+        let Some(due) = self.terminal_copy_due else {
+            return false;
+        };
+        if Instant::now() < due {
+            return false;
+        }
+        self.terminal_copy_due = None;
+        let Some(text) = self
+            .terminal_selected_text()
+            .filter(|text| text.chars().count() >= 3)
+        else {
+            return false;
+        };
+        if copy_text_to_system_clipboard(&text) {
+            self.terminal_notice = Some(("Copied to clipboard".into(), Instant::now()));
+            return true;
+        }
+        false
+    }
+
     // ------------------------------------------------------------ event loop
 
     fn event_loop(&mut self) -> AnyResult<()> {
         let mut last_draw = Instant::now();
         let mut needs_draw = true;
         loop {
+            if self.close_at.is_some_and(|close_at| Instant::now() >= close_at) {
+                self.viewer_close();
+                return Ok(());
+            }
             while let Some(event) = self.conn.poll_for_event()? {
                 match event {
                     Event::Expose(ev) if ev.count == 0 => needs_draw = true,
@@ -418,6 +1071,9 @@ impl App {
                         if ev.width != self.width || ev.height != self.height {
                             self.width = ev.width;
                             self.height = ev.height;
+                            if self.terminal_visible {
+                                self.terminal_h = i32::from(self.height) / 2;
+                            }
                             let (cols, rows) = self.term_grid_size();
                             for tab in &mut self.tabs {
                                 tab.resize(cols, rows);
@@ -438,11 +1094,19 @@ impl App {
                         needs_draw = true;
                     }
                     Event::ButtonRelease(_) => {
+                        self.finish_terminal_selection();
                         if let Some(Viewer::Model(model)) = self.viewer.as_mut() {
                             model.dragging = None;
                         }
+                        needs_draw = true;
                     }
                     Event::MotionNotify(ev) => {
+                        if self.update_terminal_selection(
+                            i32::from(ev.event_x),
+                            i32::from(ev.event_y),
+                        ) {
+                            needs_draw = true;
+                        }
                         if let Some(Viewer::Model(model)) = self.viewer.as_mut() {
                             if let Some((sx, sy)) = model.dragging {
                                 model.yaw += f32::from(ev.event_x - sx) * 0.01;
@@ -459,7 +1123,13 @@ impl App {
                         needs_draw = true;
                     }
                     Event::ClientMessage(ev) => {
-                        if ev.data.as_data32()[0] == self.wm_delete {
+                        if ev.type_ == self.open_screenshot_atom {
+                            self.handle_screenshot_message();
+                            needs_draw = true;
+                        } else if ev.type_ == self.open_folder_tab_atom {
+                            self.handle_folder_tab_message();
+                            needs_draw = true;
+                        } else if ev.data.as_data32()[0] == self.wm_delete {
                             self.viewer_close();
                             return Ok(());
                         }
@@ -474,7 +1144,29 @@ impl App {
                     term_changed = true;
                 }
             }
+            for group in self.terminal_groups.values_mut() {
+                for tab in &mut group.tabs {
+                    let _ = tab.poll();
+                }
+            }
             if term_changed {
+                needs_draw = true;
+            }
+            if self.sync_workspace_folder_tab() {
+                needs_draw = true;
+            }
+            if self.sync_folder_to_active_terminal() {
+                needs_draw = true;
+            }
+            if self.copy_terminal_selection_if_due() {
+                needs_draw = true;
+            }
+            if self
+                .terminal_notice
+                .as_ref()
+                .is_some_and(|(_, shown_at)| shown_at.elapsed() >= TERMINAL_NOTICE_DURATION)
+            {
+                self.terminal_notice = None;
                 needs_draw = true;
             }
             if needs_draw && last_draw.elapsed() >= Duration::from_millis(16) {
@@ -490,6 +1182,31 @@ impl App {
     // ------------------------------------------------------------ input
 
     fn on_click(&mut self, x: i32, y: i32, button: u8, _state: u16) {
+        if self.folder_tabs_open {
+            let menu_x = 132;
+            let menu_y = 54;
+            let menu_w = (i32::from(self.width) - menu_x - 20).min(320);
+            let row = (y - menu_y - 8) / 32;
+            if x >= menu_x
+                && x <= menu_x + menu_w
+                && y >= menu_y + 8
+                && row >= 0
+                && (row as usize) < self.folder_tabs.len()
+            {
+                self.select_folder_tab(row as usize);
+                return;
+            }
+            let add_y = menu_y + 8 + self.folder_tabs.len() as i32 * 32;
+            if x >= menu_x
+                && x <= menu_x + menu_w
+                && y >= add_y
+                && y <= add_y + 30
+            {
+                self.add_folder_tab();
+                return;
+            }
+            self.folder_tabs_open = false;
+        }
         let (tx, ty, tw, th) = self.terminal_rect();
         let _ = (tx, tw);
         // Terminal area
@@ -497,6 +1214,7 @@ impl App {
             self.focus = Focus::Terminal;
             let rel_y = y - ty;
             if rel_y < TAB_BAR_H {
+                self.clear_terminal_selection();
                 // Tab bar: [tabs...] [+]   [hide]
                 let tab_w = 148;
                 let idx = (x - 8) / tab_w;
@@ -515,33 +1233,107 @@ impl App {
                 {
                     self.new_tab();
                 }
+            } else if button == 1 {
+                let mouse_enabled = self
+                    .tabs
+                    .get(self.active_tab)
+                    .is_some_and(|tab| tab.mouse_enabled);
+                if mouse_enabled {
+                    if let Some((row, col)) = self.terminal_cell_at(x, y) {
+                        let event = format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", col + 1, row + 1, col + 1, row + 1);
+                        if let Some(tab) = self.tabs.get(self.active_tab) {
+                            tab.write_input(event.as_bytes());
+                        }
+                    }
+                    self.clear_terminal_selection();
+                } else if let Some(cell) = self.terminal_cell_at(x, y) {
+                    self.terminal_selection = Some(TerminalSelection {
+                        tab: self.active_tab,
+                        start: cell,
+                        end: cell,
+                    });
+                    self.terminal_selecting = true;
+                    self.terminal_copy_due = None;
+                    self.terminal_notice = None;
+                }
             }
             return;
         }
+        if self.sort_open {
+            if x >= 94 && x <= 216 && y >= 54 && y <= 150 {
+                let idx = ((y - 62) / 28).clamp(0, 2);
+                self.sort_mode = [SortMode::Name, SortMode::Date, SortMode::Size][idx as usize];
+                self.sort_open = false;
+                self.refresh_entries();
+                self.selected = None;
+                self.scroll = 0;
+                self.status = format!("Sorted by {}", self.sort_mode.label().to_lowercase());
+                return;
+            }
+            self.sort_open = false;
+        }
+        if self.more_open {
+            let menu_x = i32::from(self.width) - 214;
+            if x >= menu_x + 8 && x <= menu_x + 186 && y >= 86 && y <= 116 {
+                self.show_hidden = !self.show_hidden;
+                self.more_open = false;
+                self.refresh_entries();
+                self.selected = None;
+                self.scroll = 0;
+                self.status = if self.show_hidden {
+                    "Showing hidden files".into()
+                } else {
+                    "Hidden files are hidden".into()
+                };
+                return;
+            }
+            self.more_open = false;
+        }
         // Header
         if y < HEADER_H {
-            if x < 44 {
-                // Back / up one level
-                if self.viewer.is_some() {
-                    self.viewer_close();
-                } else if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
-                    self.navigate(&parent);
-                }
-            } else if x >= i32::from(self.width) - 44 {
+            if (18..=48).contains(&x) && (18..=48).contains(&y) {
+                self.navigate(&home_dir());
+            } else if (56..=86).contains(&x) && (18..=48).contains(&y) {
                 self.terminal_visible = !self.terminal_visible;
+                if self.terminal_visible {
+                    self.terminal_h = i32::from(self.height) / 2;
+                }
                 let (cols, rows) = self.term_grid_size();
                 for tab in &mut self.tabs {
                     tab.resize(cols, rows);
                 }
-            } else if x >= i32::from(self.width) - 88 && x < i32::from(self.width) - 44 {
-                self.show_hidden = !self.show_hidden;
-                self.entries = list_dir(&self.cwd, self.show_hidden);
-                self.scroll = 0;
+            } else if (94..=124).contains(&x) && (18..=48).contains(&y) {
+                self.sort_open = !self.sort_open;
+                self.folder_tabs_open = false;
+                self.more_open = false;
+            } else if (132..=162).contains(&x) && (18..=48).contains(&y) {
+                self.folder_tabs_open = !self.folder_tabs_open;
+                self.sort_open = false;
+                self.more_open = false;
+            } else if x >= i32::from(self.width) - 50
+                && x <= i32::from(self.width) - 20
+                && (18..=48).contains(&y)
+            {
+                self.more_open = !self.more_open;
+                self.sort_open = false;
+                self.folder_tabs_open = false;
             }
             return;
         }
         // Sidebar
         if x < SIDEBAR_W {
+            if button == 4 {
+                self.scroll = self.scroll.saturating_sub(3);
+                return;
+            }
+            if button == 5 {
+                let max = self.entries.len().saturating_sub(self.visible_rows());
+                self.scroll = (self.scroll + 3).min(max);
+                return;
+            }
+            if button != 1 {
+                return;
+            }
             let idx = ((y - HEADER_H - 10) / 32) as usize;
             if let Some(place) = self.places.get(idx) {
                 let path = place.path.clone();
@@ -635,6 +1427,15 @@ impl App {
         if row >= 0 {
             let idx = self.scroll + row as usize;
             if idx < self.entries.len() {
+                let is_parent = self.entries.get(idx).is_some_and(|entry| {
+                    entry.name == ".."
+                        && entry.kind == FileKind::Directory
+                        && self.cwd.parent().is_some_and(|parent| parent == entry.path)
+                });
+                if is_parent {
+                    self.open_entry(idx);
+                    return;
+                }
                 let now = Instant::now();
                 let double = self
                     .last_click
@@ -666,9 +1467,24 @@ impl App {
 
         match self.focus {
             Focus::Terminal => {
-                if let Some(tab) = self.tabs.get(self.active_tab) {
+                if self.tabs.get(self.active_tab).is_some() {
                     if ctrl && (keysym == 't' as u32 || keysym == 'T' as u32) && shift {
                         self.new_tab();
+                        return Ok(false);
+                    }
+                    if ctrl && matches!(keysym, 0x76 | 0x56) {
+                        if let Some(text) = read_text_from_system_clipboard() {
+                            self.clear_terminal_selection();
+                            if let Some(tab) = self.tabs.get(self.active_tab) {
+                                if tab.bracketed_paste {
+                                    tab.write_input(b"\x1b[200~");
+                                    tab.write_input(text.as_bytes());
+                                    tab.write_input(b"\x1b[201~");
+                                } else {
+                                    tab.write_input(text.as_bytes());
+                                }
+                            }
+                        }
                         return Ok(false);
                     }
                     let bytes: Vec<u8> = match keysym {
@@ -696,7 +1512,10 @@ impl App {
                         _ => Vec::new(),
                     };
                     if !bytes.is_empty() {
-                        tab.write_input(&bytes);
+                        self.clear_terminal_selection();
+                        if let Some(tab) = self.tabs.get(self.active_tab) {
+                            tab.write_input(&bytes);
+                        }
                     }
                 }
             }
@@ -779,6 +1598,11 @@ impl App {
 
     fn draw(&mut self) -> AnyResult<()> {
         let mut c = Canvas::new(self.width, self.height, PAPER);
+        if self.viewer_only {
+            self.draw_viewer(&mut c);
+            self.upload(&c)?;
+            return Ok(());
+        }
         self.draw_header(&mut c);
         self.draw_sidebar(&mut c);
         if self.viewer.is_some() {
@@ -789,6 +1613,7 @@ impl App {
         if self.terminal_visible {
             self.draw_terminal(&mut c);
         }
+        self.draw_header_menus(&mut c);
         self.upload(&c)?;
         Ok(())
     }
@@ -796,10 +1621,22 @@ impl App {
     fn draw_header(&self, c: &mut Canvas) {
         c.draw_rect(0, 0, i32::from(self.width), HEADER_H, Color::rgb(236, 245, 250));
         c.draw_rect(0, HEADER_H - 1, i32::from(self.width), 1, Color::rgba(176, 198, 210, 120));
-        // Back button
-        c.draw_round_rect(8, 10, 32, 32, 9, CARD);
-        c.draw_line(28, 18, 18, 26, 2, MINT_DARK);
-        c.draw_line(18, 26, 28, 34, 2, MINT_DARK);
+        // Match the desktop folder toolbar: Home, Terminal, Sort, Tabs, More.
+        c.draw_round_rect(18, 18, 30, 30, 10, CARD);
+        self.draw_home_icon(c, 33, 33);
+        c.draw_round_rect(56, 18, 30, 30, 10, CARD);
+        self.draw_terminal_icon(
+            c,
+            71,
+            33,
+            if self.terminal_visible { MINT_DARK } else { SOFT_INK },
+        );
+        c.draw_round_rect(94, 18, 30, 30, 10, CARD);
+        self.draw_sort_icon(c, 109, 33);
+        c.draw_round_rect(132, 18, 30, 30, 10, CARD);
+        self.draw_folder_tabs_icon(c, 147, 33);
+        c.draw_round_rect(i32::from(self.width) - 50, 18, 30, 30, 10, CARD);
+        self.draw_more_icon(c, i32::from(self.width) - 35, 33);
         // Path or viewer title
         let label = if let Some(viewer) = &self.viewer {
             let name = match viewer {
@@ -814,24 +1651,191 @@ impl App {
         } else {
             compact_path(&self.cwd, 60)
         };
-        c.draw_text(&self.bold, &label, 52, 15, 15.0, INK);
-        // Hidden-files toggle
-        c.draw_round_rect(i32::from(self.width) - 86, 10, 38, 32, 9, CARD);
-        c.draw_text_center(
-            &self.bold,
-            if self.show_hidden { ".*" } else { ".x" },
-            i32::from(self.width) - 67,
-            17,
-            13.0,
-            if self.show_hidden { MINT_DARK } else { MUTED },
-        );
-        // Terminal toggle
-        c.draw_round_rect(i32::from(self.width) - 42, 10, 34, 32, 9, CARD);
-        c.draw_text_center(&self.bold, ">_", i32::from(self.width) - 25, 17, 13.0,
-            if self.terminal_visible { MINT_DARK } else { MUTED });
+        c.draw_text(&self.bold, &label, 18, 54, 14.0, MINT_DARK);
         if !self.status.is_empty() {
-            c.draw_text(&self.regular, &compact(&self.status, 52), 52, 33, 11.0, MUTED);
+            c.draw_text(
+                &self.regular,
+                &compact(&self.status, 52),
+                176,
+                27,
+                11.0,
+                MUTED,
+            );
         }
+    }
+
+    fn draw_header_menus(&self, c: &mut Canvas) {
+        if self.sort_open {
+            let menu_x = 94;
+            let menu_y = 54;
+            c.draw_round_rect(menu_x, menu_y, 122, 96, 12, Color::rgba(250, 254, 255, 242));
+            for (idx, sort) in [SortMode::Name, SortMode::Date, SortMode::Size]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                let y = menu_y + 16 + idx as i32 * 28;
+                if sort == self.sort_mode {
+                    c.draw_round_rect(
+                        menu_x + 8,
+                        y - 5,
+                        106,
+                        23,
+                        7,
+                        Color::rgba(116, 213, 198, 92),
+                    );
+                }
+                c.draw_text(&self.regular, sort.label(), menu_x + 18, y, 12.0, INK);
+            }
+        }
+        if self.folder_tabs_open {
+            let menu_x = 132;
+            let menu_y = 54;
+            let menu_w = (i32::from(self.width) - menu_x - 20).min(320);
+            let menu_h = 12 + (self.folder_tabs.len() as i32 + 1) * 32;
+            c.draw_round_rect(
+                menu_x,
+                menu_y,
+                menu_w,
+                menu_h,
+                12,
+                Color::rgba(250, 254, 255, 248),
+            );
+            for (idx, tab) in self.folder_tabs.iter().enumerate() {
+                let y = menu_y + 8 + idx as i32 * 32;
+                if idx == self.active_folder_tab {
+                    c.draw_round_rect(
+                        menu_x + 7,
+                        y + 2,
+                        menu_w - 14,
+                        28,
+                        8,
+                        Color::rgba(116, 213, 198, 92),
+                    );
+                }
+                let label = if tab.role == FolderTabRole::Screenshots {
+                    let file = tab
+                        .last_file
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Latest image".into());
+                    format!("Screenshots  ·  {file}")
+                } else {
+                    let workspace = self
+                        .workspace_tabs
+                        .iter()
+                        .filter_map(|(workspace, tab_idx)| (*tab_idx == idx).then_some(*workspace))
+                        .min();
+                    let folder = tab
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "/".into());
+                    workspace.map_or_else(
+                        || format!("Tab {}  ·  {folder}", idx + 1),
+                        |workspace| format!("Workspace {}  ·  {folder}", workspace + 1),
+                    )
+                };
+                c.draw_text(
+                    &self.regular,
+                    &compact(&label, ((menu_w - 30) / 7).max(8) as usize),
+                    menu_x + 16,
+                    y + 8,
+                    12.0,
+                    if idx == self.active_folder_tab {
+                        MINT_DARK
+                    } else {
+                        INK
+                    },
+                );
+            }
+            let add_y = menu_y + 8 + self.folder_tabs.len() as i32 * 32;
+            c.draw_rect(
+                menu_x + 10,
+                add_y,
+                menu_w - 20,
+                1,
+                Color::rgba(176, 198, 210, 110),
+            );
+            c.draw_text(
+                &self.bold,
+                "+  New folder tab",
+                menu_x + 16,
+                add_y + 9,
+                12.0,
+                MINT_DARK,
+            );
+        }
+        if self.more_open {
+            let menu_x = i32::from(self.width) - 214;
+            let menu_y = 54;
+            c.draw_round_rect(
+                menu_x,
+                menu_y,
+                194,
+                72,
+                12,
+                Color::rgba(250, 254, 255, 242),
+            );
+            c.draw_text(&self.bold, "View", menu_x + 14, menu_y + 12, 14.0, INK);
+            c.draw_round_rect(
+                menu_x + 8,
+                menu_y + 32,
+                178,
+                30,
+                7,
+                Color::rgba(234, 246, 249, 150),
+            );
+            c.draw_text(
+                &self.regular,
+                if self.show_hidden {
+                    "Hide hidden files"
+                } else {
+                    "Show hidden files"
+                },
+                menu_x + 18,
+                menu_y + 39,
+                12.0,
+                INK,
+            );
+            if self.show_hidden {
+                c.draw_circle(menu_x + 172, menu_y + 47, 4, MINT_DARK);
+            }
+        }
+    }
+
+    fn draw_home_icon(&self, c: &mut Canvas, cx: i32, cy: i32) {
+        c.draw_line(cx - 10, cy, cx, cy - 9, 2, MINT_DARK);
+        c.draw_line(cx, cy - 9, cx + 10, cy, 2, MINT_DARK);
+        c.draw_round_rect(cx - 7, cy, 14, 11, 4, Color::rgba(29, 145, 137, 45));
+        c.draw_round_rect(cx - 2, cy + 5, 4, 6, 2, MINT_DARK);
+    }
+
+    fn draw_folder_tabs_icon(&self, c: &mut Canvas, cx: i32, cy: i32) {
+        c.draw_round_rect(cx - 9, cy - 7, 13, 10, 3, Color::rgba(29, 145, 137, 42));
+        c.draw_round_rect(cx - 5, cy - 3, 13, 10, 3, Color::rgba(29, 145, 137, 72));
+        c.draw_line(cx - 1, cy + 1, cx + 3, cy + 5, 2, MINT_DARK);
+        c.draw_line(cx + 3, cy + 5, cx + 7, cy + 1, 2, MINT_DARK);
+    }
+
+    fn draw_terminal_icon(&self, c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+        c.draw_line(cx - 8, cy - 5, cx - 3, cy, 2, color);
+        c.draw_line(cx - 8, cy + 5, cx - 3, cy, 2, color);
+        c.draw_line(cx + 1, cy + 5, cx + 8, cy + 5, 2, color);
+    }
+
+    fn draw_sort_icon(&self, c: &mut Canvas, cx: i32, cy: i32) {
+        c.draw_line(cx - 8, cy - 6, cx + 7, cy - 6, 2, MINT_DARK);
+        c.draw_line(cx - 8, cy, cx + 3, cy, 2, MINT_DARK);
+        c.draw_line(cx - 8, cy + 6, cx - 1, cy + 6, 2, MINT_DARK);
+    }
+
+    fn draw_more_icon(&self, c: &mut Canvas, cx: i32, cy: i32) {
+        c.draw_circle(cx - 7, cy, 2, MINT_DARK);
+        c.draw_circle(cx, cy, 2, MINT_DARK);
+        c.draw_circle(cx + 7, cy, 2, MINT_DARK);
     }
 
     fn draw_sidebar(&self, c: &mut Canvas) {
@@ -889,13 +1893,24 @@ impl App {
                 },
             );
             self.draw_kind_icon(c, entry.kind, cx + 26, y + ROW_H / 2 - 2);
-            c.draw_text(&self.bold, &compact(&entry.name, 52), cx + 46, y + 3, 13.0, INK);
-            let info = if entry.kind == FileKind::Directory {
-                entry.kind.label().to_string()
-            } else {
-                format!("{} - {}", entry.kind.label(), format_size(entry.size))
-            };
-            c.draw_text(&self.regular, &info, cx + cw - 200, y + 6, 11.0, MUTED);
+            let name_x = cx + 46;
+            let info = (entry.kind != FileKind::Directory)
+                .then(|| format!("{}  ·  {}", entry.kind.label(), format_size(entry.size)));
+            let info_x = info.as_ref().map_or(cx + cw - 18, |info| {
+                cx + cw - 18 - measure_text(&self.regular, info, 11.0)
+            });
+            let name_chars = ((info_x - name_x - 12).max(28) / 7) as usize;
+            c.draw_text(
+                &self.bold,
+                &compact(&entry.name, name_chars),
+                name_x,
+                y + 3,
+                13.0,
+                INK,
+            );
+            if let Some(info) = info {
+                c.draw_text(&self.regular, &info, info_x, y + 6, 11.0, MUTED);
+            }
         }
         // Scrollbar
         if self.entries.len() > visible {
@@ -984,10 +1999,25 @@ impl App {
             Viewer::Image(img) => {
                 if let Some(err) = &img.error {
                     c.draw_text(&self.regular, err, cx + 18, cy + 20, 13.0, MUTED);
+                } else if self.viewer_only {
+                    c.draw_rect(cx, cy, cw, ch, Color::rgb(21, 39, 66));
+                    let x = cx + (cw - img.width as i32) / 2;
+                    let y = cy + (ch - img.height as i32) / 2;
+                    c.draw_rect(
+                        x - 3,
+                        y - 3,
+                        img.width as i32 + 6,
+                        img.height as i32 + 6,
+                        Color::rgb(38, 68, 110),
+                    );
+                    c.paint_rgba(&img.pixels, x, y, img.width as i32, img.height as i32);
                 } else {
                     let x = cx + (cw - img.width as i32) / 2;
                     let y = cy + 40 + (ch - 60 - img.height as i32).max(0) / 2;
-                    c.draw_rect(x - 2, y - 2, img.width as i32 + 4, img.height as i32 + 4, Color::rgba(23, 34, 42, 30));
+                    // Dark navy backdrop + border make the image pop against
+                    // the light chrome, whatever the picture's own colors.
+                    c.draw_round_rect(cx + 8, cy + 34, cw - 16, ch - 46, 12, Color::rgb(21, 39, 66));
+                    c.draw_rect(x - 3, y - 3, img.width as i32 + 6, img.height as i32 + 6, Color::rgb(38, 68, 110));
                     c.paint_rgba(&img.pixels, x, y, img.width as i32, img.height as i32);
                     c.draw_text(
                         &self.regular,
@@ -1095,7 +2125,14 @@ impl App {
         let (tx, ty, tw, th) = self.terminal_rect();
         c.draw_rect(tx, ty, tw, th, TERM_BG);
         // Tab bar
-        c.draw_rect(tx, ty, tw, TAB_BAR_H, Color::rgb(18, 27, 36));
+        c.draw_rect(tx, ty, tw, TAB_BAR_H, Color::rgb(236, 245, 250));
+        c.draw_rect(
+            tx,
+            ty + TAB_BAR_H - 1,
+            tw,
+            1,
+            Color::rgba(176, 198, 210, 120),
+        );
         let tab_w = 148;
         for (idx, tab) in self.tabs.iter().enumerate() {
             let x = 8 + idx as i32 * tab_w;
@@ -1107,9 +2144,9 @@ impl App {
                 TAB_BAR_H - 8,
                 7,
                 if active {
-                    Color::rgba(116, 213, 198, 60)
+                    Color::rgba(116, 213, 198, 95)
                 } else {
-                    Color::rgba(255, 255, 255, 18)
+                    CARD
                 },
             );
             let label = if tab.busy() {
@@ -1124,19 +2161,19 @@ impl App {
                 ty + 8,
                 11.0,
                 if active {
-                    Color::rgb(160, 238, 220)
+                    MINT_DARK
                 } else {
-                    Color::rgb(180, 196, 208)
+                    SOFT_INK
                 },
             );
-            c.draw_text(&self.regular, "x", x + tab_w - 18, ty + 8, 11.0, Color::rgb(150, 165, 178));
+            c.draw_text(&self.regular, "x", x + tab_w - 18, ty + 8, 11.0, MUTED);
         }
         // "+" new tab
         let plus_x = 8 + self.tabs.len() as i32 * tab_w;
-        c.draw_round_rect(plus_x, ty + 4, 26, TAB_BAR_H - 8, 7, Color::rgba(255, 255, 255, 22));
-        c.draw_text_center(&self.regular, "+", plus_x + 13, ty + 7, 13.0, Color::rgb(180, 196, 208));
+        c.draw_round_rect(plus_x, ty + 4, 26, TAB_BAR_H - 8, 7, CARD);
+        c.draw_text_center(&self.regular, "+", plus_x + 13, ty + 7, 13.0, MINT_DARK);
         // Hide button
-        c.draw_text(&self.regular, "v", i32::from(self.width) - 24, ty + 8, 12.0, Color::rgb(150, 165, 178));
+        c.draw_text(&self.regular, "v", i32::from(self.width) - 24, ty + 8, 12.0, MUTED);
 
         // Grid
         let Some(tab) = self.tabs.get(self.active_tab) else {
@@ -1148,32 +2185,58 @@ impl App {
             if y + CELL_H > ty + th {
                 break;
             }
-            // Batch runs of same style for fewer draw_text calls.
-            let mut run = String::new();
-            let mut run_start = 0usize;
-            let mut run_fg = cells.first().map(|c| c.fg).unwrap_or(term::TERM_FG);
-            for (col, cell) in cells.iter().enumerate() {
-                if cell.fg != run_fg && !run.trim().is_empty() {
-                    c.draw_text(&self.mono, &run, 10 + run_start as i32 * CELL_W, y, 13.0, run_fg);
-                    run.clear();
-                    run_start = col;
-                    run_fg = cell.fg;
-                } else if cell.fg != run_fg {
-                    run.clear();
-                    run_start = col;
-                    run_fg = cell.fg;
+            for col in 0..cells.len() {
+                if self.terminal_cell_selected(row, col) {
+                    c.draw_rect(
+                        10 + col as i32 * CELL_W,
+                        y,
+                        CELL_W,
+                        CELL_H,
+                        Color::rgba(73, 156, 231, 105),
+                    );
                 }
-                run.push(cell.ch);
             }
-            if !run.trim().is_empty() {
-                c.draw_text(&self.mono, &run, 10 + run_start as i32 * CELL_W, y, 13.0, run_fg);
+            // Position every glyph on the PTY's fixed cell grid. Drawing a
+            // whole run uses the font's fractional advance, which accumulates
+            // an offset between the visible text and the grid cursor.
+            for (col, cell) in cells.iter().enumerate() {
+                if cell.ch != ' ' {
+                    c.draw_text(
+                        &self.mono,
+                        &cell.ch.to_string(),
+                        10 + col as i32 * CELL_W,
+                        y,
+                        13.0,
+                        cell.fg,
+                    );
+                }
             }
+        }
+        if let Some((message, _)) = self.terminal_notice.as_ref() {
+            let notice_w = 154;
+            let notice_x = i32::from(self.width) - notice_w - 42;
+            c.draw_round_rect(
+                notice_x,
+                ty + 4,
+                notice_w,
+                TAB_BAR_H - 8,
+                7,
+                Color::rgba(116, 213, 198, 118),
+            );
+            c.draw_text_center(
+                &self.bold,
+                message,
+                notice_x + notice_w / 2,
+                ty + 8,
+                11.0,
+                MINT_DARK,
+            );
         }
         // Cursor
         if !tab.dead && self.focus == Focus::Terminal {
             let cx = 10 + tab.cur_x as i32 * CELL_W;
             let cy = origin_y + tab.cur_y as i32 * CELL_H;
-            c.draw_rect(cx, cy + 1, CELL_W, CELL_H - 2, Color::rgba(160, 238, 220, 150));
+            c.draw_rect(cx, cy + 1, CELL_W, CELL_H - 2, Color::rgba(29, 145, 137, 145));
         }
         if tab.dead {
             c.draw_text(

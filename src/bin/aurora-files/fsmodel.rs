@@ -3,6 +3,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -39,6 +40,7 @@ pub struct Entry {
     pub path: PathBuf,
     pub kind: FileKind,
     pub size: u64,
+    pub modified: SystemTime,
 }
 
 pub fn home_dir() -> PathBuf {
@@ -87,7 +89,10 @@ pub fn list_dir(path: &Path, show_hidden: bool) -> Vec<Entry> {
             } else {
                 file_kind_for(&entry_path)
             },
-            size: meta.map(|m| m.len()).unwrap_or(0),
+            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            modified: meta
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH),
             path: entry_path,
         });
         if entries.len() >= 2048 {

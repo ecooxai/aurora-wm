@@ -914,16 +914,30 @@ impl Aurora {
         match item.action {
             AppAction::Terminal => self.launch_terminal(),
             AppAction::Browser => self.launch_browser(),
-            AppAction::Pictures => self.show_folder(FolderMode::Pictures, true)?,
-            AppAction::Music => self.show_folder(FolderMode::Music, true)?,
-            AppAction::Videos => self.show_folder(FolderMode::Videos, true)?,
+            AppAction::Pictures => {
+                if !self.launch_file_manager(&folder_path_for(FolderMode::Pictures)) {
+                    self.show_folder(FolderMode::Pictures, true)?;
+                }
+            }
+            AppAction::Music => {
+                if !self.launch_file_manager(&folder_path_for(FolderMode::Music)) {
+                    self.show_folder(FolderMode::Music, true)?;
+                }
+            }
+            AppAction::Videos => {
+                if !self.launch_file_manager(&folder_path_for(FolderMode::Videos)) {
+                    self.show_folder(FolderMode::Videos, true)?;
+                }
+            }
             AppAction::Settings => {
                 self.settings_visible = true;
                 self.settings_front = true;
+                self.settings_hidden_at = None;
                 self.folder_front = false;
                 self.media_front = false;
                 self.conn.map_window(self.ui.settings)?;
                 self.raise_ui()?;
+                self.request_settings_data(self.settings.tab);
                 self.redraw_settings()?;
             }
             AppAction::More => {

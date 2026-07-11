@@ -138,6 +138,7 @@ impl Aurora {
         };
         let mut sampler = SystemSampler::new();
         let metrics = sampler.sample();
+        let (settings_data_tx, settings_data_rx) = mpsc::channel();
         let (terminal_apps, browser_apps, photo_apps, video_apps) = discover_installed_apps();
         let display_modes =
             read_display_modes(&display, screen.width_in_pixels, screen.height_in_pixels);
@@ -265,6 +266,11 @@ impl Aurora {
             ffplay_process: None,
             pending_window_nudges: Vec::new(),
             wifi_refresh_rx: None,
+            settings_cache: SettingsDataCache::default(),
+            settings_data_tx,
+            settings_data_rx,
+            settings_data_pending: 0,
+            settings_hidden_at: None,
             focus_history: Vec::new(),
             alt_tab_index: 0,
             alt_tab_windows: Vec::new(),
@@ -280,6 +286,7 @@ impl Aurora {
         }
         let _ = save_app_commands(&app.settings);
         app.create_ui_windows()?;
+        app.request_settings_data(app.settings.tab);
         if let Err(err) = app.init_clipboard_watcher() {
             eprintln!("aurora-wm: clipboard watcher unavailable, using polling: {err}");
         }
@@ -453,6 +460,9 @@ impl Aurora {
             if self.process_pending_window_nudges()? {
                 handled_event = true;
             }
+            if self.poll_settings_data()? {
+                handled_event = true;
+            }
             self.reap_ffplay_process();
 
             if self
@@ -505,6 +515,11 @@ impl Aurora {
                     && matches!(self.settings.tab, SettingsTab::Power | SettingsTab::About);
                 if clock_changed || metrics_visible {
                     self.metrics = self.sampler.sample();
+                    self.metrics.gpu_usage = self
+                        .settings_cache
+                        .gpu_usage
+                        .clone()
+                        .unwrap_or_default();
                 }
                 if clock_changed {
                     self.last_clock_label = clock_label;
@@ -512,13 +527,25 @@ impl Aurora {
                     idle_changed = true;
                 }
                 if self.settings_visible {
-                    if self.settings.tab == SettingsTab::Network {
-                        self.redraw_settings()?;
-                        idle_changed = true;
-                    } else if matches!(self.settings.tab, SettingsTab::Power | SettingsTab::About) {
+                    // Kick off async refreshes for the visible tab; results
+                    // arrive via poll_settings_data without blocking drawing.
+                    self.request_settings_data(self.settings.tab);
+                    if matches!(
+                        self.settings.tab,
+                        SettingsTab::Network | SettingsTab::Power | SettingsTab::About
+                    ) {
                         self.redraw_settings()?;
                         idle_changed = true;
                     }
+                } else if self
+                    .settings_hidden_at
+                    .is_some_and(|at| at.elapsed() >= Duration::from_secs(10))
+                {
+                    // Settings hidden for a while: drop its cached data so it
+                    // costs nothing until it is opened again.
+                    self.settings_hidden_at = None;
+                    self.settings_cache = SettingsDataCache::default();
+                    self.wifi_refresh_rx = None;
                 }
                 if idle_changed {
                     self.conn.flush()?;
@@ -603,6 +630,11 @@ impl Aurora {
             timeout = timeout.min(
                 (self.last_media_tick + Duration::from_millis(250)).saturating_duration_since(now),
             );
+        }
+        if self.settings_data_pending != 0 {
+            // Background settings loaders are running; wake soon so their
+            // results are applied as they arrive.
+            timeout = timeout.min(Duration::from_millis(60));
         }
         if !interactive {
             timeout =
@@ -725,6 +757,7 @@ impl Aurora {
         self.grab_root_button1()?;
         self.grab_alt_tab()?;
         self.grab_workspace_keys()?;
+        self.grab_command_paste()?;
         self.grab_configured_shortcuts()?;
         self.publish_ewmh_support()?;
         self.create_extra_ui_windows()?;
@@ -991,7 +1024,6 @@ impl Aurora {
             )?;
         }
 
-        self.conn.map_window(self.ui.folder)?;
         self.conn.map_window(self.ui.topbar)?;
         self.conn.map_window(self.ui.dock)?;
         self.conn.map_window(self.ui.settings)?;
@@ -1086,7 +1118,13 @@ impl Aurora {
             return Ok(());
         }
         let attr = self.conn.get_window_attributes(window)?.reply()?;
-        if !attr.override_redirect && attr.map_state != MapState::UNMAPPED {
+        if attr.override_redirect && attr.map_state != MapState::UNMAPPED {
+            let _ = self.conn.change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            );
+            let _ = self.suppress_uncomposited_cursor_overlay(window);
+        } else if attr.map_state != MapState::UNMAPPED {
             self.manage_window(window)?;
         }
         Ok(())

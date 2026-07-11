@@ -160,8 +160,12 @@ impl Aurora {
                 .height(u32::from(terminal.3)),
         )?;
         self.sync_folder_terminal_size();
-        self.conn.map_window(self.ui.folder)?;
-        if self.folder_terminal.visible {
+        if self.choose_file_mode {
+            self.conn.map_window(self.ui.folder)?;
+        } else {
+            self.conn.unmap_window(self.ui.folder)?;
+        }
+        if self.choose_file_mode && self.folder_terminal.visible {
             self.conn.map_window(self.ui.folder_terminal)?;
         } else {
             self.conn.unmap_window(self.ui.folder_terminal)?;
@@ -173,8 +177,10 @@ impl Aurora {
                 self.conn.unmap_window(window)?;
             }
         }
-        self.redraw_folder()?;
-        if self.folder_terminal.visible {
+        if self.choose_file_mode {
+            self.redraw_folder()?;
+        }
+        if self.choose_file_mode && self.folder_terminal.visible {
             self.redraw_folder_terminal()?;
         }
         for slot in 0..MEDIA_SLOT_COUNT {
@@ -285,7 +291,25 @@ impl Aurora {
 
     pub(crate) fn open_settings_tab(&mut self, tab: SettingsTab) -> AnyResult<()> {
         if self.settings_visible && self.settings.tab == tab {
+            if !self.settings_front {
+                // Settings is showing but behind another window: bring it to
+                // the front and give it focus instead of closing it.
+                self.settings_front = true;
+                self.folder_front = false;
+                self.media_front = false;
+                self.raise_ui()?;
+                self.conn.set_input_focus(
+                    InputFocus::POINTER_ROOT,
+                    self.ui.settings,
+                    CURRENT_TIME,
+                )?;
+                self.redraw_topbar()?;
+                return Ok(());
+            }
+            // Already focused: the button acts as a close toggle.
             self.settings_visible = false;
+            self.settings_front = false;
+            self.settings_hidden_at = Some(Instant::now());
             self.conn.unmap_window(self.ui.settings)?;
             self.redraw_topbar()?;
             return Ok(());
@@ -294,6 +318,7 @@ impl Aurora {
         self.settings.scroll = 0;
         self.settings_visible = true;
         self.settings_front = true;
+        self.settings_hidden_at = None;
         self.folder_front = false;
         self.media_front = false;
         self.conn.map_window(self.ui.settings)?;
@@ -301,6 +326,7 @@ impl Aurora {
         if tab == SettingsTab::Network {
             self.ensure_wifi_refresh_started(false);
         }
+        self.request_settings_data(tab);
         self.redraw_settings()?;
         self.redraw_topbar()
     }

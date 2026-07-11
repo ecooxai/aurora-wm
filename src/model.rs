@@ -401,7 +401,9 @@ impl SystemSampler {
             swap_total_kb,
             swap_used_kb,
             gpus: self.gpus.clone(),
-            gpu_usage: read_gpu_usage(),
+            // GPU usage is sampled asynchronously (can invoke nvidia-smi which
+            // is slow); the caller merges the cached value into the metrics.
+            gpu_usage: Vec::new(),
             nics: self.nics.clone(),
             net_rx_bps,
             net_tx_bps,
@@ -930,6 +932,41 @@ pub(crate) struct WifiRefreshResult {
     pub(crate) networks: Option<Result<Vec<WifiNetwork>, String>>,
 }
 
+/// Cached results of slow settings-tab probes (subprocess calls).
+/// `None` means "not loaded yet"; tabs draw instantly from this cache and a
+/// background thread refreshes it, so switching settings areas never blocks.
+#[derive(Default)]
+pub(crate) struct SettingsDataCache {
+    pub(crate) audio_volume: Option<Option<u8>>,
+    pub(crate) audio_outputs: Option<Vec<AudioDevice>>,
+    pub(crate) audio_inputs: Option<Vec<AudioDevice>>,
+    pub(crate) network_details: Option<Vec<String>>,
+    pub(crate) bluetooth_devices: Option<Vec<String>>,
+    pub(crate) autostart_apps: Option<Vec<String>>,
+    pub(crate) gpu_usage: Option<Vec<GpuUsage>>,
+}
+
+/// Message from a settings background-loader thread.
+pub(crate) enum SettingsData {
+    Audio {
+        volume: Option<u8>,
+        outputs: Vec<AudioDevice>,
+        inputs: Vec<AudioDevice>,
+    },
+    Network(Vec<String>),
+    Bluetooth(Vec<String>),
+    Autostart(Vec<String>),
+    GpuUsage(Vec<GpuUsage>),
+}
+
+pub(crate) mod settings_pending {
+    pub(crate) const AUDIO: u8 = 1;
+    pub(crate) const NETWORK: u8 = 2;
+    pub(crate) const BLUETOOTH: u8 = 4;
+    pub(crate) const AUTOSTART: u8 = 8;
+    pub(crate) const GPU: u8 = 16;
+}
+
 pub(crate) struct Aurora {
     pub(crate) conn: RustConnection,
     pub(crate) display: String,
@@ -1047,6 +1084,13 @@ pub(crate) struct Aurora {
     pub(crate) ffplay_process: Option<std::process::Child>,
     pub(crate) pending_window_nudges: Vec<PendingWindowNudge>,
     pub(crate) wifi_refresh_rx: Option<Receiver<WifiRefreshResult>>,
+    pub(crate) settings_cache: SettingsDataCache,
+    pub(crate) settings_data_tx: mpsc::Sender<SettingsData>,
+    pub(crate) settings_data_rx: Receiver<SettingsData>,
+    pub(crate) settings_data_pending: u8,
+    /// When the settings panel was hidden; after 10 s its caches are dropped
+    /// so a hidden panel costs no CPU or memory.
+    pub(crate) settings_hidden_at: Option<Instant>,
     pub(crate) focus_history: Vec<Window>,
     pub(crate) alt_tab_index: usize,
     pub(crate) alt_tab_windows: Vec<Window>,

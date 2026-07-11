@@ -370,20 +370,22 @@ impl Aurora {
             );
         }
 
-        draw_card(c, sx, 304, i32::from(c.width) - sx - 24, 154);
+        draw_card(c, sx, 304, i32::from(c.width) - sx - 24, 166);
         c.draw_text(&self.bold, "System", sx + 16, 324, 15.0, INK);
         draw_metric_bar(
             c,
             &self.regular,
             sx + 16,
-            354,
+            352,
             "CPU",
             self.metrics.cpu_usage,
             "%",
         );
-        let mut bar_y = 354;
-        for gpu in self.metrics.gpu_usage.iter().take(2) {
-            bar_y += 38;
+        // GPU usage right below the CPU bar: supports NVIDIA (nvidia-smi),
+        // AMD and Intel (sysfs) and lists each GPU on multi-GPU systems.
+        let mut bar_y = 352;
+        for gpu in self.metrics.gpu_usage.iter().take(3) {
+            bar_y += 30;
             draw_metric_bar(
                 c,
                 &self.regular,
@@ -395,26 +397,40 @@ impl Aurora {
             );
         }
         if self.metrics.gpu_usage.is_empty() {
-            bar_y += 20;
+            bar_y += 22;
             c.draw_text(
                 &self.regular,
-                "GPU usage unavailable (no driver metric exposed)",
+                if self.settings_cache.gpu_usage.is_some() {
+                    "GPU usage unavailable (no driver metric exposed)"
+                } else {
+                    "Reading GPU usage..."
+                },
                 sx + 16,
                 bar_y,
                 11.0,
                 MUTED,
             );
+            bar_y += 8;
+        }
+        if bar_y + 30 <= 452 {
+            bar_y += 30;
+            let ram_pct = if self.metrics.ram_total_kb > 0 {
+                self.metrics.ram_used_kb as f32 * 100.0 / self.metrics.ram_total_kb as f32
+            } else {
+                0.0
+            };
+            draw_metric_bar(c, &self.regular, sx + 16, bar_y, "RAM", ram_pct, "%");
         }
         let freq_lines = cpu_frequency_lines(&self.metrics.cpu_frequencies, 46);
         if let Some(line) = freq_lines.first() {
-            if bar_y + 38 <= 440 {
-                c.draw_text(&self.regular, "CPU frequency", sx + 16, bar_y + 28, 11.0, MUTED);
-                c.draw_text(&self.regular, line, sx + 110, bar_y + 28, 11.0, INK);
+            if bar_y + 26 <= 458 {
+                c.draw_text(&self.regular, "CPU frequency", sx + 16, bar_y + 24, 11.0, MUTED);
+                c.draw_text(&self.regular, line, sx + 110, bar_y + 24, 11.0, INK);
             }
         }
 
-        draw_card(c, sx, 476, i32::from(c.width) - sx - 24, 76);
-        c.draw_text(&self.bold, "Battery", sx + 16, 496, 15.0, INK);
+        draw_card(c, sx, 486, i32::from(c.width) - sx - 24, 70);
+        c.draw_text(&self.bold, "Battery", sx + 16, 502, 15.0, INK);
         c.draw_text(
             &self.regular,
             self.metrics
@@ -422,7 +438,7 @@ impl Aurora {
                 .as_deref()
                 .unwrap_or("No battery exposed"),
             sx + 16,
-            524,
+            528,
             14.0,
             MINT_DARK,
         );
@@ -517,7 +533,8 @@ impl Aurora {
         c.draw_text(&self.bold, "Audio", sx, 22, 24.0, INK);
         draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 112);
         c.draw_text(&self.bold, "Volume", sx + 16, 106, 15.0, INK);
-        let volume = read_audio_volume_percent();
+        let loaded = self.settings_cache.audio_volume.is_some();
+        let volume = self.settings_cache.audio_volume.flatten();
         let volume_pct = volume.unwrap_or(0);
         let bar_w = 230;
         c.draw_round_rect(sx + 16, 142, bar_w, 10, 5, Color::rgba(211, 225, 232, 170));
@@ -531,9 +548,13 @@ impl Aurora {
         );
         c.draw_text(
             &self.regular,
-            &volume
-                .map(|pct| format!("{pct}%"))
-                .unwrap_or_else(|| "unavailable".to_string()),
+            &volume.map(|pct| format!("{pct}%")).unwrap_or_else(|| {
+                if loaded {
+                    "unavailable".to_string()
+                } else {
+                    "loading...".to_string()
+                }
+            }),
             sx + 262,
             136,
             15.0,
@@ -552,11 +573,20 @@ impl Aurora {
         let card_w = i32::from(c.width) - sx - 24;
         draw_card(c, sx, 220, card_w, 150);
         c.draw_text(&self.bold, "Output device", sx + 16, 240, 15.0, INK);
-        let outputs = read_audio_devices(AudioDeviceKind::Output);
+        let outputs_loaded = self.settings_cache.audio_outputs.is_some();
+        let outputs = self
+            .settings_cache
+            .audio_outputs
+            .clone()
+            .unwrap_or_default();
         if outputs.is_empty() {
             c.draw_text(
                 &self.regular,
-                "No output devices found",
+                if outputs_loaded {
+                    "No output devices found"
+                } else {
+                    "Loading audio devices..."
+                },
                 sx + 16,
                 272,
                 12.0,
@@ -596,11 +626,20 @@ impl Aurora {
         }
         draw_card(c, sx, 392, card_w, 108);
         c.draw_text(&self.bold, "Input device", sx + 16, 412, 15.0, INK);
-        let inputs = read_audio_devices(AudioDeviceKind::Input);
+        let inputs_loaded = self.settings_cache.audio_inputs.is_some();
+        let inputs = self
+            .settings_cache
+            .audio_inputs
+            .clone()
+            .unwrap_or_default();
         if inputs.is_empty() {
             c.draw_text(
                 &self.regular,
-                "No input devices found",
+                if inputs_loaded {
+                    "No input devices found"
+                } else {
+                    "Loading audio devices..."
+                },
                 sx + 16,
                 444,
                 12.0,
@@ -657,12 +696,23 @@ impl Aurora {
 
         // Scroll exactly with step 24 matching line spacing!
         let start = (self.settings.scroll / 24).max(0) as usize;
-        for (idx, line) in read_network_details()
-            .iter()
-            .skip(start)
-            .take(4)
-            .enumerate()
-        {
+        let details_loaded = self.settings_cache.network_details.is_some();
+        let details = self
+            .settings_cache
+            .network_details
+            .clone()
+            .unwrap_or_default();
+        if !details_loaded {
+            c.draw_text(
+                &self.regular,
+                "Loading network status...",
+                sx + 16,
+                134,
+                13.0,
+                MUTED,
+            );
+        }
+        for (idx, line) in details.iter().skip(start).take(4).enumerate() {
             c.draw_text(
                 &self.regular,
                 &compact(line, 62),
@@ -920,11 +970,20 @@ impl Aurora {
         c.draw_text(&self.bold, "Bluetooth", sx, 22, 24.0, INK);
         draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 116);
         c.draw_text(&self.bold, "Connected devices", sx + 16, 106, 15.0, INK);
-        let devices = read_bluetooth_devices();
+        let devices_loaded = self.settings_cache.bluetooth_devices.is_some();
+        let devices = self
+            .settings_cache
+            .bluetooth_devices
+            .clone()
+            .unwrap_or_default();
         if devices.is_empty() {
             c.draw_text(
                 &self.regular,
-                "No connected devices",
+                if devices_loaded {
+                    "No connected devices"
+                } else {
+                    "Loading bluetooth devices..."
+                },
                 sx + 16,
                 140,
                 12.0,
@@ -966,11 +1025,20 @@ impl Aurora {
             MUTED,
         );
         draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 394);
-        let apps = read_autostart_apps();
+        let apps_loaded = self.settings_cache.autostart_apps.is_some();
+        let apps = self
+            .settings_cache
+            .autostart_apps
+            .clone()
+            .unwrap_or_default();
         if apps.is_empty() {
             c.draw_text(
                 &self.regular,
-                "No autostart entries",
+                if apps_loaded {
+                    "No autostart entries"
+                } else {
+                    "Loading autostart entries..."
+                },
                 sx + 16,
                 116,
                 12.0,

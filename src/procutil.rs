@@ -76,6 +76,20 @@ pub(crate) fn command_status_success(cmd: &mut Command) -> bool {
     cmd.status().is_ok_and(|status| status.success())
 }
 
+/// Locate the standalone `aurora-files` app: next to the running aurora-wm
+/// binary first (dev builds), then on PATH.
+pub(crate) fn aurora_files_binary() -> Option<String> {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("aurora-files");
+            if sibling.exists() {
+                return Some(sibling.to_string_lossy().into_owned());
+            }
+        }
+    }
+    command_exists("aurora-files").then(|| "aurora-files".to_string())
+}
+
 pub(crate) fn shell_quote_text(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
@@ -171,7 +185,11 @@ pub(crate) fn copy_text_to_clipboard(text: &str) {
 }
 
 pub(crate) fn read_text_clipboard() -> Option<String> {
-    let commands: [(&str, &[&str]); 3] = [
+    let commands: [(&str, &[&str]); 4] = [
+        (
+            "xclip",
+            &["-selection", "clipboard", "-o", "-target", "UTF8_STRING"],
+        ),
         ("xclip", &["-selection", "clipboard", "-o"]),
         ("xsel", &["--clipboard", "--output"]),
         ("wl-paste", &[]),

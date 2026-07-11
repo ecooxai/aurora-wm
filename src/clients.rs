@@ -884,6 +884,41 @@ impl Aurora {
         Ok(())
     }
 
+    pub(crate) fn suppress_uncomposited_cursor_overlay(&self, window: Window) -> AnyResult<bool> {
+        let Ok(reply) = self
+            .conn
+            .get_property(false, window, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 96)?
+            .reply()
+        else {
+            return Ok(false);
+        };
+        let title = String::from_utf8_lossy(&reply.value);
+        if !title.starts_with("Cua.AgentCursorOverlay.") {
+            return Ok(false);
+        }
+
+        if self.shape_supported {
+            // cua-driver's cursor is a full-screen ARGB window. Without a real
+            // alpha compositor its transparent pixels are rendered as black by
+            // Xorg/Xephyr. Keep the window mapped (the driver continually
+            // enforces its z-order), but give it an empty visible shape.
+            self.conn.shape_rectangles(
+                shape::SO::SET,
+                shape::SK::BOUNDING,
+                ClipOrdering::YX_BANDED,
+                window,
+                0,
+                0,
+                &[],
+            )?;
+        } else {
+            self.conn.unmap_window(window)?;
+        }
+        self.conn.flush()?;
+        eprintln!("aurora-wm: suppressed unsupported ARGB cursor overlay {title}");
+        Ok(true)
+    }
+
     pub(crate) fn window_title(&self, window: Window) -> String {
         let Ok(cookie) =
             self.conn

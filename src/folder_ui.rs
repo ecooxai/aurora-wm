@@ -64,8 +64,15 @@ use crate::files::*;
 
 impl Aurora {
     pub(crate) fn show_folder(&mut self, mode: FolderMode, front: bool) -> AnyResult<()> {
+        let path = folder_path_for(mode);
+        if self.launch_file_manager(&path) {
+            return Ok(());
+        }
+
+        // Keep the former built-in folder available as a fallback when the
+        // standalone binary is missing.
         self.folder_mode = mode;
-        self.folder_path = folder_path_for(mode);
+        self.folder_path = path;
         self.folder_entries = folder_entries_for(mode, self.folder_sort);
         self.folder_selected = None;
         self.folder_scroll = 0;

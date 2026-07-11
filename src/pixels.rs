@@ -340,7 +340,8 @@ pub(crate) fn render_image_preview(path: &std::path::Path, w: i32, h: i32) -> Op
     let scale = (w as f32 / iw as f32).min(h as f32 / ih as f32);
     let nw = (iw as f32 * scale).round().max(1.0) as u32;
     let nh = (ih as f32 * scale).round().max(1.0) as u32;
-    let resized = image::imageops::resize(&img, nw, nh, FilterType::Triangle);
+    // Lanczos3 keeps downscaled photos crisp in the viewer.
+    let resized = image::imageops::resize(&img, nw, nh, FilterType::Lanczos3);
     Some(ImagePreview {
         pixels: resized.into_raw(),
         width: nw.min(u16::MAX as u32) as u16,

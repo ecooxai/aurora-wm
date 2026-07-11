@@ -63,6 +63,123 @@ use crate::procutil::*;
 use crate::files::*;
 
 impl Aurora {
+    /// Kick off background loading of the slow data a settings tab needs.
+    /// The tab draws immediately from `settings_cache` (showing a loading
+    /// hint when empty) and is redrawn when the fresh data arrives.
+    pub(crate) fn request_settings_data(&mut self, tab: SettingsTab) {
+        match tab {
+            SettingsTab::Audio => {
+                if self.settings_data_pending & settings_pending::AUDIO == 0 {
+                    self.settings_data_pending |= settings_pending::AUDIO;
+                    let tx = self.settings_data_tx.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(SettingsData::Audio {
+                            volume: read_audio_volume_percent(),
+                            outputs: read_audio_devices(AudioDeviceKind::Output),
+                            inputs: read_audio_devices(AudioDeviceKind::Input),
+                        });
+                    });
+                }
+            }
+            SettingsTab::Network => {
+                if self.settings_data_pending & settings_pending::NETWORK == 0 {
+                    self.settings_data_pending |= settings_pending::NETWORK;
+                    let tx = self.settings_data_tx.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(SettingsData::Network(read_network_details()));
+                    });
+                }
+            }
+            SettingsTab::Bluetooth => {
+                if self.settings_data_pending & settings_pending::BLUETOOTH == 0 {
+                    self.settings_data_pending |= settings_pending::BLUETOOTH;
+                    let tx = self.settings_data_tx.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(SettingsData::Bluetooth(read_bluetooth_devices()));
+                    });
+                }
+            }
+            SettingsTab::Startup => {
+                if self.settings_data_pending & settings_pending::AUTOSTART == 0 {
+                    self.settings_data_pending |= settings_pending::AUTOSTART;
+                    let tx = self.settings_data_tx.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(SettingsData::Autostart(read_autostart_apps()));
+                    });
+                }
+            }
+            SettingsTab::Power | SettingsTab::About => {
+                if self.settings_data_pending & settings_pending::GPU == 0 {
+                    self.settings_data_pending |= settings_pending::GPU;
+                    let tx = self.settings_data_tx.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(SettingsData::GpuUsage(read_gpu_usage()));
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply results from settings background loaders. Returns true when the
+    /// visible settings tab was redrawn.
+    pub(crate) fn poll_settings_data(&mut self) -> AnyResult<bool> {
+        let mut redraw_tabs: [bool; 4] = [false; 4]; // audio, network, bt, startup
+        let mut gpu_updated = false;
+        loop {
+            match self.settings_data_rx.try_recv() {
+                Ok(SettingsData::Audio {
+                    volume,
+                    outputs,
+                    inputs,
+                }) => {
+                    self.settings_data_pending &= !settings_pending::AUDIO;
+                    self.settings_cache.audio_volume = Some(volume);
+                    self.settings_cache.audio_outputs = Some(outputs);
+                    self.settings_cache.audio_inputs = Some(inputs);
+                    redraw_tabs[0] = true;
+                }
+                Ok(SettingsData::Network(details)) => {
+                    self.settings_data_pending &= !settings_pending::NETWORK;
+                    self.settings_cache.network_details = Some(details);
+                    redraw_tabs[1] = true;
+                }
+                Ok(SettingsData::Bluetooth(devices)) => {
+                    self.settings_data_pending &= !settings_pending::BLUETOOTH;
+                    self.settings_cache.bluetooth_devices = Some(devices);
+                    redraw_tabs[2] = true;
+                }
+                Ok(SettingsData::Autostart(apps)) => {
+                    self.settings_data_pending &= !settings_pending::AUTOSTART;
+                    self.settings_cache.autostart_apps = Some(apps);
+                    redraw_tabs[3] = true;
+                }
+                Ok(SettingsData::GpuUsage(usage)) => {
+                    self.settings_data_pending &= !settings_pending::GPU;
+                    self.metrics.gpu_usage = usage.clone();
+                    self.settings_cache.gpu_usage = Some(usage);
+                    gpu_updated = true;
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        if !self.settings_visible {
+            return Ok(false);
+        }
+        let should_redraw = match self.settings.tab {
+            SettingsTab::Audio => redraw_tabs[0],
+            SettingsTab::Network => redraw_tabs[1],
+            SettingsTab::Bluetooth => redraw_tabs[2],
+            SettingsTab::Startup => redraw_tabs[3],
+            SettingsTab::Power | SettingsTab::About => gpu_updated,
+            _ => false,
+        };
+        if should_redraw {
+            self.redraw_settings()?;
+        }
+        Ok(should_redraw)
+    }
+
     pub(crate) fn handle_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         if self.settings.tab == SettingsTab::Power && self.settings.auto_power_saver_editing {
             let sx = SIDEBAR_WIDTH + 24;
@@ -97,6 +214,9 @@ impl Aurora {
                 if tab == SettingsTab::Network {
                     self.ensure_wifi_refresh_started(false);
                 }
+                // Draw the tab shell immediately from cached data; heavy
+                // content loads in the background and fills in when ready.
+                self.request_settings_data(tab);
                 self.redraw_settings()?;
                 self.redraw_topbar()?;
             }
@@ -131,7 +251,12 @@ impl Aurora {
         }
         let max_scroll = match self.settings.tab {
             SettingsTab::Network => {
-                let lines = read_network_details().len();
+                let lines = self
+                    .settings_cache
+                    .network_details
+                    .as_ref()
+                    .map(Vec::len)
+                    .unwrap_or(0);
                 (lines.saturating_sub(4) * 24) as i32
             }
             SettingsTab::Startup | SettingsTab::About => 180,
@@ -254,18 +379,27 @@ impl Aurora {
         if x >= bar_x && x <= bar_x + bar_w && (132..=162).contains(&y) {
             let percent = (((x - bar_x) * 100) / bar_w).clamp(0, 100) as u8;
             self.settings.audio_status = match set_audio_volume_percent(percent) {
-                Ok(()) => Some(format!("Volume set to {percent}%")),
+                Ok(()) => {
+                    self.settings_cache.audio_volume = Some(Some(percent));
+                    Some(format!("Volume set to {percent}%"))
+                }
                 Err(err) => Some(err),
             };
             self.redraw_settings()?;
         }
         let card_w = i32::from(self.settings_geometry().2) - sx - 24;
         if x >= sx + 12 && x <= sx + card_w - 12 {
-            for (idx, dev) in read_audio_devices(AudioDeviceKind::Output)
-                .iter()
-                .take(3)
-                .enumerate()
-            {
+            let outputs = self
+                .settings_cache
+                .audio_outputs
+                .clone()
+                .unwrap_or_default();
+            let inputs = self
+                .settings_cache
+                .audio_inputs
+                .clone()
+                .unwrap_or_default();
+            for (idx, dev) in outputs.iter().take(3).enumerate() {
                 let row_y = 260 + idx as i32 * 30;
                 if y >= row_y - 3 && y <= row_y + 21 {
                     self.settings.audio_status =
@@ -273,15 +407,13 @@ impl Aurora {
                             Ok(()) => Some(format!("Output set to {}", dev.label)),
                             Err(err) => Some(err),
                         };
+                    self.settings_data_pending &= !settings_pending::AUDIO;
+                    self.request_settings_data(SettingsTab::Audio);
                     self.redraw_settings()?;
                     return Ok(());
                 }
             }
-            for (idx, dev) in read_audio_devices(AudioDeviceKind::Input)
-                .iter()
-                .take(2)
-                .enumerate()
-            {
+            for (idx, dev) in inputs.iter().take(2).enumerate() {
                 let row_y = 432 + idx as i32 * 30;
                 if y >= row_y - 3 && y <= row_y + 21 {
                     self.settings.audio_status =
@@ -289,6 +421,8 @@ impl Aurora {
                             Ok(()) => Some(format!("Input set to {}", dev.label)),
                             Err(err) => Some(err),
                         };
+                    self.settings_data_pending &= !settings_pending::AUDIO;
+                    self.request_settings_data(SettingsTab::Audio);
                     self.redraw_settings()?;
                     return Ok(());
                 }

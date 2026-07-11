@@ -1275,13 +1275,23 @@ impl Aurora {
             return Ok(());
         };
         let (_, _, w, h) = self.media_geometry(slot);
-        let mut c = Canvas::new(w, h, Color::rgb(247, 252, 255));
+        // Dark navy border ring so the viewer popup stands out clearly
+        // against the wallpaper and light app windows.
+        let mut c = Canvas::new(w, h, Color::rgb(21, 39, 66));
         c.draw_round_rect(
             0,
             0,
             i32::from(w),
             i32::from(h),
             18,
+            Color::rgb(21, 39, 66),
+        );
+        c.draw_round_rect(
+            3,
+            3,
+            i32::from(w) - 6,
+            i32::from(h) - 6,
+            15,
             Color::rgb(247, 252, 255),
         );
         c.draw_text(
@@ -1340,6 +1350,9 @@ impl Aurora {
         let preview_h = i32::from(h) - 130;
         let preview_bg = if media.entry.kind == FileKind::Text {
             Color::rgb(255, 255, 255)
+        } else if media.entry.kind == FileKind::Image {
+            // Dark navy backdrop improves perceived contrast for photos.
+            Color::rgb(28, 48, 78)
         } else {
             Color::rgb(238, 247, 252)
         };

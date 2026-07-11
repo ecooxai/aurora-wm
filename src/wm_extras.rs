@@ -154,16 +154,22 @@ pub(crate) fn read_gpu_usage() -> Vec<GpuUsage> {
             if vendor == "0x10de" {
                 continue; // NVIDIA: sysfs has no busy percent; use nvidia-smi below.
             }
-            let Some(percent) = fs::read_to_string(dev.join("gpu_busy_percent"))
-                .ok()
-                .and_then(|v| v.trim().parse::<f32>().ok())
-            else {
-                continue;
-            };
             let label = match vendor.as_str() {
                 "0x1002" => "AMD GPU",
                 "0x8086" => "Intel GPU",
                 _ => "GPU",
+            };
+            // AMD (amdgpu) and some drivers expose a direct busy percentage.
+            let mut percent = fs::read_to_string(dev.join("gpu_busy_percent"))
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok());
+            // Intel i915/xe expose no busy percent in sysfs; estimate load
+            // from actual vs. max GT frequency (idle GPUs clock down).
+            if percent.is_none() && vendor == "0x8086" {
+                percent = intel_gpu_freq_percent(&entry.path());
+            }
+            let Some(percent) = percent else {
+                continue;
             };
             out.push(GpuUsage {
                 name: format!("{label} ({})", entry.file_name().to_string_lossy()),
@@ -195,6 +201,33 @@ pub(crate) fn read_gpu_usage() -> Vec<GpuUsage> {
         }
     }
     out
+}
+
+/// Approximate Intel GPU load from GT frequency scaling: i915 clocks the GPU
+/// between RPn (idle) and RP0 (max); actual freq relative to that range is a
+/// usable load proxy when no busy counter is exposed.
+pub(crate) fn intel_gpu_freq_percent(card: &Path) -> Option<f32> {
+    let read_mhz = |name: &str| -> Option<f32> {
+        // i915 places these at the card root; newer kernels use gt/gt0/.
+        for base in [card.to_path_buf(), card.join("gt/gt0")] {
+            if let Some(value) = fs::read_to_string(base.join(name))
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+            {
+                return Some(value);
+            }
+        }
+        None
+    };
+    let act = read_mhz("gt_act_freq_mhz").or_else(|| read_mhz("gt_cur_freq_mhz"))?;
+    let max = read_mhz("gt_RP0_freq_mhz").or_else(|| read_mhz("gt_max_freq_mhz"))?;
+    let min = read_mhz("gt_RPn_freq_mhz")
+        .or_else(|| read_mhz("gt_min_freq_mhz"))
+        .unwrap_or(0.0);
+    if max <= min {
+        return None;
+    }
+    Some(((act - min) / (max - min) * 100.0).clamp(0.0, 100.0))
 }
 
 impl Aurora {
@@ -853,6 +886,10 @@ impl Aurora {
     }
 
     pub(crate) fn shortcut_focus_folder(&mut self) -> AnyResult<()> {
+        if self.launch_file_manager(&self.folder_path) {
+            return Ok(());
+        }
+
         self.folder_front = true;
         self.settings_front = false;
         self.media_front = false;
@@ -869,6 +906,10 @@ impl Aurora {
     }
 
     pub(crate) fn shortcut_focus_terminal(&mut self) -> AnyResult<()> {
+        if self.launch_file_manager_terminal(&self.folder_path) {
+            return Ok(());
+        }
+
         if !self.folder_terminal.visible {
             self.toggle_folder_terminal()?;
         }

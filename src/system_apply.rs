@@ -197,10 +197,15 @@ impl Aurora {
 
     pub(crate) fn launch_terminal(&mut self) {
         let selected = if self.settings.terminal_command.trim().is_empty() {
-            self.available_apps(DefaultAppKind::Terminal)
-                .first()
-                .map(|app| app.command.clone())
-                .unwrap_or_default()
+            if let Some(files_bin) = aurora_files_binary() {
+                // Prefer the bundled Aurora Files tabbed terminal.
+                format!("\"{files_bin}\" --terminal")
+            } else {
+                self.available_apps(DefaultAppKind::Terminal)
+                    .first()
+                    .map(|app| app.command.clone())
+                    .unwrap_or_default()
+            }
         } else {
             self.settings.terminal_command.clone()
         };
@@ -259,6 +264,111 @@ impl Aurora {
             }
             Err(_) => false,
         }
+    }
+
+    /// Launch the standalone Aurora Files app at `path`. Returns false when
+    /// the binary is not available (callers fall back to the built-in UI).
+    pub(crate) fn launch_file_manager(&self, path: &Path) -> bool {
+        let Some(files_bin) = aurora_files_binary() else {
+            return false;
+        };
+        let mut cmd = Command::new(files_bin);
+        cmd.env("DISPLAY", &self.display).arg(path);
+        spawn_detached(cmd);
+        true
+    }
+
+    /// Open `path` as a new tab in the active Aurora Files window. If no
+    /// suitable window exists, launch Aurora Files normally.
+    pub(crate) fn open_file_manager_tab(&mut self, path: &Path) -> bool {
+        let is_files_window = |window: Window| {
+            self.clients.get(&window).is_some_and(|info| {
+                self.window_class(info.window).contains("aurora-files")
+                    && self.window_title(info.window) == "Aurora Files"
+            })
+        };
+        let target = self
+            .active_client
+            .filter(|window| is_files_window(*window))
+            .or_else(|| {
+                self.focus_history
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|window| is_files_window(*window))
+            })
+            .or_else(|| {
+                self.clients
+                    .keys()
+                    .copied()
+                    .find(|window| is_files_window(*window))
+            });
+        let Some(target) = target else {
+            return self.launch_file_manager(path);
+        };
+        let Some(info) = self.clients.get(&target).copied() else {
+            return self.launch_file_manager(path);
+        };
+        let Ok(message_atom) = self.atom(b"_AURORA_FILES_OPEN_FOLDER_TAB") else {
+            return self.launch_file_manager(path);
+        };
+        let Ok(path_atom) = self.atom(b"_AURORA_FILES_FOLDER_TAB_PATH") else {
+            return self.launch_file_manager(path);
+        };
+        let Ok(utf8_atom) = self.atom(b"UTF8_STRING") else {
+            return self.launch_file_manager(path);
+        };
+        if self
+            .conn
+            .change_property8(
+                PropMode::REPLACE,
+                info.window,
+                path_atom,
+                utf8_atom,
+                path.to_string_lossy().as_bytes(),
+            )
+            .is_err()
+        {
+            return self.launch_file_manager(path);
+        }
+        let event = ClientMessageEvent::new(32, info.window, message_atom, [0, 0, 0, 0, 0]);
+        if self
+            .conn
+            .send_event(false, info.window, EventMask::NO_EVENT, event)
+            .is_err()
+            || self.conn.flush().is_err()
+        {
+            return self.launch_file_manager(path);
+        }
+        let _ = self.focus_window(target);
+        true
+    }
+
+    /// Launch Aurora Files with its terminal focused.
+    pub(crate) fn launch_file_manager_terminal(&self, path: &Path) -> bool {
+        let Some(files_bin) = aurora_files_binary() else {
+            return false;
+        };
+        let mut cmd = Command::new(files_bin);
+        cmd.env("DISPLAY", &self.display)
+            .arg("--terminal")
+            .arg(path);
+        spawn_detached(cmd);
+        true
+    }
+
+    /// Launch a minimal image-only screenshot viewer. The viewer owns its
+    /// timeout and exits automatically after one minute.
+    pub(crate) fn launch_screenshot_viewer(&self, path: &Path) -> bool {
+        let Some(files_bin) = aurora_files_binary() else {
+            return false;
+        };
+        let mut cmd = Command::new(files_bin);
+        cmd.env("DISPLAY", &self.display)
+            .arg("--image-viewer")
+            .arg(path);
+        spawn_detached(cmd);
+        true
     }
 
     pub(crate) fn spawn_first_available(&self, names: &[&str], args: &[&str]) {

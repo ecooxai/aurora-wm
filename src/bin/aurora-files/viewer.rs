@@ -160,8 +160,9 @@ impl ImageView {
                     .min(1.0);
                 let nw = ((iw as f32 * scale) as u32).max(1);
                 let nh = ((ih as f32 * scale) as u32).max(1);
+                // Lanczos3 gives noticeably sharper downscaling than Triangle.
                 let resized =
-                    image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+                    image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
                 Self {
                     path: path.to_path_buf(),
                     pixels: resized.into_raw(),
