@@ -26,23 +26,31 @@ need_cmd() {
     fi
 }
 
-need_cmd cargo
 if [ "$(id -u)" -ne 0 ]; then
     need_cmd sudo
+fi
+
+if [ -x "./$BIN_NAME" ] && [ -x "./aurora-files" ]; then
+    wm_source="./$BIN_NAME"
+    files_source="./aurora-files"
+    echo "Using bundled release binaries."
+else
+    need_cmd cargo
+    echo "Building $BIN_NAME and aurora-files release binaries..."
+    cargo build --release --bins
+    wm_source="target/release/$BIN_NAME"
+    files_source="target/release/aurora-files"
 fi
 
 tmp_wrapper="$(mktemp)"
 tmp_desktop="$(mktemp)"
 trap 'rm -f "$tmp_wrapper" "$tmp_desktop"' EXIT
 
-echo "Building $BIN_NAME and aurora-files release binaries..."
-cargo build --release --bins
-
 echo "Installing $BIN_PATH..."
-as_root install -Dm755 "target/release/$BIN_NAME" "$BIN_PATH"
+as_root install -Dm755 "$wm_source" "$BIN_PATH"
 
 echo "Installing aurora-files..."
-as_root install -Dm755 "target/release/aurora-files" "$PREFIX/bin/aurora-files"
+as_root install -Dm755 "$files_source" "$PREFIX/bin/aurora-files"
 as_root install -Dm644 assets/aurora-files.desktop /usr/share/applications/aurora-files.desktop
 as_root install -Dm644 assets/aurora-files-terminal.desktop /usr/share/applications/aurora-files-terminal.desktop
 if command -v update-desktop-database >/dev/null 2>&1; then
