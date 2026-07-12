@@ -1123,6 +1123,10 @@ pub(crate) fn read_desktop_entries() -> Vec<DesktopEntry> {
                 .lines()
                 .find_map(|line| line.strip_prefix("MimeType=").map(str::to_string))
                 .unwrap_or_default();
+            let keywords = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Keywords=").map(str::to_string))
+                .unwrap_or_default();
             let command = text
                 .lines()
                 .find_map(|line| line.strip_prefix("Exec=").map(clean_desktop_command))
@@ -1146,10 +1150,22 @@ pub(crate) fn read_desktop_entries() -> Vec<DesktopEntry> {
                 command,
                 categories: cats,
                 mime_types,
+                keywords,
             });
         }
     }
-    entries.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+    entries.sort_by(|a, b| {
+        let rank = |category: &str| match category {
+            "Internet" => 0,
+            "System" => 1,
+            "Program" => 2,
+            "Media" => 3,
+            _ => 4,
+        };
+        rank(&a.category)
+            .cmp(&rank(&b.category))
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     entries
 }
 

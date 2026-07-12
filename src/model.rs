@@ -886,9 +886,8 @@ pub(crate) enum FileKind {
 pub(crate) enum AppAction {
     Terminal,
     Browser,
-    Pictures,
-    Music,
-    Videos,
+    Camera,
+    Recorder,
     Settings,
     More,
 }
@@ -900,12 +899,26 @@ pub(crate) struct AppMenuItem {
     pub(crate) action: AppAction,
 }
 
+#[derive(Clone)]
 pub(crate) struct DesktopEntry {
     pub(crate) name: String,
     pub(crate) category: String,
     pub(crate) command: String,
     pub(crate) categories: String,
     pub(crate) mime_types: String,
+    pub(crate) keywords: String,
+}
+
+pub(crate) enum AppCatalogRow {
+    Category {
+        name: String,
+        count: usize,
+        expanded: bool,
+    },
+    App {
+        name: String,
+        command: String,
+    },
 }
 
 #[derive(Clone)]
@@ -1039,6 +1052,8 @@ pub(crate) struct Aurora {
     pub(crate) app_menu_visible: bool,
     pub(crate) app_menu_more: bool,
     pub(crate) app_menu_scroll: usize,
+    pub(crate) app_menu_query: String,
+    pub(crate) app_menu_expanded_categories: HashSet<String>,
     pub(crate) dock_more_visible: bool,
     pub(crate) aurora_menu_visible: bool,
     pub(crate) aurora_menu_about: bool,
@@ -1097,6 +1112,8 @@ pub(crate) struct Aurora {
     pub(crate) choose_file_mode: bool,
     /// Client whose title dropdown menu is open.
     pub(crate) title_menu_open: Option<Window>,
+    /// When the title menu is open, whether it is showing the workspace picker submenu.
+    pub(crate) title_menu_workspaces: bool,
     /// Client with a pending close-confirmation dialog.
     pub(crate) confirm_close: Option<Window>,
     /// Currently shown topbar tooltip: (anchor x, label).

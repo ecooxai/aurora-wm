@@ -72,6 +72,20 @@ impl Aurora {
         let ctrl = state & u16::from(ModMask::CONTROL) != 0;
         let alt = state & u16::from(ModMask::M1) != 0;
         let shift = state & u16::from(ModMask::SHIFT) != 0;
+        let keysym_column = if shift && mapping.keysyms_per_keycode > 1 { 1 } else { 0 };
+        let keysym = mapping
+            .keysyms
+            .get(keysym_column)
+            .copied()
+            .unwrap_or(base_keysym);
+        if self.app_menu_visible
+            && !command
+            && !ctrl
+            && !alt
+            && self.handle_app_menu_keypress(keysym)?
+        {
+            return Ok(());
+        }
         if command && !ctrl && !alt && !shift && matches!(base_keysym, 0x76 | 0x56) {
             paste_clipboard_now(&self.display);
             return Ok(());
@@ -226,6 +240,46 @@ impl Aurora {
         }
         self.redraw_settings()?;
         Ok(())
+    }
+
+    pub(crate) fn handle_app_menu_keypress(&mut self, keysym: u32) -> AnyResult<bool> {
+        match keysym {
+            0xff1b => {
+                if self.app_menu_query.is_empty() {
+                    self.hide_app_menu()?;
+                } else {
+                    self.app_menu_query.clear();
+                    self.app_menu_scroll = 0;
+                    self.redraw_app_menu()?;
+                }
+            }
+            0xff08 => {
+                self.app_menu_query.pop();
+                self.app_menu_scroll = 0;
+                self.redraw_app_menu()?;
+            }
+            0xff0d => {
+                let rows = app_catalog_rows(
+                    &self.app_menu_query,
+                    &self.app_menu_expanded_categories,
+                );
+                if let Some(command) = rows.iter().find_map(|row| match row {
+                    AppCatalogRow::App { command, .. } => Some(command.clone()),
+                    _ => None,
+                }) {
+                    if self.spawn_configured_app(&command, None) {
+                        self.hide_app_menu()?;
+                    }
+                }
+            }
+            0x20..=0x7e if self.app_menu_query.len() < 80 => {
+                self.app_menu_query.push(char::from_u32(keysym).unwrap());
+                self.app_menu_scroll = 0;
+                self.redraw_app_menu()?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     pub(crate) fn handle_key_release(&mut self, ev: KeyReleaseEvent) -> AnyResult<()> {

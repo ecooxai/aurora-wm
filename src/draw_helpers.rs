@@ -850,11 +850,45 @@ pub(crate) fn draw_launcher_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32) {
     match idx {
         0 => draw_play_icon(c, cx, cy, BLUE),
         1 => draw_globe_icon(c, cx, cy, BLUE),
-        2 => draw_picture_icon(c, cx, cy, MINT_DARK),
-        3 => draw_music_icon(c, cx, cy, MINT_DARK),
-        4 => draw_play_icon(c, cx, cy, MINT_DARK),
-        _ => draw_gear_icon(c, cx, cy, SOFT_INK),
+        2 => draw_camera_icon(c, cx, cy, MINT_DARK),
+        3 => draw_record_icon(c, cx, cy, Color::rgb(206, 76, 91)),
+        4 => draw_gear_icon(c, cx, cy, SOFT_INK),
+        _ => draw_more_icon(c, cx, cy, SOFT_INK),
     }
+}
+
+pub(crate) fn draw_search_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_circle(cx - 2, cy - 2, 6, color);
+    c.draw_circle(cx - 2, cy - 2, 4, Color::rgba(248, 253, 255, 255));
+    draw_round_line(c, cx + 2, cy + 2, cx + 7, cy + 7, 2, color);
+}
+
+pub(crate) fn draw_catalog_chevron(
+    c: &mut Canvas,
+    cx: i32,
+    cy: i32,
+    expanded: bool,
+    color: Color,
+) {
+    if expanded {
+        draw_round_line(c, cx - 4, cy - 2, cx, cy + 2, 2, color);
+        draw_round_line(c, cx, cy + 2, cx + 4, cy - 2, 2, color);
+    } else {
+        draw_round_line(c, cx - 2, cy - 4, cx + 2, cy, 2, color);
+        draw_round_line(c, cx + 2, cy, cx - 2, cy + 4, 2, color);
+    }
+}
+
+pub(crate) fn draw_camera_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_round_rect(cx - 11, cy - 7, 22, 15, 5, Color::rgba(color.r, color.g, color.b, 55));
+    c.draw_round_rect(cx - 5, cy - 11, 10, 5, 2, color);
+    c.draw_circle(cx, cy, 6, color);
+    c.draw_circle(cx, cy, 3, Color::rgba(248, 253, 255, 255));
+}
+
+pub(crate) fn draw_record_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    c.draw_circle(cx, cy, 11, Color::rgba(color.r, color.g, color.b, 40));
+    c.draw_circle(cx, cy, 6, color);
 }
 
 pub(crate) fn draw_folder_icon(c: &mut Canvas, cx: i32, cy: i32, _color: Color) {

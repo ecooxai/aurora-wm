@@ -314,13 +314,13 @@ impl Aurora {
                 && ry >= i32::from(my)
                 && ry <= i32::from(my) + i32::from(mh);
             if inside {
-                if ev.event == self.ui.title_menu {
+                if ev.event == self.ui.title_menu || ev.event == self.root {
+                    // The synchronous root grab reports the press on the root window; handle
+                    // it directly (rather than replaying) so the click reaches the menu.
+                    if ev.event == self.root {
+                        self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+                    }
                     self.handle_title_menu_click(ry - i32::from(my))?;
-                    self.conn.flush()?;
-                    return Ok(());
-                }
-                if ev.event == self.root {
-                    self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
                     self.conn.flush()?;
                     return Ok(());
                 }
@@ -380,6 +380,14 @@ impl Aurora {
         } else {
             ev.event
         };
+        if self.app_menu_visible
+            && ev.event != self.ui.app_menu
+            && pointer_target != self.ui.app_menu
+            && ev.event != self.ui.dock
+            && pointer_target != self.ui.dock
+        {
+            self.hide_app_menu()?;
+        }
         if self.screenshot_mode && ev.detail == 1 {
             self.start_screenshot_selection(ev.root_x, ev.root_y)?;
             if ev.event == self.root {
@@ -397,6 +405,11 @@ impl Aurora {
             };
             if ev.detail == 1 {
                 self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+                self.conn.set_input_focus(
+                    InputFocus::POINTER_ROOT,
+                    self.ui.app_menu,
+                    CURRENT_TIME,
+                )?;
             }
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_settings_scroll(ev.detail, event_x, event_y)?;
@@ -481,8 +494,20 @@ impl Aurora {
             }
             self.handle_folder_terminal_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
             self.redraw_folder_terminal()?;
-        } else if ev.event == self.ui.app_menu {
-            self.handle_app_menu_click(ev.detail, i32::from(ev.event_x), i32::from(ev.event_y))?;
+        } else if ev.event == self.ui.app_menu || pointer_target == self.ui.app_menu {
+            let (menu_x, menu_y, _, _) = self.app_menu_geometry();
+            let (event_x, event_y) = if ev.event == self.ui.app_menu {
+                (i32::from(ev.event_x), i32::from(ev.event_y))
+            } else {
+                (
+                    i32::from(ev.root_x) - i32::from(menu_x),
+                    i32::from(ev.root_y) - i32::from(menu_y),
+                )
+            };
+            if ev.detail == 1 {
+                self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+            }
+            self.handle_app_menu_click(ev.detail, event_x, event_y)?;
         } else if ev.event == self.ui.aurora_menu {
             self.handle_aurora_menu_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if ev.event == self.ui.clipboard_menu {
@@ -550,7 +575,7 @@ impl Aurora {
             if let Some(pending) = self.pending_client_drag {
                 let moved = (i32::from(ev.root_x) - i32::from(pending.root_x)).abs() > 4
                     || (i32::from(ev.root_y) - i32::from(pending.root_y)).abs() > 4;
-                if moved && pending.pressed_at.elapsed() >= Duration::from_millis(500) {
+                if moved && self.drag.is_none() {
                     self.pending_client_drag = None;
                     self.start_drag(pending.client, ev.root_x, ev.root_y)?;
                     return Ok(true);
@@ -835,7 +860,16 @@ impl Aurora {
         let root_x = data[0].min(i16::MAX as u32) as i16;
         let root_y = data[1].min(i16::MAX as u32) as i16;
         match data[2] {
-            8 => self.start_drag(client, root_x, root_y)?,
+            8 => {
+                // The app is driving the move itself (CSD titlebar). Drop our own pending
+                // titlebar-drag fallback so the two don't both call start_drag with
+                // different offsets — that double-drag makes the frame jump and exposes the
+                // black frame background inside the window during non-composited moves.
+                self.pending_client_drag = None;
+                if self.drag.is_none() {
+                    self.start_drag(client, root_x, root_y)?;
+                }
+            }
             0 => self.start_resize(
                 client,
                 root_x,

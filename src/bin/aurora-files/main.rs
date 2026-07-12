@@ -43,6 +43,8 @@ const ROW_H: i32 = 34;
 const CELL_W: i32 = 8;
 const CELL_H: i32 = 17;
 const TERMINAL_COPY_DELAY: Duration = Duration::from_secs(2);
+/// Maximum number of folder tabs; opening more replaces the last one.
+const MAX_FOLDER_TABS: usize = 20;
 const TERMINAL_NOTICE_DURATION: Duration = Duration::from_secs(3);
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -93,6 +95,52 @@ struct FolderTab {
 struct TerminalGroup {
     tabs: Vec<Tab>,
     active_tab: usize,
+}
+
+/// Atoms used to act as an XDND (drag-and-drop) source so files/images can be
+/// dragged out of the viewer/list into other applications.
+struct XdndAtoms {
+    aware: Atom,
+    selection: Atom,
+    enter: Atom,
+    position: Atom,
+    status: Atom,
+    leave: Atom,
+    drop: Atom,
+    finished: Atom,
+    action_copy: Atom,
+    uri_list: Atom,
+}
+
+impl XdndAtoms {
+    fn intern(conn: &RustConnection) -> AnyResult<Self> {
+        let mut a = |name: &[u8]| -> AnyResult<Atom> {
+            Ok(conn.intern_atom(false, name)?.reply()?.atom)
+        };
+        Ok(Self {
+            aware: a(b"XdndAware")?,
+            selection: a(b"XdndSelection")?,
+            enter: a(b"XdndEnter")?,
+            position: a(b"XdndPosition")?,
+            status: a(b"XdndStatus")?,
+            leave: a(b"XdndLeave")?,
+            drop: a(b"XdndDrop")?,
+            finished: a(b"XdndFinished")?,
+            action_copy: a(b"XdndActionCopy")?,
+            uri_list: a(b"text/uri-list")?,
+        })
+    }
+}
+
+/// State of a file being dragged out to another application.
+struct FileDrag {
+    path: PathBuf,
+    start_x: i32,
+    start_y: i32,
+    started: bool,
+    target: Window,
+    target_ver: u8,
+    accepted: bool,
 }
 
 struct App {
@@ -151,6 +199,11 @@ struct App {
 
     viewer: Option<Viewer>,
     focus: Focus,
+    /// Right-click context menu for the image viewer, anchored at (x, y).
+    image_menu: Option<(i32, i32)>,
+    xdnd: XdndAtoms,
+    /// A file being dragged out of the app to another application.
+    file_drag: Option<FileDrag>,
 }
 
 fn main() {
@@ -209,6 +262,34 @@ fn copy_text_to_system_clipboard(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Copy an image file to the system clipboard as image/png (best effort), so it can be
+/// pasted into other applications.
+fn copy_image_to_system_clipboard(path: &Path) -> bool {
+    let mime = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "image/png",
+    };
+    Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", mime, "-i"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(|mut child| child.wait())
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn read_text_from_system_clipboard() -> Option<String> {
@@ -374,6 +455,15 @@ fn run(args: &[String]) -> AnyResult<()> {
         .reply()?
         .atom;
     let utf8_string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+    let xdnd = XdndAtoms::intern(&conn)?;
+    // Advertise ourselves as an XDND source (version 5).
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        xdnd.aware,
+        AtomEnum::ATOM,
+        &[5u32],
+    )?;
     let current_workspace = read_current_desktop(&conn, screen.root, current_desktop_atom);
     conn.change_property32(
         PropMode::REPLACE,
@@ -475,6 +565,9 @@ fn run(args: &[String]) -> AnyResult<()> {
         terminal_copy_due: None,
         terminal_notice: None,
         viewer: None,
+        image_menu: None,
+        xdnd,
+        file_drag: None,
         focus: if args.iter().any(|a| a == "--terminal") {
             Focus::Terminal
         } else {
@@ -662,10 +755,36 @@ impl App {
         }
     }
 
+    /// Append a folder tab, enforcing the tab cap: at the limit the last tab is
+    /// replaced instead of growing the list unbounded. Returns the tab's index.
+    fn push_folder_tab(&mut self, tab: FolderTab) -> usize {
+        if self.folder_tabs.len() >= MAX_FOLDER_TABS {
+            let idx = self.folder_tabs.len() - 1;
+            self.folder_tabs[idx] = tab;
+            idx
+        } else {
+            self.folder_tabs.push(tab);
+            self.folder_tabs.len() - 1
+        }
+    }
+
+    /// Index of an existing plain-folder tab already showing `path`, if any.
+    fn existing_folder_tab(&self, path: &Path) -> Option<usize> {
+        self.folder_tabs
+            .iter()
+            .position(|tab| tab.role == FolderTabRole::Folder && tab.path == path)
+    }
+
     fn add_folder_tab(&mut self) {
-        let idx = self.folder_tabs.len();
-        self.folder_tabs.push(FolderTab {
-            path: home_dir(),
+        let path = home_dir();
+        // Don't create a duplicate tab for a path that already has one.
+        if let Some(idx) = self.existing_folder_tab(&path) {
+            self.select_folder_tab(idx);
+            self.status = "Switched to existing tab".into();
+            return;
+        }
+        let idx = self.push_folder_tab(FolderTab {
+            path,
             role: FolderTabRole::Folder,
             last_file: None,
         });
@@ -677,8 +796,13 @@ impl App {
         if !path.is_dir() {
             return;
         }
-        let idx = self.folder_tabs.len();
-        self.folder_tabs.push(FolderTab {
+        // Switch to an existing tab for this path rather than duplicating it.
+        if let Some(idx) = self.existing_folder_tab(&path) {
+            self.select_folder_tab(idx);
+            self.status = "Switched to existing tab".into();
+            return;
+        }
+        let idx = self.push_folder_tab(FolderTab {
             path,
             role: FolderTabRole::Folder,
             last_file: None,
@@ -1093,7 +1217,10 @@ impl App {
                         );
                         needs_draw = true;
                     }
-                    Event::ButtonRelease(_) => {
+                    Event::ButtonRelease(ev) => {
+                        if self.file_drag.is_some() {
+                            self.drag_out_release(ev.time)?;
+                        }
                         self.finish_terminal_selection();
                         if let Some(Viewer::Model(model)) = self.viewer.as_mut() {
                             model.dragging = None;
@@ -1101,6 +1228,15 @@ impl App {
                         needs_draw = true;
                     }
                     Event::MotionNotify(ev) => {
+                        if self.file_drag.is_some() {
+                            self.drag_out_motion(
+                                i32::from(ev.event_x),
+                                i32::from(ev.event_y),
+                                ev.root_x,
+                                ev.root_y,
+                                ev.time,
+                            )?;
+                        }
                         if self.update_terminal_selection(
                             i32::from(ev.event_x),
                             i32::from(ev.event_y),
@@ -1122,8 +1258,13 @@ impl App {
                         }
                         needs_draw = true;
                     }
+                    Event::SelectionRequest(ev) => {
+                        self.handle_selection_request(&ev)?;
+                    }
                     Event::ClientMessage(ev) => {
-                        if ev.type_ == self.open_screenshot_atom {
+                        if self.handle_xdnd_client_message(&ev) {
+                            needs_draw = true;
+                        } else if ev.type_ == self.open_screenshot_atom {
                             self.handle_screenshot_message();
                             needs_draw = true;
                         } else if ev.type_ == self.open_folder_tab_atom {
@@ -1346,8 +1487,46 @@ impl App {
             self.focus = Focus::Files;
             return;
         }
+        // Image context menu (right-click): handle its own clicks first.
+        if let Some((mx, my)) = self.image_menu {
+            if button == 1 || button == 3 {
+                let handled = self.handle_image_menu_click(mx, my, x, y);
+                self.image_menu = None;
+                if handled {
+                    return;
+                }
+            }
+        }
         // Viewer interactions
         let (cx, cy, cw, _ch) = self.content_rect();
+        // Viewer close (X) button.
+        if self.viewer.is_some() && button == 1 {
+            let (bx, by, bw, bh) = self.viewer_close_button_rect();
+            if x >= bx && x < bx + bw && y >= by && y < by + bh {
+                self.viewer_close();
+                return;
+            }
+        }
+        // Right-click on an image opens the context menu (copy / zoom).
+        if button == 3 && matches!(self.viewer, Some(Viewer::Image(_))) {
+            self.image_menu = Some((x, y));
+            return;
+        }
+        // Left press on the image arms a potential drag-out to another app; it only
+        // becomes a real drag once the pointer moves past a small threshold.
+        if button == 1 {
+            if let Some(Viewer::Image(img)) = &self.viewer {
+                self.file_drag = Some(FileDrag {
+                    path: img.path.clone(),
+                    start_x: x,
+                    start_y: y,
+                    started: false,
+                    target: 0,
+                    target_ver: 0,
+                    accepted: false,
+                });
+            }
+        }
         if let Some(viewer) = self.viewer.as_mut() {
             match viewer {
                 Viewer::Pdf(pdf) => {
@@ -1600,6 +1779,7 @@ impl App {
         let mut c = Canvas::new(self.width, self.height, PAPER);
         if self.viewer_only {
             self.draw_viewer(&mut c);
+            self.draw_image_menu(&mut c);
             self.upload(&c)?;
             return Ok(());
         }
@@ -1614,6 +1794,7 @@ impl App {
             self.draw_terminal(&mut c);
         }
         self.draw_header_menus(&mut c);
+        self.draw_image_menu(&mut c);
         self.upload(&c)?;
         Ok(())
     }
@@ -2019,14 +2200,17 @@ impl App {
                     c.draw_round_rect(cx + 8, cy + 34, cw - 16, ch - 46, 12, Color::rgb(21, 39, 66));
                     c.draw_rect(x - 3, y - 3, img.width as i32 + 6, img.height as i32 + 6, Color::rgb(38, 68, 110));
                     c.paint_rgba(&img.pixels, x, y, img.width as i32, img.height as i32);
-                    c.draw_text(
-                        &self.regular,
-                        &format!("{}x{}", img.width, img.height),
-                        cx + 18,
-                        cy + 10,
-                        12.0,
-                        MUTED,
+                    let size_bytes = std::fs::metadata(&img.path).map(|m| m.len()).unwrap_or(0);
+                    let mut label = format!(
+                        "{} x {} px  -  {}",
+                        img.orig_width,
+                        img.orig_height,
+                        format_size(size_bytes)
                     );
+                    if (img.zoom - 1.0).abs() > 0.01 {
+                        label.push_str(&format!("  -  {}%", (img.zoom * 100.0).round() as i32));
+                    }
+                    c.draw_text(&self.regular, &label, cx + 18, cy + 10, 12.0, MUTED);
                 }
             }
             Viewer::Pdf(pdf) => {
@@ -2118,6 +2302,299 @@ impl App {
             Viewer::Info(message) => {
                 c.draw_text(&self.regular, message, cx + 18, cy + 20, 13.0, MUTED);
             }
+        }
+        // Close button, always at the top-right of the viewer.
+        let (bx, by, bw, bh) = self.viewer_close_button_rect();
+        c.draw_round_rect(bx, by, bw, bh, bw / 2, Color::rgba(226, 92, 101, 220));
+        c.draw_line(bx + 9, by + 9, bx + bw - 9, by + bh - 9, 2, Color::rgb(255, 255, 255));
+        c.draw_line(bx + bw - 9, by + 9, bx + 9, by + bh - 9, 2, Color::rgb(255, 255, 255));
+    }
+
+    /// Rectangle of the viewer's close (X) button, at the top-right corner.
+    fn viewer_close_button_rect(&self) -> (i32, i32, i32, i32) {
+        let (cx, cy, cw, _ch) = self.content_rect();
+        let bw = 26;
+        (cx + cw - bw - 10, cy + 6, bw, bw)
+    }
+
+    const IMAGE_MENU_ITEMS: [&'static str; 4] =
+        ["Copy image", "Zoom in", "Zoom out", "Reset zoom"];
+
+    fn image_menu_geometry(&self) -> (i32, i32, i32, i32) {
+        let (mx, my) = self.image_menu.unwrap_or((0, 0));
+        let w = 170;
+        let h = Self::IMAGE_MENU_ITEMS.len() as i32 * 30 + 10;
+        let x = mx.min(i32::from(self.width) - w - 6).max(4);
+        let y = my.min(i32::from(self.height) - h - 6).max(4);
+        (x, y, w, h)
+    }
+
+    fn draw_image_menu(&self, c: &mut Canvas) {
+        if self.image_menu.is_none() {
+            return;
+        }
+        let (gx, gy, gw, gh) = self.image_menu_geometry();
+        c.draw_round_rect(gx, gy, gw, gh, 10, Color::rgb(250, 254, 255));
+        c.draw_round_rect(gx, gy, gw, gh, 10, Color::rgba(176, 198, 210, 90));
+        for (i, label) in Self::IMAGE_MENU_ITEMS.iter().enumerate() {
+            let ry = gy + 5 + i as i32 * 30;
+            c.draw_text(&self.regular, label, gx + 16, ry + 9, 13.0, INK);
+        }
+    }
+
+    /// Returns true when the click landed on a menu item (so the caller consumes it).
+    fn handle_image_menu_click(&mut self, _mx: i32, _my: i32, x: i32, y: i32) -> bool {
+        let (gx, gy, gw, gh) = self.image_menu_geometry();
+        if x < gx || x >= gx + gw || y < gy || y >= gy + gh {
+            return false;
+        }
+        let row = ((y - gy - 5) / 30).clamp(0, Self::IMAGE_MENU_ITEMS.len() as i32 - 1);
+        match row {
+            0 => {
+                if let Some(Viewer::Image(img)) = &self.viewer {
+                    let path = img.path.clone();
+                    self.status = if copy_image_to_system_clipboard(&path) {
+                        "Image copied to clipboard".into()
+                    } else {
+                        "Copy failed (install xclip)".into()
+                    };
+                }
+            }
+            1 => self.zoom_image(1.25),
+            2 => self.zoom_image(0.8),
+            _ => self.zoom_image_to(1.0),
+        }
+        true
+    }
+
+    fn zoom_image(&mut self, factor: f32) {
+        if let Some(Viewer::Image(img)) = &self.viewer {
+            let z = (img.zoom * factor).clamp(0.1, 12.0);
+            self.zoom_image_to(z);
+        }
+    }
+
+    fn zoom_image_to(&mut self, zoom: f32) {
+        let Some(Viewer::Image(img)) = &self.viewer else {
+            return;
+        };
+        let path = img.path.clone();
+        let (_, _, cw, ch) = self.content_rect();
+        let mw = (cw - 40).max(50) as u32;
+        let mh = (ch - 80).max(50) as u32;
+        self.viewer = Some(Viewer::Image(ImageView::open_zoomed(&path, mw, mh, zoom)));
+        self.status = format!("Zoom {}%", (zoom * 100.0).round() as i32);
+    }
+
+    // ------------------------------------------------------ drag-out (XDND source)
+
+    fn send_client_message(&self, target: Window, type_: Atom, data: [u32; 5]) -> AnyResult<()> {
+        let event = ClientMessageEvent::new(32, target, type_, data);
+        self.conn
+            .send_event(false, target, EventMask::NO_EVENT, event)?;
+        Ok(())
+    }
+
+    /// XdndAware version advertised by `win`, if any.
+    fn xdnd_aware_version(&self, win: Window) -> AnyResult<Option<u8>> {
+        let reply = self
+            .conn
+            .get_property(false, win, self.xdnd.aware, AtomEnum::ATOM, 0, 1)?
+            .reply();
+        if let Ok(reply) = reply {
+            if let Some(mut vals) = reply.value32() {
+                if let Some(ver) = vals.next() {
+                    return Ok(Some((ver as u8).min(5)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Deepest XDND-aware window under the given root coordinates.
+    fn xdnd_target_at(&self, root_x: i16, root_y: i16) -> AnyResult<(Window, u8)> {
+        let mut win = self.root;
+        let mut found = (0u32, 0u8);
+        for _ in 0..16 {
+            let trans = self
+                .conn
+                .translate_coordinates(self.root, win, root_x, root_y)?
+                .reply()?;
+            if win != self.root && win != self.window {
+                if let Some(ver) = self.xdnd_aware_version(win)? {
+                    found = (win, ver);
+                }
+            }
+            if trans.child == x11rb::NONE {
+                break;
+            }
+            win = trans.child;
+        }
+        Ok(found)
+    }
+
+    fn xdnd_enter(&self, target: Window, _ver: u8) -> AnyResult<()> {
+        // Version 5 in the high byte; low bit 0 = we advertise <= 3 types inline.
+        self.send_client_message(
+            target,
+            self.xdnd.enter,
+            [self.window, 5 << 24, self.xdnd.uri_list, 0, 0],
+        )
+    }
+
+    fn xdnd_position(&self, target: Window, root_x: i16, root_y: i16) -> AnyResult<()> {
+        let pos = ((root_x as u32) << 16) | (root_y as u32 & 0xffff);
+        self.send_client_message(
+            target,
+            self.xdnd.position,
+            [self.window, 0, pos, 0, self.xdnd.action_copy],
+        )
+    }
+
+    fn xdnd_leave(&self, target: Window) -> AnyResult<()> {
+        self.send_client_message(target, self.xdnd.leave, [self.window, 0, 0, 0, 0])
+    }
+
+    fn xdnd_drop(&self, target: Window, time: u32) -> AnyResult<()> {
+        self.send_client_message(target, self.xdnd.drop, [self.window, 0, time, 0, 0])
+    }
+
+    /// Handle pointer motion while a file drag is armed/active. Returns whether a redraw
+    /// is needed.
+    fn drag_out_motion(
+        &mut self,
+        event_x: i32,
+        event_y: i32,
+        root_x: i16,
+        root_y: i16,
+        time: u32,
+    ) -> AnyResult<bool> {
+        let Some(drag) = self.file_drag.as_ref() else {
+            return Ok(false);
+        };
+        if !drag.started {
+            let moved =
+                (event_x - drag.start_x).abs() > 6 || (event_y - drag.start_y).abs() > 6;
+            if !moved {
+                return Ok(false);
+            }
+            self.conn
+                .set_selection_owner(self.window, self.xdnd.selection, time)?;
+            let _ = self
+                .conn
+                .grab_pointer(
+                    false,
+                    self.window,
+                    EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                    x11rb::NONE,
+                    x11rb::NONE,
+                    time,
+                )?
+                .reply();
+            if let Some(d) = self.file_drag.as_mut() {
+                d.started = true;
+            }
+            self.status = "Dragging file to another app...".into();
+        }
+        let (target, ver) = self.xdnd_target_at(root_x, root_y)?;
+        let prev = self.file_drag.as_ref().map(|d| d.target).unwrap_or(0);
+        if target != prev {
+            if prev != 0 {
+                self.xdnd_leave(prev)?;
+            }
+            if target != 0 {
+                self.xdnd_enter(target, ver)?;
+            }
+            if let Some(d) = self.file_drag.as_mut() {
+                d.target = target;
+                d.target_ver = ver;
+                d.accepted = false;
+            }
+        }
+        if target != 0 {
+            self.xdnd_position(target, root_x, root_y)?;
+        }
+        self.conn.flush()?;
+        Ok(false)
+    }
+
+    /// Handle button release: complete or cancel a drag-out.
+    fn drag_out_release(&mut self, time: u32) -> AnyResult<()> {
+        let Some(drag) = self.file_drag.as_ref() else {
+            return Ok(());
+        };
+        if !drag.started {
+            self.file_drag = None;
+            return Ok(());
+        }
+        let target = drag.target;
+        let accepted = drag.accepted;
+        let _ = self.conn.ungrab_pointer(time);
+        if target != 0 && accepted {
+            self.xdnd_drop(target, time)?;
+            self.status = "Dropped file".into();
+            // Keep file_drag alive to answer the SelectionRequest / XdndFinished.
+        } else {
+            if target != 0 {
+                self.xdnd_leave(target)?;
+            }
+            self.file_drag = None;
+            self.status = "Drag cancelled".into();
+        }
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn handle_selection_request(&mut self, ev: &SelectionRequestEvent) -> AnyResult<()> {
+        if ev.selection != self.xdnd.selection {
+            return Ok(());
+        }
+        let mut property = ev.property;
+        if let Some(drag) = self.file_drag.as_ref() {
+            if ev.target == self.xdnd.uri_list {
+                let uri = format!("file://{}\r\n", drag.path.to_string_lossy());
+                self.conn.change_property8(
+                    PropMode::REPLACE,
+                    ev.requestor,
+                    ev.property,
+                    self.xdnd.uri_list,
+                    uri.as_bytes(),
+                )?;
+            } else {
+                property = x11rb::NONE;
+            }
+        } else {
+            property = x11rb::NONE;
+        }
+        let notify = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: ev.time,
+            requestor: ev.requestor,
+            selection: ev.selection,
+            target: ev.target,
+            property,
+        };
+        self.conn
+            .send_event(false, ev.requestor, EventMask::NO_EVENT, notify)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn handle_xdnd_client_message(&mut self, ev: &ClientMessageEvent) -> bool {
+        let data = ev.data.as_data32();
+        if ev.type_ == self.xdnd.status {
+            if let Some(drag) = self.file_drag.as_mut() {
+                drag.accepted = data[1] & 1 != 0;
+            }
+            true
+        } else if ev.type_ == self.xdnd.finished {
+            self.file_drag = None;
+            true
+        } else {
+            false
         }
     }
 

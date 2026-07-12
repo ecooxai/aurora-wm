@@ -1,0 +1,11 @@
+DISPLAY=:0
+X0
+X11
+X111
+--PS--
+ 169238 /usr/local/bin/aurora-wm
+ 170987 Xephyr -ac -screen 1360x768 -reset -resizeable :111
+ 180211 target/release/aurora-wm --replace --compositor no
+ 181275 Xephyr -ac -screen 1360x768 -reset -resizeable :11
+ 183305 target/release/aurora-wm --replace --compositor no
+--HOSTTREE--

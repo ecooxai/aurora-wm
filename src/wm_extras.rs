@@ -21,7 +21,7 @@ use crate::textutil::*;
 
 pub(crate) const TITLE_MENU_WIDTH: u16 = 252;
 pub(crate) const TITLE_MENU_ROW_H: i32 = 36;
-pub(crate) const TITLE_MENU_ITEMS: usize = 5;
+pub(crate) const TITLE_MENU_ITEMS: usize = 6;
 pub(crate) const CONFIRM_W: u16 = 380;
 pub(crate) const CONFIRM_H: u16 = 148;
 pub(crate) const TOOLTIP_H: u16 = 30;
@@ -467,8 +467,18 @@ impl Aurora {
 
     // -------------------------------------------------------------- title menu
 
+    /// Number of rows in the title menu, depending on which page is showing.
+    pub(crate) fn title_menu_row_count(&self) -> usize {
+        if self.title_menu_workspaces {
+            // A "Back" row followed by one row per workspace.
+            self.workspace_count + 1
+        } else {
+            TITLE_MENU_ITEMS
+        }
+    }
+
     pub(crate) fn title_menu_geometry(&self, client: Window) -> (i16, i16, u16, u16) {
-        let h = (TITLE_MENU_ROW_H * TITLE_MENU_ITEMS as i32 + 14) as u16;
+        let h = (TITLE_MENU_ROW_H * self.title_menu_row_count() as i32 + 14) as u16;
         let Some(info) = self.clients.get(&client) else {
             return (0, 0, TITLE_MENU_WIDTH, h);
         };
@@ -479,11 +489,7 @@ impl Aurora {
         (x, y, TITLE_MENU_WIDTH, h)
     }
 
-    pub(crate) fn toggle_title_menu(&mut self, client: Window) -> AnyResult<()> {
-        if self.title_menu_open == Some(client) {
-            return self.hide_title_menu();
-        }
-        self.title_menu_open = Some(client);
+    pub(crate) fn configure_title_menu(&self, client: Window) -> AnyResult<()> {
         let (x, y, w, h) = self.title_menu_geometry(client);
         self.conn.configure_window(
             self.ui.title_menu,
@@ -494,13 +500,27 @@ impl Aurora {
                 .height(u32::from(h))
                 .stack_mode(StackMode::ABOVE),
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn toggle_title_menu(&mut self, client: Window) -> AnyResult<()> {
+        if self.title_menu_open == Some(client) {
+            return self.hide_title_menu();
+        }
+        self.title_menu_open = Some(client);
+        self.title_menu_workspaces = false;
+        self.configure_title_menu(client)?;
         self.conn.map_window(self.ui.title_menu)?;
+        // Sync so the override-redirect window is viewable before we draw into it
+        // (without a compositor an early put_image would otherwise be dropped).
+        self.conn.sync()?;
         self.redraw_title_menu()?;
         Ok(())
     }
 
     pub(crate) fn hide_title_menu(&mut self) -> AnyResult<()> {
         if self.title_menu_open.take().is_some() {
+            self.title_menu_workspaces = false;
             self.conn.unmap_window(self.ui.title_menu)?;
         }
         Ok(())
@@ -524,6 +544,35 @@ impl Aurora {
             12,
             Color::rgba(176, 198, 210, 60),
         );
+        if self.title_menu_workspaces {
+            // Workspace picker page: a back row, then one row per workspace.
+            c.draw_text(&self.bold, "‹  Move to workspace", 20, 16, 13.0, INK);
+            c.draw_rect(
+                10,
+                TITLE_MENU_ROW_H - 2,
+                i32::from(w) - 20,
+                1,
+                Color::rgba(176, 198, 210, 90),
+            );
+            for index in 0..self.workspace_count {
+                let y = 8 + (index + 1) as i32 * TITLE_MENU_ROW_H;
+                let current = index == info.workspace;
+                c.draw_text(
+                    &self.regular,
+                    &format!("Workspace {}", index + 1),
+                    40,
+                    y + 8,
+                    13.0,
+                    INK,
+                );
+                if current {
+                    c.draw_round_rect(12, y + 8, 16, 16, 5, Color::rgba(29, 145, 137, 210));
+                    c.draw_line(15, y + 16, 19, y + 20, 2, Color::rgb(255, 255, 255));
+                    c.draw_line(19, y + 20, 25, y + 11, 2, Color::rgb(255, 255, 255));
+                }
+            }
+            return self.upload_canvas(self.ui.title_menu, &c);
+        }
         let items = [
             (
                 "Show on all workspaces",
@@ -537,11 +586,12 @@ impl Aurora {
             ),
             ("Maximize / Restore", None, INK),
             ("Minimize", None, INK),
+            ("Move to workspace  ›", None, INK),
             ("Close...", None, Color::rgb(196, 64, 74)),
         ];
         for (idx, (label, checked, color)) in items.iter().enumerate() {
             let y = 8 + idx as i32 * TITLE_MENU_ROW_H;
-            if idx == 4 {
+            if idx == items.len() - 1 {
                 c.draw_rect(10, y - 2, i32::from(w) - 20, 1, Color::rgba(176, 198, 210, 90));
             }
             c.draw_text(&self.regular, label, 40, y + 8, 13.0, *color);
@@ -564,23 +614,57 @@ impl Aurora {
         let Some(client) = self.title_menu_open else {
             return Ok(());
         };
+        if self.title_menu_workspaces {
+            let row = ((y - 8) / TITLE_MENU_ROW_H).max(0) as usize;
+            if row == 0 {
+                // Back to the main title menu page.
+                self.title_menu_workspaces = false;
+                self.configure_title_menu(client)?;
+                self.conn.sync()?;
+                self.redraw_title_menu()?;
+                return Ok(());
+            }
+            let workspace = row - 1;
+            self.hide_title_menu()?;
+            if workspace < self.workspace_count {
+                self.move_client_to_workspace(client, workspace)?;
+            }
+            return Ok(());
+        }
         let idx = ((y - 8) / TITLE_MENU_ROW_H).clamp(0, TITLE_MENU_ITEMS as i32 - 1) as usize;
-        self.hide_title_menu()?;
         match idx {
             0 => {
+                self.hide_title_menu()?;
                 let sticky = self.clients.get(&client).is_some_and(|info| info.sticky);
                 self.set_sticky(client, !sticky)?;
             }
             1 => {
+                self.hide_title_menu()?;
                 let fullscreen = self
                     .clients
                     .get(&client)
                     .is_some_and(|info| info.fullscreen);
                 self.set_fullscreen(client, !fullscreen)?;
             }
-            2 => self.toggle_maximize_client(client)?,
-            3 => self.minimize_client(client)?,
-            _ => self.show_close_confirm(client)?,
+            2 => {
+                self.hide_title_menu()?;
+                self.toggle_maximize_client(client)?;
+            }
+            3 => {
+                self.hide_title_menu()?;
+                self.minimize_client(client)?;
+            }
+            4 => {
+                // Open the workspace picker submenu in place (keep the menu open).
+                self.title_menu_workspaces = true;
+                self.configure_title_menu(client)?;
+                self.conn.sync()?;
+                self.redraw_title_menu()?;
+            }
+            _ => {
+                self.hide_title_menu()?;
+                self.show_close_confirm(client)?;
+            }
         }
         Ok(())
     }
@@ -982,7 +1066,8 @@ impl Aurora {
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         for (window, w, h) in [
             (
                 self.ui.title_menu,
@@ -1008,7 +1093,8 @@ impl Aurora {
         let tooltip_aux = CreateWindowAux::new()
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         self.conn.create_window(
             self.depth,
             self.ui.tooltip,

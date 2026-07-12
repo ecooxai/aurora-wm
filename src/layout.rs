@@ -251,6 +251,12 @@ impl Aurora {
     }
 
     pub(crate) fn raise_chrome(&self) -> AnyResult<()> {
+        // Keep the dock above app windows at all times so nothing can cover it (a covering
+        // window would otherwise leave the dock area unpainted / black without a compositor).
+        self.conn.configure_window(
+            self.ui.dock,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
         self.conn.configure_window(
             self.ui.topbar,
             &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
@@ -499,8 +505,10 @@ impl Aurora {
     }
 
     pub(crate) fn app_menu_geometry(&self) -> (i16, i16, u16, u16) {
-        let width = if self.app_menu_more { 590u16 } else { 260u16 };
-        let height = if self.app_menu_more { 500u16 } else { 360u16 };
+        let width = if self.app_menu_more { 700u16 } else { 420u16 }
+            .min(self.screen_width.saturating_sub(36));
+        let height = if self.app_menu_more { 540u16 } else { 350u16 }
+            .min(self.screen_height.saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + 24));
         let dock = self.dock_geometry();
         let x = dock.0.max(18);
         let y = dock.1.saturating_sub(height as i16 + 10);

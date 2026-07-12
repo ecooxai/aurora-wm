@@ -230,6 +230,27 @@ impl Aurora {
         }
     }
 
+    pub(crate) fn launch_desktop_app_matching(
+        &mut self,
+        name_fragments: &[&str],
+        fallback_commands: &[&str],
+    ) -> bool {
+        let entries = read_desktop_entries();
+        for fragment in name_fragments {
+            if let Some(entry) = entries.iter().find(|entry| {
+                entry.name.to_ascii_lowercase().contains(&fragment.to_ascii_lowercase())
+                    && !entry.command.trim().is_empty()
+            }) {
+                if self.spawn_configured_app(&entry.command, None) {
+                    return true;
+                }
+            }
+        }
+        fallback_commands
+            .iter()
+            .any(|command| self.spawn_configured_app(command, None))
+    }
+
     pub(crate) fn spawn_configured_app(&self, command: &str, path: Option<&Path>) -> bool {
         if command.trim().is_empty() {
             return false;

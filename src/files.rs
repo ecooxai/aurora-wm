@@ -75,19 +75,14 @@ pub(crate) fn app_menu_items() -> Vec<AppMenuItem> {
             action: AppAction::Browser,
         },
         AppMenuItem {
-            label: "Pictures",
-            hint: "Browse images",
-            action: AppAction::Pictures,
+            label: "Camera",
+            hint: "Take photos",
+            action: AppAction::Camera,
         },
         AppMenuItem {
-            label: "Music",
-            hint: "Browse audio",
-            action: AppAction::Music,
-        },
-        AppMenuItem {
-            label: "Videos",
-            hint: "Browse movies",
-            action: AppAction::Videos,
+            label: "Recorder",
+            hint: "Record audio or screen",
+            action: AppAction::Recorder,
         },
         AppMenuItem {
             label: "Settings",
@@ -100,6 +95,131 @@ pub(crate) fn app_menu_items() -> Vec<AppMenuItem> {
             action: AppAction::More,
         },
     ]
+}
+
+fn normalized_search_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (row, left_ch) in left.chars().enumerate() {
+        let mut current = vec![row + 1];
+        for (col, right_ch) in right.iter().enumerate() {
+            current.push(
+                (previous[col + 1] + 1)
+                    .min(current[col] + 1)
+                    .min(previous[col] + usize::from(left_ch != *right_ch)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+pub(crate) fn fuzzy_app_score(query: &str, entry: &DesktopEntry) -> Option<usize> {
+    let query = normalized_search_text(query);
+    if query.is_empty() {
+        return Some(0);
+    }
+    let searchable = format!(
+        "{} {} {} {}",
+        entry.name, entry.category, entry.categories, entry.keywords
+    )
+    .to_ascii_lowercase();
+    let joined = normalized_search_text(&searchable);
+    if let Some(position) = joined.find(&query) {
+        return Some(position);
+    }
+
+    let mut best = edit_distance(&query, &normalized_search_text(&entry.name));
+    for word in searchable.split(|ch: char| !ch.is_alphanumeric()) {
+        if !word.is_empty() {
+            best = best.min(edit_distance(&query, &normalized_search_text(word)));
+        }
+    }
+    let tolerance = 2usize.max((query.chars().count() + 2) / 3);
+    (best <= tolerance).then_some(100 + best)
+}
+
+pub(crate) fn app_catalog_rows(
+    query: &str,
+    expanded_categories: &HashSet<String>,
+) -> Vec<AppCatalogRow> {
+    let searching = !query.trim().is_empty();
+    let mut entries = read_desktop_entries()
+        .into_iter()
+        .filter_map(|entry| fuzzy_app_score(query, &entry).map(|score| (score, entry)))
+        .collect::<Vec<_>>();
+    entries.sort_by(|(score_a, a), (score_b, b)| {
+        score_a
+            .cmp(score_b)
+            .then(category_rank(&a.category).cmp(&category_rank(&b.category)))
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    let mut rows = Vec::new();
+    for category in ["Internet", "System", "Program", "Media", "Other"] {
+        let category_entries = entries
+            .iter()
+            .filter(|(_, entry)| entry.category == category)
+            .collect::<Vec<_>>();
+        if category_entries.is_empty() {
+            continue;
+        }
+        let expanded = searching || expanded_categories.contains(category);
+        rows.push(AppCatalogRow::Category {
+            name: category.to_string(),
+            count: category_entries.len(),
+            expanded,
+        });
+        if expanded {
+            rows.extend(category_entries.into_iter().map(|(_, entry)| AppCatalogRow::App {
+                name: entry.name.clone(),
+                command: entry.command.clone(),
+            }));
+        }
+    }
+    rows
+}
+
+#[cfg(test)]
+mod app_search_tests {
+    use super::*;
+
+    fn entry(name: &str) -> DesktopEntry {
+        DesktopEntry {
+            name: name.to_string(),
+            category: "Internet".to_string(),
+            command: "true".to_string(),
+            categories: "Network;WebBrowser;".to_string(),
+            mime_types: String::new(),
+            keywords: "web;browser;".to_string(),
+        }
+    }
+
+    #[test]
+    fn fuzzy_search_tolerates_missing_and_wrong_characters() {
+        let chrome = entry("Google Chrome");
+        assert!(fuzzy_app_score("gogle", &chrome).is_some());
+        assert!(fuzzy_app_score("chrom", &chrome).is_some());
+        assert!(fuzzy_app_score("zzqq", &chrome).is_none());
+    }
+}
+
+fn category_rank(category: &str) -> usize {
+    match category {
+        "Internet" => 0,
+        "System" => 1,
+        "Program" => 2,
+        "Media" => 3,
+        _ => 4,
+    }
 }
 
 pub(crate) fn folder_entries_for(mode: FolderMode, sort: FolderSort) -> Vec<FolderEntry> {

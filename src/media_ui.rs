@@ -869,9 +869,19 @@ impl Aurora {
     }
 
     pub(crate) fn handle_app_menu_click(&mut self, button: u8, x: i32, y: i32) -> AnyResult<()> {
-        if self.app_menu_more && x >= 270 && (button == 4 || button == 5) {
-            let entries = read_desktop_entries();
-            let max_scroll = entries.len().saturating_sub(15);
+        let (_, _, w, h) = self.app_menu_geometry();
+        if button == 1 && x >= 92 && x <= i32::from(w) - 18 && (11..=45).contains(&y) {
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.ui.app_menu, CURRENT_TIME)?;
+            return Ok(());
+        }
+        if self.app_menu_more && x >= 264 && (button == 4 || button == 5) {
+            let rows = app_catalog_rows(
+                &self.app_menu_query,
+                &self.app_menu_expanded_categories,
+            );
+            let visible = ((i32::from(h) - 100) / 30).max(1) as usize;
+            let max_scroll = rows.len().saturating_sub(visible);
             if button == 4 {
                 self.app_menu_scroll = self.app_menu_scroll.saturating_sub(3);
             } else {
@@ -880,56 +890,79 @@ impl Aurora {
             self.redraw_app_menu()?;
             return Ok(());
         }
-        if self.app_menu_more && x >= 270 && button == 1 {
-            let entries = read_desktop_entries();
-            let visible = 15usize;
-            let start = self.app_menu_scroll.min(entries.len().saturating_sub(1));
-            let mut cy_draw = 56;
-            let mut current = String::new();
-            for entry in entries.iter().skip(start).take(visible) {
-                if entry.category != current {
-                    current = entry.category.clone();
-                    cy_draw += 22;
+        if self.app_menu_more && x >= 264 && button == 1 && y >= 88 {
+            let rows = app_catalog_rows(
+                &self.app_menu_query,
+                &self.app_menu_expanded_categories,
+            );
+            let visible = ((i32::from(h) - 100) / 30).max(1) as usize;
+            let start = self
+                .app_menu_scroll
+                .min(rows.len().saturating_sub(visible));
+            let row_idx = start + ((y - 88) / 30).max(0) as usize;
+            if let Some(row) = rows.get(row_idx) {
+                match row {
+                    AppCatalogRow::Category { name, .. } if self.app_menu_query.is_empty() => {
+                        if !self.app_menu_expanded_categories.remove(name) {
+                            self.app_menu_expanded_categories.insert(name.clone());
+                        }
+                        self.app_menu_scroll = 0;
+                        self.redraw_app_menu()?;
+                    }
+                    AppCatalogRow::Category { .. } => {}
+                    AppCatalogRow::App { command, .. } => {
+                        if self.spawn_configured_app(command, None) {
+                            self.hide_app_menu()?;
+                        }
+                    }
                 }
-                if (cy_draw - 14..=cy_draw + 8).contains(&y) {
-                    self.spawn_configured_app(&entry.command, None);
-                    self.app_menu_visible = false;
-                    self.app_menu_more = false;
-                    self.app_menu_scroll = 0;
-                    self.conn.unmap_window(self.ui.app_menu)?;
-                    return Ok(());
-                }
-                cy_draw += 24;
             }
             return Ok(());
         }
-        let idx = (y - 53) / 42;
-        if idx < 0 {
+        if !self.app_menu_more && !self.app_menu_query.is_empty() && button == 1 {
+            let idx = (y - 59) / 42;
+            if idx >= 0 && x >= 14 {
+                let matches = app_catalog_rows(
+                    &self.app_menu_query,
+                    &self.app_menu_expanded_categories,
+                )
+                .into_iter()
+                .filter_map(|row| match row {
+                    AppCatalogRow::App { command, .. } => Some(command),
+                    _ => None,
+                })
+                .take(6)
+                .collect::<Vec<_>>();
+                if let Some(command) = matches.get(idx as usize) {
+                    if self.spawn_configured_app(command, None) {
+                        self.hide_app_menu()?;
+                    }
+                }
+            }
             return Ok(());
         }
+        if button != 1 || x < 14 || (self.app_menu_more && x > 252) {
+            return Ok(());
+        }
+        let idx = (y - 59) / 42;
         let apps = app_menu_items();
-        let Some(item) = apps.get(idx as usize) else {
+        let Some(item) = (idx >= 0).then(|| apps.get(idx as usize)).flatten() else {
             return Ok(());
         };
         match item.action {
             AppAction::Terminal => self.launch_terminal(),
             AppAction::Browser => self.launch_browser(),
-            AppAction::Pictures => {
-                if !self.launch_file_manager(&folder_path_for(FolderMode::Pictures)) {
-                    self.show_folder(FolderMode::Pictures, true)?;
-                }
+            AppAction::Camera => {
+                self.launch_desktop_app_matching(&["snapshot", "camera", "cheese"], &["snapshot"]);
             }
-            AppAction::Music => {
-                if !self.launch_file_manager(&folder_path_for(FolderMode::Music)) {
-                    self.show_folder(FolderMode::Music, true)?;
-                }
-            }
-            AppAction::Videos => {
-                if !self.launch_file_manager(&folder_path_for(FolderMode::Videos)) {
-                    self.show_folder(FolderMode::Videos, true)?;
-                }
+            AppAction::Recorder => {
+                self.launch_desktop_app_matching(
+                    &["recorder", "obs studio", "screencast"],
+                    &["obs"],
+                );
             }
             AppAction::Settings => {
+                self.hide_app_menu()?;
                 self.settings_visible = true;
                 self.settings_front = true;
                 self.settings_hidden_at = None;
@@ -939,14 +972,21 @@ impl Aurora {
                 self.raise_ui()?;
                 self.request_settings_data(self.settings.tab);
                 self.redraw_settings()?;
+                self.redraw_topbar()?;
+                return Ok(());
             }
             AppAction::More => {
                 self.app_menu_more = !self.app_menu_more;
                 self.app_menu_scroll = 0;
+                if self.app_menu_more {
+                    self.app_menu_expanded_categories.clear();
+                }
                 let menu = self.app_menu_geometry();
                 self.conn.configure_window(
                     self.ui.app_menu,
                     &ConfigureWindowAux::new()
+                        .x(i32::from(menu.0))
+                        .y(i32::from(menu.1))
                         .width(u32::from(menu.2))
                         .height(u32::from(menu.3)),
                 )?;
@@ -954,10 +994,7 @@ impl Aurora {
                 return Ok(());
             }
         }
-        self.app_menu_visible = false;
-        self.app_menu_more = false;
-        self.app_menu_scroll = 0;
-        self.conn.unmap_window(self.ui.app_menu)?;
+        self.hide_app_menu()?;
         Ok(())
     }
 

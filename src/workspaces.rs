@@ -289,6 +289,58 @@ impl Aurora {
         self.raise_ui()
     }
 
+    pub(crate) fn move_client_to_workspace(
+        &mut self,
+        client: Window,
+        workspace: usize,
+    ) -> AnyResult<()> {
+        if workspace >= self.workspace_count {
+            return Ok(());
+        }
+        let Some(mut info) = self.clients.get(&client).copied() else {
+            return Ok(());
+        };
+        if info.workspace == workspace {
+            return Ok(());
+        }
+        info.workspace = workspace;
+        self.clients.insert(client, info);
+
+        // Keep EWMH _NET_WM_DESKTOP in sync on both the client and its frame.
+        if let Ok(desktop_atom) = self.atom(b"_NET_WM_DESKTOP") {
+            if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    info.window,
+                    desktop_atom,
+                    cardinal_atom,
+                    &[workspace as u32],
+                );
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    info.frame,
+                    desktop_atom,
+                    cardinal_atom,
+                    &[workspace as u32],
+                );
+            }
+        }
+
+        // If it left the active workspace (and isn't sticky), hide it there.
+        if !info.sticky && workspace != self.active_workspace && info.mapped {
+            self.ignored_unmaps.push(info.frame);
+            self.conn.unmap_window(info.frame)?;
+            if self.active_client == Some(client) {
+                self.active_client = None;
+                self.update_active_window_property()?;
+                self.conn
+                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+            }
+        }
+        self.redraw_dock()?;
+        Ok(())
+    }
+
     pub(crate) fn open_settings_tab(&mut self, tab: SettingsTab) -> AnyResult<()> {
         if self.settings_visible && self.settings.tab == tab {
             if !self.settings_front {

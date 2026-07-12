@@ -143,11 +143,20 @@ pub struct ImageView {
     pub pixels: Vec<u8>, // RGBA
     pub width: u32,
     pub height: u32,
+    /// Native resolution of the image on disk (before fit-to-view scaling).
+    pub orig_width: u32,
+    pub orig_height: u32,
+    /// User zoom factor applied on top of the fit-to-view size.
+    pub zoom: f32,
     pub error: Option<String>,
 }
 
 impl ImageView {
     pub fn open(path: &Path, max_w: u32, max_h: u32) -> Self {
+        Self::open_zoomed(path, max_w, max_h, 1.0)
+    }
+
+    pub fn open_zoomed(path: &Path, max_w: u32, max_h: u32, zoom: f32) -> Self {
         match fs::read(path)
             .map_err(|e| e.to_string())
             .and_then(|bytes| image::load_from_memory(&bytes).map_err(|e| e.to_string()))
@@ -155,9 +164,10 @@ impl ImageView {
             Ok(img) => {
                 let img = img.to_rgba8();
                 let (iw, ih) = img.dimensions();
-                let scale = (max_w as f32 / iw as f32)
+                let fit = (max_w as f32 / iw as f32)
                     .min(max_h as f32 / ih as f32)
                     .min(1.0);
+                let scale = (fit * zoom.max(0.05)).max(0.001);
                 let nw = ((iw as f32 * scale) as u32).max(1);
                 let nh = ((ih as f32 * scale) as u32).max(1);
                 // Lanczos3 gives noticeably sharper downscaling than Triangle.
@@ -168,6 +178,9 @@ impl ImageView {
                     pixels: resized.into_raw(),
                     width: nw,
                     height: nh,
+                    orig_width: iw,
+                    orig_height: ih,
+                    zoom,
                     error: None,
                 }
             }
@@ -176,6 +189,9 @@ impl ImageView {
                 pixels: Vec::new(),
                 width: 0,
                 height: 0,
+                orig_width: 0,
+                orig_height: 0,
+                zoom,
                 error: Some(err),
             },
         }

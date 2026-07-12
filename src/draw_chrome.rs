@@ -600,7 +600,7 @@ impl Aurora {
                     44,
                     12,
                     if active {
-                        Color::rgba(172, 218, 255, 235)
+                        Color::rgba(28, 67, 111, 242)
                     } else {
                         Color::rgba(255, 255, 255, 235)
                     },
@@ -1027,67 +1027,170 @@ impl Aurora {
             Color::rgba(248, 253, 255, 232),
         );
         c.draw_text(&self.bold, "Apps", 20, 18, 20.0, INK);
-        let apps = app_menu_items();
-        for (idx, app) in apps.iter().enumerate() {
-            let row_y = 58 + idx as i32 * 42;
-            c.draw_round_rect(
-                14,
-                row_y - 5,
-                i32::from(w) - 28,
-                34,
-                9,
-                Color::rgba(255, 255, 255, 120),
-            );
-            draw_launcher_icon(&mut c, idx, 34, row_y + 12);
-            c.draw_text(&self.bold, app.label, 58, row_y, 13.0, INK);
-            c.draw_text(&self.regular, app.hint, 58, row_y + 17, 10.0, MUTED);
+
+        let search_x = 92;
+        let search_w = i32::from(w) - search_x - 18;
+        c.draw_round_rect(search_x, 11, search_w, 34, 11, Color::rgba(255, 255, 255, 205));
+        c.draw_round_rect(
+            search_x + 1,
+            12,
+            search_w - 2,
+            32,
+            10,
+            Color::rgba(176, 198, 210, 75),
+        );
+        draw_search_icon(&mut c, search_x + 18, 28, MINT_DARK);
+        let search_label = if self.app_menu_query.is_empty() {
+            "Search all apps (typos are okay)"
+        } else {
+            &self.app_menu_query
+        };
+        c.draw_text(
+            &self.regular,
+            &compact(search_label, if self.app_menu_more { 62 } else { 32 }),
+            search_x + 36,
+            20,
+            12.0,
+            if self.app_menu_query.is_empty() { MUTED } else { INK },
+        );
+        if self.app_menu_visible && !self.app_menu_query.is_empty() {
+            let shown_query = compact(&self.app_menu_query, if self.app_menu_more { 62 } else { 32 });
+            let cursor_x = search_x
+                + 38
+                + measure_text(&self.regular, &shown_query, 12.0) as i32;
+            c.draw_rect(cursor_x.min(search_x + search_w - 10), 19, 1, 16, MINT_DARK);
         }
+
+        let compact_searching = !self.app_menu_more && !self.app_menu_query.is_empty();
+        if compact_searching {
+            let matches = app_catalog_rows(
+                &self.app_menu_query,
+                &self.app_menu_expanded_categories,
+            )
+            .into_iter()
+            .filter_map(|row| match row {
+                AppCatalogRow::App { name, command } => Some((name, command)),
+                _ => None,
+            })
+            .take(6)
+            .collect::<Vec<_>>();
+            if matches.is_empty() {
+                c.draw_text(&self.regular, "No close matches", 20, 76, 12.0, MUTED);
+            }
+            for (idx, (name, _)) in matches.iter().enumerate() {
+                let row_y = 64 + idx as i32 * 42;
+                c.draw_round_rect(
+                    14,
+                    row_y - 5,
+                    i32::from(w) - 28,
+                    34,
+                    9,
+                    Color::rgba(255, 255, 255, 120),
+                );
+                c.draw_circle(34, row_y + 12, 8, Color::rgba(75, 142, 177, 55));
+                c.draw_circle(34, row_y + 12, 4, Color::rgba(75, 142, 177, 210));
+                c.draw_text(&self.bold, &compact(name, 38), 58, row_y + 1, 13.0, INK);
+                c.draw_text(&self.regular, "Fuzzy match", 58, row_y + 17, 10.0, MUTED);
+            }
+        } else {
+            let apps = app_menu_items();
+            for (idx, app) in apps.iter().enumerate() {
+                let row_y = 64 + idx as i32 * 42;
+                let row_w = if self.app_menu_more { 238 } else { i32::from(w) - 28 };
+                c.draw_round_rect(
+                    14,
+                    row_y - 5,
+                    row_w,
+                    34,
+                    9,
+                    Color::rgba(255, 255, 255, 120),
+                );
+                draw_launcher_icon(&mut c, idx, 34, row_y + 12);
+                c.draw_text(&self.bold, app.label, 58, row_y, 13.0, INK);
+                c.draw_text(&self.regular, app.hint, 58, row_y + 17, 10.0, MUTED);
+            }
+        }
+
         if self.app_menu_more {
-            let x0 = 280;
+            let x0 = 276;
             c.draw_rect(
                 x0 - 12,
-                20,
+                58,
                 1,
-                i32::from(h) - 40,
+                i32::from(h) - 76,
                 Color::rgba(176, 198, 210, 100),
             );
-            c.draw_text(&self.bold, "Desktop Apps", x0, 18, 18.0, INK);
-            let entries = read_desktop_entries();
-            let visible = 15usize;
-            let start = self.app_menu_scroll.min(entries.len().saturating_sub(1));
-            let mut y = 56;
-            let mut current = String::new();
-            for entry in entries.iter().skip(start).take(visible) {
-                if entry.category != current {
-                    current = entry.category.clone();
-                    c.draw_text(&self.bold, &current, x0, y, 12.0, MINT_DARK);
-                    y += 22;
+            c.draw_text(&self.bold, "All apps", x0, 62, 16.0, INK);
+            let rows = app_catalog_rows(
+                &self.app_menu_query,
+                &self.app_menu_expanded_categories,
+            );
+            let visible = ((i32::from(h) - 100) / 30).max(1) as usize;
+            let max_scroll = rows.len().saturating_sub(visible);
+            let start = self.app_menu_scroll.min(max_scroll);
+            let mut row_y = 92;
+            for row in rows.iter().skip(start).take(visible) {
+                match row {
+                    AppCatalogRow::Category { name, count, expanded } => {
+                        c.draw_round_rect(
+                            x0,
+                            row_y - 4,
+                            i32::from(w) - x0 - 26,
+                            26,
+                            8,
+                            Color::rgba(214, 239, 236, 165),
+                        );
+                        draw_catalog_chevron(&mut c, x0 + 13, row_y + 9, *expanded, MINT_DARK);
+                        c.draw_text(&self.bold, name, x0 + 28, row_y + 1, 12.0, MINT_DARK);
+                        c.draw_text(
+                            &self.regular,
+                            &count.to_string(),
+                            i32::from(w) - 48,
+                            row_y + 1,
+                            11.0,
+                            MUTED,
+                        );
+                    }
+                    AppCatalogRow::App { name, .. } => {
+                        c.draw_round_rect(
+                            x0 + 10,
+                            row_y - 4,
+                            i32::from(w) - x0 - 36,
+                            26,
+                            8,
+                            Color::rgba(255, 255, 255, 105),
+                        );
+                        c.draw_circle(x0 + 24, row_y + 9, 4, Color::rgba(75, 142, 177, 190));
+                        c.draw_text(
+                            &self.regular,
+                            &compact(name, 37),
+                            x0 + 38,
+                            row_y + 1,
+                            12.0,
+                            INK,
+                        );
+                    }
                 }
-                c.draw_text(
-                    &self.regular,
-                    &compact(&entry.name, 30),
-                    x0 + 14,
-                    y,
-                    12.0,
-                    INK,
-                );
-                y += 24;
+                row_y += 30;
             }
-            if entries.len() > visible {
-                let track_x = i32::from(w) - 22;
-                let track_h = i32::from(h) - 86;
-                c.draw_round_rect(track_x, 54, 6, track_h, 3, Color::rgba(176, 198, 210, 95));
-                let thumb_h = ((track_h as f32 * visible as f32 / entries.len() as f32) as i32)
+            if rows.is_empty() {
+                c.draw_text(&self.regular, "No close matches", x0, 100, 12.0, MUTED);
+            }
+            if rows.len() > visible {
+                let track_x = i32::from(w) - 18;
+                let track_h = i32::from(h) - 104;
+                c.draw_round_rect(track_x, 90, 5, track_h, 3, Color::rgba(176, 198, 210, 95));
+                let thumb_h = ((track_h as f32 * visible as f32 / rows.len() as f32) as i32)
                     .max(34)
                     .min(track_h);
-                let max_scroll = entries.len().saturating_sub(visible).max(1);
-                let thumb_y = 54
+                let max_scroll = max_scroll.max(1);
+                let thumb_y = 90
                     + ((track_h - thumb_h) as f32 * self.app_menu_scroll.min(max_scroll) as f32
                         / max_scroll as f32) as i32;
                 c.draw_round_rect(
                     track_x,
                     thumb_y,
-                    6,
+                    5,
                     thumb_h,
                     3,
                     Color::rgba(29, 145, 137, 185),

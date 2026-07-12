@@ -1,0 +1,2 @@
+bash: xwininfo: command not found
+_NET_SUPPORTING_WM_CHECK:  no such atom on any window.

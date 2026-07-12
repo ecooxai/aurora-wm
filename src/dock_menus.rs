@@ -171,6 +171,10 @@ impl Aurora {
         self.app_menu_visible = !self.app_menu_visible;
         if self.app_menu_visible {
             self.hide_dock_more_menu()?;
+            self.app_menu_more = false;
+            self.app_menu_scroll = 0;
+            self.app_menu_query.clear();
+            self.app_menu_expanded_categories.clear();
             let menu = self.app_menu_geometry();
             self.conn.configure_window(
                 self.ui.app_menu,
@@ -182,9 +186,24 @@ impl Aurora {
                     .stack_mode(StackMode::ABOVE),
             )?;
             self.conn.map_window(self.ui.app_menu)?;
+            let _ = self
+                .conn
+                .grab_keyboard(
+                    false,
+                    self.ui.app_menu,
+                    CURRENT_TIME,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )?
+                .reply();
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.ui.app_menu, CURRENT_TIME)?;
             self.redraw_app_menu()?;
         } else {
+            self.conn.ungrab_keyboard(CURRENT_TIME)?;
             self.conn.unmap_window(self.ui.app_menu)?;
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
         }
         self.raise_ui()?;
         Ok(())
@@ -193,7 +212,14 @@ impl Aurora {
     pub(crate) fn hide_app_menu(&mut self) -> AnyResult<()> {
         if self.app_menu_visible {
             self.app_menu_visible = false;
+            self.app_menu_more = false;
+            self.app_menu_scroll = 0;
+            self.app_menu_query.clear();
+            self.app_menu_expanded_categories.clear();
+            self.conn.ungrab_keyboard(CURRENT_TIME)?;
             self.conn.unmap_window(self.ui.app_menu)?;
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
         }
         Ok(())
     }
@@ -246,7 +272,7 @@ impl Aurora {
                     32,
                     8,
                     if active {
-                        Color::rgba(172, 218, 255, 180)
+                        Color::rgba(28, 67, 111, 225)
                     } else {
                         Color::rgba(255, 255, 255, 120)
                     },
@@ -332,6 +358,9 @@ impl Aurora {
             self.app_menu_visible = false;
             self.app_menu_more = false;
             self.app_menu_scroll = 0;
+            self.app_menu_query.clear();
+            self.app_menu_expanded_categories.clear();
+            let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
             let _ = self.conn.unmap_window(self.ui.app_menu);
             self.aurora_menu_about = false;
             self.aurora_menu_restart_confirm = false;

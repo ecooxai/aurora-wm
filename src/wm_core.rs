@@ -221,6 +221,8 @@ impl Aurora {
             app_menu_visible: false,
             app_menu_more: false,
             app_menu_scroll: 0,
+            app_menu_query: String::new(),
+            app_menu_expanded_categories: HashSet::new(),
             dock_more_visible: false,
             aurora_menu_visible: false,
             aurora_menu_about: false,
@@ -276,6 +278,7 @@ impl Aurora {
             alt_tab_windows: Vec::new(),
             choose_file_mode: false,
             title_menu_open: None,
+            title_menu_workspaces: false,
             confirm_close: None,
             tooltip_shown: None,
         };
@@ -395,7 +398,7 @@ impl Aurora {
                 } else {
                     let moved = (i32::from(pointer.root_x) - i32::from(pending.root_x)).abs() > 4
                         || (i32::from(pointer.root_y) - i32::from(pending.root_y)).abs() > 4;
-                    if moved && pending.pressed_at.elapsed() >= Duration::from_millis(500) {
+                    if moved && self.drag.is_none() {
                         self.pending_client_drag = None;
                         self.start_drag(pending.client, pointer.root_x, pointer.root_y)?;
                     } else if pending.pressed_at.elapsed() >= Duration::from_secs(2) {
@@ -771,7 +774,8 @@ impl Aurora {
                     | EventMask::LEAVE_WINDOW,
             )
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         self.conn.create_window(
             self.depth,
             self.ui.topbar,
@@ -791,7 +795,8 @@ impl Aurora {
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         self.conn.create_window(
             self.depth,
             self.ui.dock,
@@ -901,7 +906,8 @@ impl Aurora {
                     | EventMask::POINTER_MOTION,
             )
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         self.conn.create_window(
             self.depth,
             self.ui.screenshot_overlay,
@@ -919,9 +925,10 @@ impl Aurora {
         let menu = self.app_menu_geometry();
         let menu_aux = CreateWindowAux::new()
             .override_redirect(1)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
+            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::KEY_PRESS)
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         self.conn.create_window(
             self.depth,
             self.ui.app_menu,
@@ -941,7 +948,8 @@ impl Aurora {
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         self.conn.create_window(
             self.depth,
             self.ui.dock_more_menu,
@@ -961,7 +969,8 @@ impl Aurora {
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         self.conn.create_window(
             self.depth,
             self.ui.aurora_menu,
@@ -981,7 +990,8 @@ impl Aurora {
             .override_redirect(1)
             .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         self.conn.create_window(
             self.depth,
             self.ui.clipboard_menu,
@@ -1006,7 +1016,8 @@ impl Aurora {
                     | EventMask::KEY_PRESS,
             )
             .cursor(self.cursor)
-            .background_pixel(0);
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
         for (idx, window) in self.ui.media.iter().copied().enumerate() {
             let media = self.media_geometry(idx);
             self.conn.create_window(

@@ -691,12 +691,7 @@ impl Aurora {
         if previous_active != Some(client) {
             self.redraw_dock()?;
         }
-        self.conn.configure_window(
-            self.ui.dock,
-            &ConfigureWindowAux::new()
-                .sibling(info.frame)
-                .stack_mode(StackMode::BELOW),
-        )?;
+        // The dock stays above app windows (raised by raise_chrome below).
         self.raise_chrome()?;
         if info.fullscreen {
             self.conn.configure_window(

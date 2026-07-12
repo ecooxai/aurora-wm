@@ -166,6 +166,10 @@ impl Aurora {
         self.clipboard_history_page = 0;
         self.configure_clipboard_menu()?;
         self.conn.map_window(self.ui.clipboard_menu)?;
+        // Without a compositor an override-redirect window has no pixel storage until it is
+        // actually viewable, so a put_image issued right after map_window is dropped and the
+        // window shows its (black) background. Sync so the map completes before we draw.
+        self.conn.sync()?;
         self.redraw_clipboard_menu()?;
         self.raise_ui()
     }
