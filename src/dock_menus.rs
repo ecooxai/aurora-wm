@@ -64,17 +64,18 @@ use crate::files::*;
 
 impl Aurora {
     pub(crate) fn handle_dock_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
-        let (_, _, w, h) = self.dock_geometry();
+        let (_, _, _, h) = self.dock_geometry();
         let buttons = self.dock_button_count();
         let task_windows = self.task_client_windows();
-        let stride = 58;
-        let total = buttons as i32 * stride - 12;
-        let mut bx = (i32::from(w) - total) / 2;
         let cy = i32::from(h) / 2;
         for i in 0..buttons {
-            let rx = bx + 7;
-            let ry = cy - 22;
-            if x >= rx && x <= rx + 44 && y >= ry && y <= ry + 44 {
+            let rx = i as i32 * DOCK_STRIDE;
+            let ry = cy - DOCK_ICON_SIZE / 2;
+            if x >= rx
+                && x < rx + DOCK_ICON_SIZE
+                && y >= ry
+                && y < ry + DOCK_ICON_SIZE
+            {
                 if i == 0 {
                     self.dock_last_click = None;
                     self.hide_dock_more_menu()?;
@@ -128,7 +129,6 @@ impl Aurora {
                 }
                 return Ok(());
             }
-            bx += stride;
         }
         self.hide_dock_more_menu()?;
         Ok(())

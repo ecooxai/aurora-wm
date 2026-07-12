@@ -441,11 +441,13 @@ impl Aurora {
 
     pub(crate) fn dock_geometry(&self) -> (i16, i16, u16, u16) {
         let buttons = self.dock_button_count().max(5);
-        let width = (buttons as u16 * 58 + 28)
-            .min(self.screen_width.saturating_sub(24))
-            .max(318u16.min(self.screen_width));
+        let width = (buttons as i32 * DOCK_STRIDE - (DOCK_STRIDE - DOCK_ICON_SIZE))
+            .max(DOCK_ICON_SIZE) as u16;
+        let width = width.min(self.screen_width);
         let x = ((self.screen_width.saturating_sub(width)) / 2) as i16;
-        let y = self.screen_height.saturating_sub(DOCK_HEIGHT + 4) as i16;
+        let y = self
+            .screen_height
+            .saturating_sub(DOCK_HEIGHT + DOCK_BOTTOM_MARGIN) as i16;
         (x, y, width, DOCK_HEIGHT)
     }
 
@@ -582,13 +584,9 @@ impl Aurora {
 
     pub(crate) fn dock_more_menu_geometry(&self) -> (i16, i16, u16, u16) {
         let (dx, dy, dw, _dh) = self.dock_geometry();
-        let buttons = self.dock_button_count();
-        let stride = 58;
-        let total = buttons as i32 * stride - 12;
-        let mut bx = (i32::from(dw) - total) / 2;
-        bx += 15 * stride;
-        let icon_x = bx + 7;
-        let center_x = dx + icon_x as i16 + 22;
+        let mut icon_x = 15 * DOCK_STRIDE;
+        icon_x = icon_x.min(i32::from(dw).saturating_sub(DOCK_ICON_SIZE));
+        let center_x = dx + icon_x as i16 + (DOCK_ICON_SIZE / 2) as i16;
 
         let task_windows = self.task_client_windows();
         let hidden_count = task_windows.len().saturating_sub(10);

@@ -547,23 +547,19 @@ impl Aurora {
         );
 
         let buttons = self.dock_button_count();
-        let stride = 58;
-        let total = buttons as i32 * stride - 12;
-        let mut bx = (i32::from(w) - total) / 2;
         let cy = i32::from(h) / 2;
         for i in 0..buttons {
-            let icon_x = bx + 7;
-            let icon_y = cy - 22;
-            c.draw_round_rect(
-                icon_x + 3,
-                icon_y + 6,
-                42,
-                42,
-                14,
-                Color::rgba(44, 77, 91, 38),
-            );
+            let icon_x = i as i32 * DOCK_STRIDE;
+            let icon_y = cy - DOCK_ICON_SIZE / 2;
             if i < 5 {
-                c.draw_round_rect(icon_x, icon_y, 44, 44, 12, Color::rgba(255, 255, 255, 215));
+                c.draw_round_rect(
+                    icon_x,
+                    icon_y,
+                    DOCK_ICON_SIZE,
+                    DOCK_ICON_SIZE,
+                    DOCK_ICON_RADIUS,
+                    Color::rgba(255, 255, 255, 215),
+                );
                 c.draw_round_rect(
                     icon_x + 1,
                     icon_y + 1,
@@ -619,7 +615,29 @@ impl Aurora {
                     );
                 }
             }
-            bx += stride;
+        }
+
+        if self.shape_supported {
+            let rects = (0..buttons)
+                .flat_map(|i| {
+                    rounded_rect_shape_rects(
+                        (i as i32 * DOCK_STRIDE) as i16,
+                        0,
+                        DOCK_ICON_SIZE as u16,
+                        DOCK_ICON_SIZE as u16,
+                        DOCK_ICON_RADIUS,
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.conn.shape_rectangles(
+                shape::SO::SET,
+                shape::SK::BOUNDING,
+                ClipOrdering::UNSORTED,
+                self.ui.dock,
+                0,
+                0,
+                &rects,
+            )?;
         }
         self.upload_canvas(self.ui.dock, &c)
     }

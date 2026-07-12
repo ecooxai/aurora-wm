@@ -37,7 +37,11 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const TOPBAR_HEIGHT: u16 = 40;
-const DOCK_HEIGHT: u16 = 76;
+const DOCK_ICON_SIZE: i32 = 44;
+const DOCK_ICON_RADIUS: i32 = 12;
+const DOCK_STRIDE: i32 = 50;
+const DOCK_HEIGHT: u16 = DOCK_ICON_SIZE as u16;
+const DOCK_BOTTOM_MARGIN: u16 = 12;
 const TITLEBAR_HEIGHT: u16 = 34;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const COMPOSITED_MOVE_INTERVAL: Duration = Duration::from_millis(16);

@@ -236,6 +236,44 @@ pub(crate) fn rounded_top_shape_rects(width: u16, height: u16, radius: i32) -> V
     rects
 }
 
+pub(crate) fn rounded_rect_shape_rects(
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    radius: i32,
+) -> Vec<Rectangle> {
+    let width_i = i32::from(width);
+    let height_i = i32::from(height);
+    let r = radius.max(0).min(width_i / 2).min(height_i / 2);
+    if r == 0 {
+        return vec![Rectangle { x, y, width, height }];
+    }
+
+    let mut rects = Vec::with_capacity(height as usize);
+    for row in 0..height_i {
+        let corner_y = if row < r {
+            r - row - 1
+        } else if row >= height_i - r {
+            row - (height_i - r)
+        } else {
+            0
+        };
+        let inset = if corner_y == 0 {
+            0
+        } else {
+            r - ((r * r - corner_y * corner_y) as f64).sqrt().round() as i32
+        };
+        rects.push(Rectangle {
+            x: x.saturating_add(inset as i16),
+            y: y.saturating_add(row as i16),
+            width: (width_i - inset * 2).max(1) as u16,
+            height: 1,
+        });
+    }
+    rects
+}
+
 pub(crate) fn create_pointer_cursor(conn: &RustConnection, root: Window) -> AnyResult<Cursor> {
     create_standard_left_ptr_cursor(conn).or_else(|_| create_pixmap_pointer_cursor(conn, root))
 }
