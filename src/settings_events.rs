@@ -589,8 +589,8 @@ impl Aurora {
             self.last_pointer_pos = None;
             if self.settings.auto_power_saver_enabled && self.settings.auto_power_saver_minutes == 0
             {
-                self.settings.auto_power_saver_minutes = 10;
-                self.settings.auto_power_saver_input = "10".to_string();
+                self.settings.auto_power_saver_minutes = 50;
+                self.settings.auto_power_saver_input = "50".to_string();
             }
             if self.settings.auto_power_saver_enabled && self.settings.auto_power_saver_minutes > 0
             {
@@ -611,13 +611,21 @@ impl Aurora {
             self.redraw_settings()?;
             return Ok(());
         }
+        let slider_left = input_x;
+        let slider_right = width - 40;
+        if y >= 168 && y <= 196 && x >= slider_left - 8 && x <= slider_right + 8 {
+            self.settings.auto_power_saver_slider_dragging = true;
+            self.settings.auto_power_saver_editing = false;
+            self.set_auto_power_saver_from_slider(x)?;
+            return Ok(());
+        }
         let modes = [
             PowerMode::Saver,
             PowerMode::Balanced,
             PowerMode::Performance,
         ];
         for (idx, mode) in modes.iter().enumerate() {
-            let row_y = 202 + idx as i32 * 24;
+            let row_y = 228 + idx as i32 * 22;
             if y >= row_y - 7 && y <= row_y + 18 {
                 self.settings.auto_power_saver_editing = false;
                 self.pending_auto_power_saver_apply = None;
@@ -626,6 +634,20 @@ impl Aurora {
                 return Ok(());
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn set_auto_power_saver_from_slider(&mut self, x: i32) -> AnyResult<()> {
+        let width = i32::from(self.settings_geometry().2);
+        let slider_left = SIDEBAR_WIDTH + 40;
+        let slider_width = width - 40 - slider_left;
+        let minutes = auto_power_saver_minutes_from_slider(x, slider_left, slider_width);
+        if minutes != self.settings.auto_power_saver_minutes {
+            self.settings.auto_power_saver_minutes = minutes;
+            self.settings.auto_power_saver_input = minutes.to_string();
+            self.pending_auto_power_saver_apply = Some(Instant::now() + Duration::from_secs(3));
+        }
+        self.redraw_settings()?;
         Ok(())
     }
 

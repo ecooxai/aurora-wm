@@ -265,16 +265,20 @@ pub fn measure_text(font: &Font<'static>, text: &str, size: f32) -> i32 {
 }
 
 pub fn compact(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        value.to_string()
-    } else {
-        let mut out = value
-            .chars()
-            .take(max_chars.saturating_sub(3))
-            .collect::<String>();
-        out.push_str("...");
-        out
+    let mut chars = value.chars();
+    let mut visible = chars
+        .by_ref()
+        .take(max_chars.saturating_add(1))
+        .collect::<String>();
+    if visible.chars().count() <= max_chars {
+        return visible;
     }
+    visible = visible
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect();
+    visible.push_str("...");
+    visible
 }
 
 pub fn compact_path(path: &std::path::Path, max_chars: usize) -> String {

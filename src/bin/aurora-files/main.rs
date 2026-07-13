@@ -9,11 +9,12 @@
 
 mod canvas;
 mod fsmodel;
+mod imgwin;
 mod term;
 mod viewer;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use canvas::*;
 use fsmodel::*;
+use imgwin::{ImgState, IMG_TOP_BAR};
 use rusttype::Font;
 use term::{Tab, TERM_BG};
 use viewer::*;
@@ -46,6 +48,39 @@ const TERMINAL_COPY_DELAY: Duration = Duration::from_secs(2);
 /// Maximum number of folder tabs; opening more replaces the last one.
 const MAX_FOLDER_TABS: usize = 20;
 const TERMINAL_NOTICE_DURATION: Duration = Duration::from_secs(3);
+/// How often the current folder is re-scanned for new/removed entries.
+const DIR_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+/// Height of the toolbar at the top of the text view/editor window.
+const TXT_TOP_BAR: i32 = 40;
+/// Line height of the text view/editor window.
+const TXT_LINE_H: i32 = 18;
+const TEXT_FONT_SIZE: f32 = 13.0;
+
+/// Options in the image window's top-right dropdown menu.
+const IMG_MENU_ITEMS: [&str; 8] = [
+    "Zoom in",
+    "Zoom out",
+    "Reset zoom",
+    "Rotate 90",
+    "Flip horizontal",
+    "Flip vertical",
+    "Crop",
+    "Copy image",
+];
+/// Options in the image window's right-click context menu.
+const IMG_CTX_ITEMS: [&str; 3] = ["Copy image", "Copy path", "Reset zoom"];
+
+/// Geometry of the image window's right-click menu, clamped to the window.
+fn img_ctx_geometry(mx: i32, my: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    let gw = 170;
+    let gh = IMG_CTX_ITEMS.len() as i32 * 28 + 10;
+    (
+        mx.min(w - gw - 6).max(4),
+        my.min(h - gh - 6).max(4),
+        gw,
+        gh,
+    )
+}
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -114,7 +149,7 @@ struct XdndAtoms {
 
 impl XdndAtoms {
     fn intern(conn: &RustConnection) -> AnyResult<Self> {
-        let mut a = |name: &[u8]| -> AnyResult<Atom> {
+        let a = |name: &[u8]| -> AnyResult<Atom> {
             Ok(conn.intern_atom(false, name)?.reply()?.atom)
         };
         Ok(Self {
@@ -141,6 +176,40 @@ struct FileDrag {
     target: Window,
     target_ver: u8,
     accepted: bool,
+    /// Window in which the drag started (main window or image window).
+    src_win: Window,
+}
+
+/// The standalone image viewer window shown at the right of the file list.
+struct ImgWin {
+    window: Window,
+    gc: Gcontext,
+    width: u16,
+    height: u16,
+    maximized: bool,
+    compact: bool,
+    state: ImgState,
+    dirty: bool,
+}
+
+/// The standalone text viewer/editor window shown at the right of the file
+/// list, mirroring the image viewer window.
+struct TxtWin {
+    window: Window,
+    gc: Gcontext,
+    width: u16,
+    height: u16,
+    maximized: bool,
+    compact: bool,
+    selecting: bool,
+    text: TextView,
+    dirty: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PendingOpen {
+    Preview(usize),
+    Open(usize),
 }
 
 struct App {
@@ -153,9 +222,12 @@ struct App {
     depth: u8,
     width: u16,
     height: u16,
+    screen_w: u16,
+    screen_h: u16,
     regular: Font<'static>,
     bold: Font<'static>,
     mono: Font<'static>,
+    wm_protocols: Atom,
     wm_delete: Atom,
     current_desktop_atom: Atom,
     open_screenshot_atom: Atom,
@@ -197,6 +269,23 @@ struct App {
     terminal_copy_due: Option<Instant>,
     terminal_notice: Option<(String, Instant)>,
 
+    /// Last time the current folder was re-scanned for changes.
+    last_dir_refresh: Instant,
+    /// Paths known to exist in the current folder (for change detection).
+    known_paths: HashSet<PathBuf>,
+    /// Recently created paths, newest first; shown at the top of the list.
+    recent_paths: Vec<PathBuf>,
+    /// Right-click context menu for a file/folder row: (x, y, entry path).
+    file_menu: Option<(i32, i32, PathBuf)>,
+    /// Path stored by the context menu's "Copy" action, used by "Paste".
+    copied_path: Option<PathBuf>,
+    /// Row pressed with button 1, opened on release if no drag started.
+    pending_open: Option<PendingOpen>,
+    /// The standalone image viewer window, when open.
+    img_win: Option<ImgWin>,
+    /// The standalone text viewer/editor window, when open.
+    txt_win: Option<TxtWin>,
+
     viewer: Option<Viewer>,
     focus: Focus,
     /// Right-click context menu for the image viewer, anchored at (x, y).
@@ -236,6 +325,78 @@ fn normalized_terminal_selection(
     } else {
         (selection.end, selection.start)
     }
+}
+
+/// Translate a printable terminal key into the bytes expected by a PTY.
+/// In particular, Ctrl+V is ASCII SYN (0x16), which lets the shell handle its
+/// normal quoted-insert binding instead of turning it into a clipboard paste.
+fn terminal_printable_input(keysym: u32, ctrl: bool) -> Option<u8> {
+    let ch = u8::try_from(keysym).ok()?;
+    if !(0x20..=0x7e).contains(&ch) {
+        return None;
+    }
+    Some(if ctrl {
+        ch.to_ascii_uppercase().wrapping_sub(b'@') & 0x1f
+    } else {
+        ch
+    })
+}
+
+#[cfg(test)]
+mod terminal_key_tests {
+    use super::terminal_printable_input;
+
+    #[test]
+    fn ctrl_v_is_forwarded_as_shell_control_character() {
+        assert_eq!(terminal_printable_input('v' as u32, true), Some(0x16));
+        assert_eq!(terminal_printable_input('V' as u32, true), Some(0x16));
+    }
+
+    #[test]
+    fn unmodified_v_remains_printable() {
+        assert_eq!(terminal_printable_input('v' as u32, false), Some(b'v'));
+    }
+}
+
+fn text_prefix_width(font: &Font<'static>, line: &str, col: usize) -> i32 {
+    let prefix: String = line.chars().take(col).collect();
+    measure_text(font, &prefix, TEXT_FONT_SIZE)
+}
+
+/// Return the character boundary nearest to a click position in rendered text.
+fn text_column_at_x(font: &Font<'static>, line: &str, x: i32) -> usize {
+    if x <= 0 {
+        return 0;
+    }
+    let mut prefix = String::new();
+    let mut previous = 0;
+    for (col, ch) in line.chars().enumerate() {
+        prefix.push(ch);
+        let next = measure_text(font, &prefix, TEXT_FONT_SIZE);
+        if x < previous + (next - previous) / 2 {
+            return col;
+        }
+        previous = next;
+    }
+    line.chars().count()
+}
+
+fn text_selection_columns(
+    selection: TextSelection,
+    line: usize,
+    char_count: usize,
+) -> Option<(usize, usize)> {
+    let (start, end) = if selection.start <= selection.end {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    };
+    if start == end || line < start.0 || line > end.0 {
+        return None;
+    }
+    let first = if line == start.0 { start.1.min(char_count) } else { 0 };
+    let last = if line == end.0 { end.1.min(char_count) } else { char_count };
+    (last > first).then_some((first, last))
 }
 
 fn copy_text_to_system_clipboard(text: &str) -> bool {
@@ -519,9 +680,12 @@ fn run(args: &[String]) -> AnyResult<()> {
         depth: screen.root_depth,
         width,
         height,
+        screen_w: screen.width_in_pixels,
+        screen_h: screen.height_in_pixels,
         regular: Font::try_from_bytes(FONT_REGULAR).ok_or("font")?,
         bold: Font::try_from_bytes(FONT_BOLD).ok_or("font")?,
         mono: Font::try_from_bytes(FONT_MONO).ok_or("font")?,
+        wm_protocols,
         wm_delete,
         current_desktop_atom,
         open_screenshot_atom,
@@ -564,6 +728,14 @@ fn run(args: &[String]) -> AnyResult<()> {
         terminal_selecting: false,
         terminal_copy_due: None,
         terminal_notice: None,
+        last_dir_refresh: Instant::now(),
+        known_paths: HashSet::new(),
+        recent_paths: Vec::new(),
+        file_menu: None,
+        copied_path: None,
+        pending_open: None,
+        img_win: None,
+        txt_win: None,
         viewer: None,
         image_menu: None,
         xdnd,
@@ -574,6 +746,7 @@ fn run(args: &[String]) -> AnyResult<()> {
             Focus::Files
         },
     };
+    app.reset_dir_watch();
     app.refresh_entries();
     if !start_path.is_dir() {
         app.open_file_by_path(&start_path.clone());
@@ -712,6 +885,7 @@ impl App {
                 .unwrap_or_else(|| "/".into());
         }
         self.cwd = path.clone();
+        self.reset_dir_watch();
         self.refresh_entries();
         self.selected = None;
         self.scroll = 0;
@@ -943,10 +1117,15 @@ impl App {
             }
         });
         if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
+            let parent_name = parent
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "/".into());
             self.entries.insert(
                 0,
                 Entry {
-                    name: "..".into(),
+                    name: format!(".. {parent_name}"),
                     path: parent,
                     kind: FileKind::Directory,
                     size: 0,
@@ -954,6 +1133,62 @@ impl App {
                 },
             );
         }
+        // Hoist recently created entries to the top (below the parent entry),
+        // newest first.
+        if !self.recent_paths.is_empty() {
+            let insert_at = usize::from(self.cwd.parent().is_some());
+            for path in self.recent_paths.iter().rev() {
+                if let Some(pos) = self.entries.iter().position(|entry| entry.path == *path) {
+                    if pos > insert_at {
+                        let entry = self.entries.remove(pos);
+                        self.entries.insert(insert_at, entry);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reset change tracking for the current folder (called on navigation).
+    fn reset_dir_watch(&mut self) {
+        self.recent_paths.clear();
+        self.known_paths = list_dir(&self.cwd, self.show_hidden)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        self.last_dir_refresh = Instant::now();
+    }
+
+    /// Re-scan the current folder every DIR_REFRESH_INTERVAL; new files and
+    /// folders are hoisted to the top of the list. Returns true on change.
+    fn poll_directory_refresh(&mut self) -> bool {
+        if self.viewer_only || self.last_dir_refresh.elapsed() < DIR_REFRESH_INTERVAL {
+            return false;
+        }
+        self.last_dir_refresh = Instant::now();
+        let fresh: HashSet<PathBuf> = list_dir(&self.cwd, self.show_hidden)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        if fresh == self.known_paths {
+            return false;
+        }
+        for path in &fresh {
+            if !self.known_paths.contains(path) && !self.recent_paths.contains(path) {
+                self.recent_paths.insert(0, path.clone());
+            }
+        }
+        self.recent_paths.retain(|path| fresh.contains(path));
+        self.known_paths = fresh;
+        // Keep the selection on the same entry after the list is rebuilt.
+        let selected_path = self
+            .selected
+            .and_then(|idx| self.entries.get(idx))
+            .map(|entry| entry.path.clone());
+        self.refresh_entries();
+        self.selected = selected_path
+            .and_then(|path| self.entries.iter().position(|entry| entry.path == path));
+        self.status = "Folder updated".into();
+        true
     }
 
     fn navigate(&mut self, path: &Path) {
@@ -961,9 +1196,11 @@ impl App {
             return;
         }
         self.cwd = path.to_path_buf();
+        self.reset_dir_watch();
         self.refresh_entries();
         self.selected = None;
         self.scroll = 0;
+        self.file_menu = None;
         self.sort_open = false;
         self.folder_tabs_open = false;
         self.more_open = false;
@@ -996,9 +1233,63 @@ impl App {
         }
     }
 
+    fn preview_entry(&mut self, idx: usize) {
+        let Some(entry) = self.entries.get(idx).cloned() else {
+            return;
+        };
+        if entry.kind == FileKind::Directory {
+            return;
+        }
+        let kind = file_kind_for(&entry.path);
+        match kind {
+            FileKind::Image => self.open_image_window(&entry.path, true),
+            FileKind::Text => self.open_text_window(TextView::open(&entry.path), true),
+            FileKind::Doc => {
+                if let Ok(text) = extract_doc_text(&entry.path) {
+                    self.open_text_window(TextView::from_text(&entry.path, text), true);
+                }
+            }
+            FileKind::Other if std::fs::read_to_string(&entry.path).is_ok() => {
+                self.open_text_window(TextView::open(&entry.path), true);
+            }
+            _ => {}
+        }
+    }
+
     fn open_file_by_path(&mut self, path: &Path) {
         let (_, _, cw, ch) = self.content_rect();
         let kind = file_kind_for(path);
+        if !self.viewer_only {
+            match kind {
+                FileKind::Image => {
+                    self.viewer_close();
+                    self.open_image_window(path, false);
+                    return;
+                }
+                FileKind::Text => {
+                    self.viewer_close();
+                    self.open_text_window(TextView::open(path), false);
+                    return;
+                }
+                FileKind::Doc => {
+                    self.viewer_close();
+                    match extract_doc_text(path) {
+                        Ok(text) => self.open_text_window(TextView::from_text(path, text), false),
+                        Err(err) => self.viewer = Some(Viewer::Info(err)),
+                    }
+                    return;
+                }
+                FileKind::Other => {
+                    // Unknown kinds that read as UTF-8 open in the text window.
+                    if std::fs::read_to_string(path).is_ok() {
+                        self.viewer_close();
+                        self.open_text_window(TextView::open(path), false);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
         self.viewer_close();
         let viewer = match kind {
             FileKind::Text => Viewer::Text(TextView::open(path)),
@@ -1044,6 +1335,995 @@ impl App {
             Some(Viewer::Text(_)) => Focus::Editor,
             _ => Focus::Files,
         };
+    }
+
+    // ------------------------------------------------------------ image window
+
+    /// Normal geometry for a side view window: to the right of the file list.
+    fn side_window_normal_geometry(&self) -> AnyResult<(i16, i16, u16, u16)> {
+        let abs = self
+            .conn
+            .translate_coordinates(self.window, self.root, 0, 0)?
+            .reply()?;
+        let sw = i32::from(self.screen_w);
+        let sh = i32::from(self.screen_h);
+        let want_x = i32::from(abs.dst_x) + i32::from(self.width) + 8;
+        let w = (sw - want_x - 12).clamp(340, 900) as u16;
+        let x = want_x.min(sw - i32::from(w) - 8).max(0) as i16;
+        let h = (i32::from(self.height)).min(sh - 20).max(300) as u16;
+        let y = abs.dst_y.max(10);
+        Ok((x, y, w, h))
+    }
+
+    /// Compact first-click preview: half the normal viewer dimensions.
+    fn side_window_geometry(&self) -> AnyResult<(i16, i16, u16, u16)> {
+        let (x, y, w, h) = self.side_window_normal_geometry()?;
+        Ok((x, y, (w / 2).max(300), (h / 2).max(220)))
+    }
+
+    fn view_window_geometry(&self, compact: bool) -> AnyResult<(i16, i16, u16, u16)> {
+        if compact {
+            self.side_window_geometry()
+        } else {
+            self.side_window_normal_geometry()
+        }
+    }
+
+    /// Target geometry when maximizing a side view window: 80% of the screen,
+    /// centered, kept below the desktop top bar so the window title bar (and
+    /// its close button) always stays visible and clickable.
+    fn side_window_max_geometry(&self) -> (i32, i32, u32, u32) {
+        let sw = i32::from(self.screen_w);
+        let sh = i32::from(self.screen_h);
+        let w = (sw * 4 / 5).clamp(320.min(sw), sw) as u32;
+        let h = (sh * 4 / 5).clamp(240.min(sh), sh) as u32;
+        let x = ((sw - w as i32) / 2).max(0);
+        let y = ((sh - h as i32) / 2).max(48);
+        (x, y, w, h)
+    }
+
+    /// Open or replace an image while preserving the existing viewer surface.
+    fn open_image_window(&mut self, path: &Path, compact: bool) {
+        let Ok((x, y, w, h)) = self.view_window_geometry(compact) else {
+            self.status = "Could not position image window".into();
+            return;
+        };
+        let mut state = ImgState::open(path);
+        state.fit(i32::from(w), i32::from(h));
+        if let Some(win) = self.img_win.as_mut() {
+            if win.state.path == path {
+                win.state.fit(i32::from(w), i32::from(h));
+            } else {
+                win.state = state;
+            }
+            win.maximized = false;
+            win.compact = compact;
+            win.width = w;
+            win.height = h;
+            win.dirty = true;
+            let _ = self.conn.configure_window(
+                win.window,
+                &ConfigureWindowAux::new()
+                    .x(i32::from(x))
+                    .y(i32::from(y))
+                    .width(u32::from(w))
+                    .height(u32::from(h)),
+            );
+            let _ = self.conn.map_window(win.window);
+            let focus = if compact { self.window } else { win.window };
+            let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, focus, x11rb::CURRENT_TIME);
+            let _ = self.conn.flush();
+            return;
+        }
+        if let Some(old) = self.txt_win.take() {
+            let _ = self.conn.change_property8(
+                PropMode::REPLACE,
+                old.window,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                b"Aurora Image",
+            );
+            let _ = self.conn.configure_window(
+                old.window,
+                &ConfigureWindowAux::new()
+                    .x(i32::from(x))
+                    .y(i32::from(y))
+                    .width(u32::from(w))
+                    .height(u32::from(h)),
+            );
+            self.img_win = Some(ImgWin {
+                window: old.window,
+                gc: old.gc,
+                width: w,
+                height: h,
+                maximized: false,
+                compact,
+                state,
+                dirty: true,
+            });
+            let focus = if compact { self.window } else { old.window };
+            let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, focus, x11rb::CURRENT_TIME);
+            let _ = self.conn.flush();
+            return;
+        }
+        match self.create_image_window(state, compact) {
+            Ok(win) => {
+                let focus = if compact { self.window } else { win.window };
+                let _ = self.conn.set_input_focus(
+                    InputFocus::POINTER_ROOT,
+                    focus,
+                    x11rb::CURRENT_TIME,
+                );
+                self.img_win = Some(win);
+            }
+            Err(_) => self.status = "Could not open image window".into(),
+        }
+    }
+
+    fn create_image_window(&mut self, mut state: ImgState, compact: bool) -> AnyResult<ImgWin> {
+        let (x, y, w, h) = self.view_window_geometry(compact)?;
+        let window = self.conn.generate_id()?;
+        self.conn.create_window(
+            self.depth,
+            window,
+            self.root,
+            x,
+            y,
+            w,
+            h,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .background_pixel(0x152742)
+                .event_mask(
+                    EventMask::EXPOSURE
+                        | EventMask::BUTTON_PRESS
+                        | EventMask::BUTTON_RELEASE
+                        | EventMask::POINTER_MOTION
+                        | EventMask::KEY_PRESS
+                        | EventMask::STRUCTURE_NOTIFY,
+                ),
+        )?;
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            b"Aurora Image",
+        )?;
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            b"aurora-files\0Aurora Files\0",
+        )?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            self.wm_protocols,
+            AtomEnum::ATOM,
+            &[self.wm_delete],
+        )?;
+        let gc = self.conn.generate_id()?;
+        self.conn
+            .create_gc(gc, window, &CreateGCAux::new().graphics_exposures(0))?;
+        self.conn.map_window(window)?;
+        self.conn.flush()?;
+        state.fit(i32::from(w), i32::from(h));
+        Ok(ImgWin {
+            window,
+            gc,
+            width: w,
+            height: h,
+            maximized: false,
+            compact,
+            state,
+            dirty: true,
+        })
+    }
+
+    fn close_image_window(&mut self) {
+        if let Some(win) = self.img_win.take() {
+            let _ = self.conn.destroy_window(win.window);
+            let _ = self.conn.free_gc(win.gc);
+            let _ = self.conn.flush();
+        }
+    }
+
+    fn toggle_img_maximize(&mut self) -> AnyResult<()> {
+        if self.img_win.is_none() {
+            return Ok(());
+        }
+        let restore = if self.img_win.as_ref().is_some_and(|win| win.compact) {
+            self.side_window_geometry()?
+        } else {
+            self.side_window_normal_geometry()?
+        };
+        let target = self.side_window_max_geometry();
+        let Some(win) = self.img_win.as_mut() else {
+            return Ok(());
+        };
+        let aux = if win.maximized {
+            // Restore: back to the default spot beside the file list.
+            win.maximized = false;
+            ConfigureWindowAux::new()
+                .x(i32::from(restore.0))
+                .y(i32::from(restore.1))
+                .width(u32::from(restore.2))
+                .height(u32::from(restore.3))
+        } else {
+            // Maximize: grow to 80% of the screen, centered below the top bar.
+            win.maximized = true;
+            ConfigureWindowAux::new()
+                .x(target.0)
+                .y(target.1)
+                .width(target.2)
+                .height(target.3)
+        };
+        self.conn.configure_window(win.window, &aux)?;
+        // Refit once the new size arrives via ConfigureNotify.
+        win.state.user_zoomed = false;
+        win.dirty = true;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Copy the current (possibly edited) image to the system clipboard.
+    fn img_copy_image(&mut self) {
+        let Some(win) = self.img_win.as_mut() else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!(
+            "aurora-files-clip-{}.png",
+            std::process::id()
+        ));
+        let ok = win.state.img.save(&tmp).is_ok() && copy_image_to_system_clipboard(&tmp);
+        win.state.status = if ok {
+            "Image copied to clipboard".into()
+        } else {
+            "Copy failed (install xclip)".into()
+        };
+    }
+
+    fn img_menu_action(&mut self, row: usize, w: i32, h: i32) {
+        if row == 7 {
+            self.img_copy_image();
+            return;
+        }
+        let Some(win) = self.img_win.as_mut() else {
+            return;
+        };
+        match row {
+            0 => win.state.zoom_at(w / 2, (IMG_TOP_BAR + h) / 2, 1.25),
+            1 => win.state.zoom_at(w / 2, (IMG_TOP_BAR + h) / 2, 0.8),
+            2 => win.state.fit(w, h),
+            3 => win.state.rotate90(w, h),
+            4 => win.state.flip_horizontal(),
+            5 => win.state.flip_vertical(),
+            6 => {
+                win.state.crop_mode = !win.state.crop_mode;
+                win.state.crop_drag = None;
+                win.state.status = if win.state.crop_mode {
+                    "Crop: drag to select an area".into()
+                } else {
+                    "Crop cancelled".into()
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn on_img_click(&mut self, x: i32, y: i32, button: u8) {
+        let Some((w, h, ctx_menu, menu_open, crop_mode)) = self.img_win.as_ref().map(|win| {
+            (
+                i32::from(win.width),
+                i32::from(win.height),
+                win.state.ctx_menu,
+                win.state.menu_open,
+                win.state.crop_mode,
+            )
+        }) else {
+            return;
+        };
+        // Right-click context menu takes priority while open.
+        if let Some((mx, my)) = ctx_menu {
+            if let Some(win) = self.img_win.as_mut() {
+                win.state.ctx_menu = None;
+            }
+            let (gx, gy, gw, gh) = img_ctx_geometry(mx, my, w, h);
+            if button == 1 && x >= gx && x < gx + gw && y >= gy && y < gy + gh {
+                let row = ((y - gy - 5) / 28).clamp(0, IMG_CTX_ITEMS.len() as i32 - 1);
+                match row {
+                    0 => self.img_copy_image(),
+                    1 => {
+                        if let Some(win) = self.img_win.as_mut() {
+                            let text = win.state.path.to_string_lossy().into_owned();
+                            win.state.status = if copy_text_to_system_clipboard(&text) {
+                                "Path copied to clipboard".into()
+                            } else {
+                                "Copy failed (install xclip)".into()
+                            };
+                        }
+                    }
+                    _ => {
+                        if let Some(win) = self.img_win.as_mut() {
+                            win.state.fit(w, h);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // Dropdown menu.
+        if menu_open {
+            if let Some(win) = self.img_win.as_mut() {
+                win.state.menu_open = false;
+            }
+            let gx = w - 196;
+            let gy = IMG_TOP_BAR + 4;
+            let gh = IMG_MENU_ITEMS.len() as i32 * 28 + 10;
+            if button == 1 && x >= gx && x < gx + 188 && y >= gy && y < gy + gh {
+                let row = ((y - gy - 5) / 28).clamp(0, IMG_MENU_ITEMS.len() as i32 - 1);
+                self.img_menu_action(row as usize, w, h);
+            }
+            return;
+        }
+        // Toolbar buttons: [menu] [max] [close] at the top right.
+        if y < IMG_TOP_BAR {
+            if button != 1 {
+                return;
+            }
+            if x >= w - 36 && x < w - 8 {
+                self.close_image_window();
+            } else if x >= w - 70 && x < w - 42 {
+                let _ = self.toggle_img_maximize();
+            } else if x >= w - 104 && x < w - 76 {
+                if let Some(win) = self.img_win.as_mut() {
+                    win.state.menu_open = true;
+                }
+            }
+            return;
+        }
+        // Image area.
+        let Some(win) = self.img_win.as_mut() else {
+            return;
+        };
+        match button {
+            4 => win.state.zoom_at(x, y, 1.15),
+            5 => win.state.zoom_at(x, y, 1.0 / 1.15),
+            3 => win.state.ctx_menu = Some((x, y)),
+            1 => {
+                if crop_mode {
+                    win.state.crop_drag = Some((x, y, x, y));
+                } else if win.state.overflows(w, h) {
+                    // Zoomed in: left-drag pans the image.
+                    win.state.panning = Some((x, y));
+                } else {
+                    // Arm a drag-out of the image file to another app.
+                    let path = win.state.path.clone();
+                    let src_win = win.window;
+                    self.file_drag = Some(FileDrag {
+                        path,
+                        start_x: x,
+                        start_y: y,
+                        started: false,
+                        target: 0,
+                        target_ver: 0,
+                        accepted: false,
+                        src_win,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pointer motion inside the image window (crop rubber band / panning).
+    fn on_img_motion(&mut self, x: i32, y: i32) {
+        let Some(win) = self.img_win.as_mut() else {
+            return;
+        };
+        if let Some((sx, sy, _, _)) = win.state.crop_drag {
+            win.state.crop_drag = Some((sx, sy, x, y));
+            win.dirty = true;
+        } else if let Some((lx, ly)) = win.state.panning {
+            win.state.pan(x - lx, y - ly);
+            win.state.panning = Some((x, y));
+            win.dirty = true;
+        }
+    }
+
+    /// Button release inside the image window: apply crop / stop panning.
+    fn on_img_release(&mut self) {
+        let Some(win) = self.img_win.as_mut() else {
+            return;
+        };
+        if win.state.crop_drag.is_some() {
+            let (w, h) = (i32::from(win.width), i32::from(win.height));
+            win.state.apply_crop(w, h);
+            win.dirty = true;
+        }
+        if win.state.panning.take().is_some() {
+            win.dirty = true;
+        }
+    }
+
+    fn on_img_key(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        let keysym = mapping.keysyms.first().copied().unwrap_or(0);
+        let mut close = false;
+        if let Some(win) = self.img_win.as_mut() {
+            let (w, h) = (i32::from(win.width), i32::from(win.height));
+            match keysym {
+                0xff1b => {
+                    if win.state.crop_mode || win.state.crop_drag.is_some() {
+                        win.state.crop_mode = false;
+                        win.state.crop_drag = None;
+                        win.state.status = "Crop cancelled".into();
+                    } else {
+                        close = true;
+                    }
+                }
+                0x2b | 0x3d => win.state.zoom_at(w / 2, (IMG_TOP_BAR + h) / 2, 1.25),
+                0x2d => win.state.zoom_at(w / 2, (IMG_TOP_BAR + h) / 2, 0.8),
+                0x72 => win.state.rotate90(w, h),
+                0x30 => win.state.fit(w, h),
+                _ => {}
+            }
+            win.dirty = true;
+        }
+        if close {
+            self.close_image_window();
+        }
+        Ok(())
+    }
+
+    fn draw_image_window(&mut self) -> AnyResult<()> {
+        let Some(win) = self.img_win.as_ref() else {
+            return Ok(());
+        };
+        let mut c = Canvas::new(win.width, win.height, PAPER);
+        let w = i32::from(win.width);
+        let h = i32::from(win.height);
+        win.state.render(&mut c);
+        // Toolbar
+        c.draw_rect(0, 0, w, IMG_TOP_BAR, Color::rgb(236, 245, 250));
+        c.draw_rect(0, IMG_TOP_BAR - 1, w, 1, Color::rgba(176, 198, 210, 120));
+        let name = win
+            .state
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let label = if let Some(err) = &win.state.error {
+            format!("{name}  -  {err}")
+        } else {
+            format!(
+                "{name}  -  {} x {} px  -  {}%",
+                win.state.img.width(),
+                win.state.img.height(),
+                (win.state.zoom * 100.0).round() as i32
+            )
+        };
+        c.draw_text(
+            &self.bold,
+            &compact(&label, ((w - 130) / 7).max(8) as usize),
+            14,
+            11,
+            13.0,
+            INK,
+        );
+        // Menu button (3 dots)
+        c.draw_round_rect(w - 104, 6, 28, 28, 9, CARD);
+        self.draw_more_icon(&mut c, w - 90, 20);
+        // Maximize button
+        c.draw_round_rect(w - 70, 6, 28, 28, 9, CARD);
+        c.draw_rect(w - 63, 13, 14, 2, MINT_DARK);
+        c.draw_rect(w - 63, 25, 14, 2, MINT_DARK);
+        c.draw_rect(w - 63, 13, 2, 14, MINT_DARK);
+        c.draw_rect(w - 51, 13, 2, 14, MINT_DARK);
+        // Close button
+        c.draw_round_rect(w - 36, 6, 28, 28, 14, Color::rgba(226, 92, 101, 220));
+        c.draw_line(w - 27, 15, w - 17, 25, 2, Color::rgb(255, 255, 255));
+        c.draw_line(w - 17, 15, w - 27, 25, 2, Color::rgb(255, 255, 255));
+        // Status chip at the bottom left.
+        if !win.state.status.is_empty() {
+            let chip_w = measure_text(&self.regular, &win.state.status, 11.0) + 22;
+            c.draw_round_rect(10, h - 34, chip_w, 24, 8, Color::rgba(250, 254, 255, 225));
+            c.draw_text(&self.regular, &win.state.status, 21, h - 30, 11.0, INK);
+        }
+        // Dropdown menu
+        if win.state.menu_open {
+            let gx = w - 196;
+            let gy = IMG_TOP_BAR + 4;
+            let gh = IMG_MENU_ITEMS.len() as i32 * 28 + 10;
+            c.draw_round_rect(gx, gy, 188, gh, 10, Color::rgb(250, 254, 255));
+            c.draw_round_rect(gx, gy, 188, gh, 10, Color::rgba(176, 198, 210, 90));
+            for (idx, item) in IMG_MENU_ITEMS.iter().enumerate() {
+                let iy = gy + 5 + idx as i32 * 28;
+                if idx == 6 && win.state.crop_mode {
+                    c.draw_round_rect(gx + 5, iy, 178, 26, 7, Color::rgba(116, 213, 198, 92));
+                }
+                c.draw_text(&self.regular, item, gx + 16, iy + 6, 13.0, INK);
+            }
+        }
+        // Right-click context menu
+        if let Some((mx, my)) = win.state.ctx_menu {
+            let (gx, gy, gw, gh) = img_ctx_geometry(mx, my, w, h);
+            c.draw_round_rect(gx, gy, gw, gh, 10, Color::rgb(250, 254, 255));
+            c.draw_round_rect(gx, gy, gw, gh, 10, Color::rgba(176, 198, 210, 90));
+            for (idx, item) in IMG_CTX_ITEMS.iter().enumerate() {
+                let iy = gy + 5 + idx as i32 * 28;
+                c.draw_text(&self.regular, item, gx + 16, iy + 6, 13.0, INK);
+            }
+        }
+        let xi = Image::new(
+            c.width,
+            c.height,
+            ScanlinePad::Pad32,
+            self.depth,
+            BitsPerPixel::B32,
+            ImageOrder::LsbFirst,
+            Cow::Borrowed(&c.data),
+        )?;
+        xi.put(&self.conn, win.window, win.gc, 0, 0)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ text window
+
+    /// Open or replace text while preserving the existing viewer surface.
+    fn open_text_window(&mut self, text: TextView, compact: bool) {
+        let Ok((x, y, w, h)) = self.view_window_geometry(compact) else {
+            self.status = "Could not position text window".into();
+            return;
+        };
+        if let Some(win) = self.txt_win.as_mut() {
+            if win.text.path != text.path {
+                win.text = text;
+            }
+            win.maximized = false;
+            win.compact = compact;
+            win.selecting = false;
+            win.width = w;
+            win.height = h;
+            win.dirty = true;
+            let _ = self.conn.configure_window(
+                win.window,
+                &ConfigureWindowAux::new()
+                    .x(i32::from(x))
+                    .y(i32::from(y))
+                    .width(u32::from(w))
+                    .height(u32::from(h)),
+            );
+            let _ = self.conn.map_window(win.window);
+            let focus = if compact { self.window } else { win.window };
+            let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, focus, x11rb::CURRENT_TIME);
+            let _ = self.conn.flush();
+            return;
+        }
+        if let Some(old) = self.img_win.take() {
+            let _ = self.conn.change_property8(
+                PropMode::REPLACE,
+                old.window,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                b"Aurora Text",
+            );
+            let _ = self.conn.configure_window(
+                old.window,
+                &ConfigureWindowAux::new()
+                    .x(i32::from(x))
+                    .y(i32::from(y))
+                    .width(u32::from(w))
+                    .height(u32::from(h)),
+            );
+            self.txt_win = Some(TxtWin {
+                window: old.window,
+                gc: old.gc,
+                width: w,
+                height: h,
+                maximized: false,
+                compact,
+                selecting: false,
+                text,
+                dirty: true,
+            });
+            let focus = if compact { self.window } else { old.window };
+            let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, focus, x11rb::CURRENT_TIME);
+            let _ = self.conn.flush();
+            return;
+        }
+        match self.create_text_window(text, compact) {
+            Ok(win) => {
+                let focus = if compact { self.window } else { win.window };
+                let _ = self.conn.set_input_focus(
+                    InputFocus::POINTER_ROOT,
+                    focus,
+                    x11rb::CURRENT_TIME,
+                );
+                let _ = self.conn.flush();
+                self.txt_win = Some(win);
+            }
+            Err(_) => self.status = "Could not open text window".into(),
+        }
+    }
+
+    fn create_text_window(&mut self, text: TextView, compact: bool) -> AnyResult<TxtWin> {
+        let (x, y, w, h) = self.view_window_geometry(compact)?;
+        let window = self.conn.generate_id()?;
+        self.conn.create_window(
+            self.depth,
+            window,
+            self.root,
+            x,
+            y,
+            w,
+            h,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .background_pixel(0xF7FCFF)
+                .event_mask(
+                    EventMask::EXPOSURE
+                        | EventMask::BUTTON_PRESS
+                        | EventMask::BUTTON_RELEASE
+                        | EventMask::POINTER_MOTION
+                        | EventMask::KEY_PRESS
+                        | EventMask::STRUCTURE_NOTIFY,
+                ),
+        )?;
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            b"Aurora Text",
+        )?;
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            b"aurora-files\0Aurora Files\0",
+        )?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            self.wm_protocols,
+            AtomEnum::ATOM,
+            &[self.wm_delete],
+        )?;
+        let gc = self.conn.generate_id()?;
+        self.conn
+            .create_gc(gc, window, &CreateGCAux::new().graphics_exposures(0))?;
+        self.conn.map_window(window)?;
+        self.conn.flush()?;
+        Ok(TxtWin {
+            window,
+            gc,
+            width: w,
+            height: h,
+            maximized: false,
+            compact,
+            selecting: false,
+            text,
+            dirty: true,
+        })
+    }
+
+    fn close_text_window(&mut self) {
+        if let Some(win) = self.txt_win.take() {
+            let _ = self.conn.destroy_window(win.window);
+            let _ = self.conn.free_gc(win.gc);
+            // Hand keyboard focus back to the main window.
+            let _ = self.conn.set_input_focus(
+                InputFocus::POINTER_ROOT,
+                self.window,
+                x11rb::CURRENT_TIME,
+            );
+            let _ = self.conn.flush();
+        }
+    }
+
+    fn toggle_txt_maximize(&mut self) -> AnyResult<()> {
+        if self.txt_win.is_none() {
+            return Ok(());
+        }
+        let restore = if self.txt_win.as_ref().is_some_and(|win| win.compact) {
+            self.side_window_geometry()?
+        } else {
+            self.side_window_normal_geometry()?
+        };
+        let target = self.side_window_max_geometry();
+        let Some(win) = self.txt_win.as_mut() else {
+            return Ok(());
+        };
+        let aux = if win.maximized {
+            // Restore: back to the default spot beside the file list.
+            win.maximized = false;
+            ConfigureWindowAux::new()
+                .x(i32::from(restore.0))
+                .y(i32::from(restore.1))
+                .width(u32::from(restore.2))
+                .height(u32::from(restore.3))
+        } else {
+            // Maximize: grow to 80% of the screen, centered below the top bar.
+            win.maximized = true;
+            ConfigureWindowAux::new()
+                .x(target.0)
+                .y(target.1)
+                .width(target.2)
+                .height(target.3)
+        };
+        self.conn.configure_window(win.window, &aux)?;
+        win.dirty = true;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Number of text lines visible in the text window.
+    fn txt_visible_lines(height: u16) -> usize {
+        ((i32::from(height) - TXT_TOP_BAR - 16) / TXT_LINE_H).max(1) as usize
+    }
+
+    fn on_txt_click(&mut self, x: i32, y: i32, button: u8) {
+        let Some((w, editable)) = self
+            .txt_win
+            .as_ref()
+            .map(|win| (i32::from(win.width), win.text.editable))
+        else {
+            return;
+        };
+        // Toolbar buttons: [Save] [max] [close] at the top right.
+        if y < TXT_TOP_BAR {
+            if button != 1 {
+                return;
+            }
+            if x >= w - 36 && x < w - 8 {
+                self.close_text_window();
+            } else if x >= w - 70 && x < w - 42 {
+                let _ = self.toggle_txt_maximize();
+            } else if x >= w - 128 && x < w - 76 && editable {
+                if let Some(win) = self.txt_win.as_mut() {
+                    win.text.save();
+                    win.dirty = true;
+                }
+            }
+            return;
+        }
+        let Some(win) = self.txt_win.as_mut() else {
+            return;
+        };
+        match button {
+            4 => win.text.scroll = win.text.scroll.saturating_sub(3),
+            5 => {
+                win.text.scroll =
+                    (win.text.scroll + 3).min(win.text.lines.len().saturating_sub(4));
+            }
+            1 => {
+                // Place the cursor under the pointer.
+                let line = (win.text.scroll as i32 + (y - TXT_TOP_BAR - 8) / TXT_LINE_H)
+                    .max(0) as usize;
+                if line < win.text.lines.len() {
+                    let col = text_column_at_x(&self.mono, &win.text.lines[line], x - 14);
+                    win.text.cursor = (line, col);
+                    win.text.selection = Some(TextSelection {
+                        start: (line, col),
+                        end: (line, col),
+                    });
+                    win.selecting = true;
+                }
+            }
+            _ => {}
+        }
+        win.dirty = true;
+    }
+
+    fn on_txt_motion(&mut self, x: i32, y: i32) {
+        let Some(win) = self.txt_win.as_mut() else {
+            return;
+        };
+        if !win.selecting || win.text.lines.is_empty() {
+            return;
+        }
+        let line = (win.text.scroll as i32 + (y - TXT_TOP_BAR - 8) / TXT_LINE_H)
+            .max(0) as usize;
+        let line = line.min(win.text.lines.len() - 1);
+        let col = text_column_at_x(&self.mono, &win.text.lines[line], x - 14);
+        if let Some(selection) = win.text.selection.as_mut() {
+            selection.end = (line, col);
+        }
+        win.text.cursor = (line, col);
+        win.dirty = true;
+    }
+
+    fn on_txt_release(&mut self) {
+        let Some(win) = self.txt_win.as_mut() else {
+            return;
+        };
+        if !win.selecting {
+            return;
+        }
+        win.selecting = false;
+        if let Some(text) = win.text.selected_text().filter(|text| !text.is_empty()) {
+            win.text.status = if copy_text_to_system_clipboard(&text) {
+                "Selection copied".into()
+            } else {
+                "Copy failed (install xclip)".into()
+            };
+        }
+        win.dirty = true;
+    }
+
+    fn on_txt_key(&mut self, ev: KeyPressEvent) -> AnyResult<()> {
+        let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        let state = u16::from(ev.state);
+        let shift = state & u16::from(KeyButMask::SHIFT) != 0;
+        let ctrl = state & u16::from(KeyButMask::CONTROL) != 0;
+        let column = usize::from(shift && mapping.keysyms_per_keycode > 1);
+        let keysym = mapping
+            .keysyms
+            .get(column)
+            .copied()
+            .filter(|&k| k != 0)
+            .or_else(|| mapping.keysyms.first().copied())
+            .unwrap_or(0);
+        let mut close = false;
+        if let Some(win) = self.txt_win.as_mut() {
+            let text = &mut win.text;
+            match keysym {
+                _ if ctrl && (keysym == 'c' as u32 || keysym == 'C' as u32) => {
+                    if let Some(selected) = text.selected_text().filter(|value| !value.is_empty()) {
+                        text.status = if copy_text_to_system_clipboard(&selected) {
+                            "Selection copied".into()
+                        } else {
+                            "Copy failed (install xclip)".into()
+                        };
+                    }
+                }
+                _ if ctrl && (keysym == 's' as u32 || keysym == 'S' as u32) => text.save(),
+                0xff0d => text.newline(),
+                0xff08 => text.backspace(),
+                0xff1b => close = true,
+                0xff51 => text.move_cursor(-1, 0),
+                0xff53 => text.move_cursor(1, 0),
+                0xff52 => text.move_cursor(0, -1),
+                0xff54 => text.move_cursor(0, 1),
+                0xff50 => text.cursor.1 = 0,
+                0xff57 => text.cursor.1 = text.lines[text.cursor.0].chars().count(),
+                0xff55 => text.scroll = text.scroll.saturating_sub(20),
+                0xff56 => {
+                    text.scroll = (text.scroll + 20).min(text.lines.len().saturating_sub(4));
+                }
+                0x20..=0x7e if !ctrl => {
+                    if let Some(ch) = char::from_u32(keysym) {
+                        text.insert_char(ch);
+                    }
+                }
+                _ => {}
+            }
+            // Keep the cursor on screen.
+            let visible = Self::txt_visible_lines(win.height);
+            let text = &mut win.text;
+            if text.cursor.0 < text.scroll {
+                text.scroll = text.cursor.0;
+            } else if text.cursor.0 >= text.scroll + visible {
+                text.scroll = text.cursor.0 + 1 - visible;
+            }
+            win.dirty = true;
+        }
+        if close {
+            self.close_text_window();
+        }
+        Ok(())
+    }
+
+    fn draw_text_window(&mut self) -> AnyResult<()> {
+        let Some(win) = self.txt_win.as_ref() else {
+            return Ok(());
+        };
+        let w = i32::from(win.width);
+        let h = i32::from(win.height);
+        let mut c = Canvas::new(win.width, win.height, PAPER);
+        let text = &win.text;
+        // Text content below the toolbar.
+        let visible = Self::txt_visible_lines(win.height);
+        let max_chars = ((w - 28) / 8).max(8) as usize;
+        for (row, line) in text.lines.iter().skip(text.scroll).take(visible).enumerate() {
+            let y = TXT_TOP_BAR + 8 + row as i32 * TXT_LINE_H;
+            let line_idx = text.scroll + row;
+            if let Some((first, last)) = text.selection.and_then(|selection| {
+                text_selection_columns(selection, line_idx, max_chars)
+            }) {
+                let first = first.min(max_chars);
+                let last = last.min(max_chars);
+                let x1 = 14 + text_prefix_width(&self.mono, line, first);
+                let x2 = 14 + text_prefix_width(&self.mono, line, last);
+                if last > first {
+                    c.draw_rect(
+                        x1,
+                        y - 2,
+                        (x2 - x1).max(2),
+                        17,
+                        Color::rgba(73, 156, 231, 105),
+                    );
+                }
+            }
+            if text.editable && line_idx == text.cursor.0 {
+                c.draw_rect(8, y - 2, w - 16, TXT_LINE_H, Color::rgba(116, 213, 198, 40));
+                if text.cursor.1 <= max_chars {
+                    let cursor_x = 14 + text_prefix_width(&self.mono, line, text.cursor.1);
+                    c.draw_rect(cursor_x, y - 2, 2, 17, MINT_DARK);
+                }
+            }
+            c.draw_text(
+                &self.mono,
+                &compact(line, max_chars),
+                14,
+                y,
+                TEXT_FONT_SIZE,
+                INK,
+            );
+        }
+        // Toolbar
+        c.draw_rect(0, 0, w, TXT_TOP_BAR, Color::rgb(236, 245, 250));
+        c.draw_rect(0, TXT_TOP_BAR - 1, w, 1, Color::rgba(176, 198, 210, 120));
+        let name = text
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let label = format!(
+            "{}{}  -  {} lines{}",
+            if text.dirty { "* " } else { "" },
+            name,
+            text.lines.len(),
+            if text.editable { "" } else { "  (read-only)" },
+        );
+        c.draw_text(
+            &self.bold,
+            &compact(&label, ((w - 150) / 7).max(8) as usize),
+            14,
+            11,
+            13.0,
+            INK,
+        );
+        // Save button
+        if text.editable {
+            c.draw_round_rect(w - 128, 6, 52, 28, 9, Color::rgba(116, 213, 198, 150));
+            c.draw_text_center(&self.bold, "Save", w - 102, 13, 12.0, MINT_DARK);
+        }
+        // Maximize button
+        c.draw_round_rect(w - 70, 6, 28, 28, 9, CARD);
+        c.draw_rect(w - 63, 13, 14, 2, MINT_DARK);
+        c.draw_rect(w - 63, 25, 14, 2, MINT_DARK);
+        c.draw_rect(w - 63, 13, 2, 14, MINT_DARK);
+        c.draw_rect(w - 51, 13, 2, 14, MINT_DARK);
+        // Close button
+        c.draw_round_rect(w - 36, 6, 28, 28, 14, Color::rgba(226, 92, 101, 220));
+        c.draw_line(w - 27, 15, w - 17, 25, 2, Color::rgb(255, 255, 255));
+        c.draw_line(w - 17, 15, w - 27, 25, 2, Color::rgb(255, 255, 255));
+        // Status chip at the bottom left.
+        if !text.status.is_empty() {
+            let chip_w = measure_text(&self.regular, &text.status, 11.0) + 22;
+            c.draw_round_rect(10, h - 34, chip_w, 24, 8, Color::rgba(250, 254, 255, 225));
+            c.draw_text(&self.regular, &text.status, 21, h - 30, 11.0, INK);
+        }
+        let xi = Image::new(
+            c.width,
+            c.height,
+            ScanlinePad::Pad32,
+            self.depth,
+            BitsPerPixel::B32,
+            ImageOrder::LsbFirst,
+            Cow::Borrowed(&c.data),
+        )?;
+        xi.put(&self.conn, win.window, win.gc, 0, 0)?;
+        Ok(())
     }
 
     fn viewer_close(&mut self) {
@@ -1139,8 +2419,8 @@ impl App {
         let tab = self.tabs.get(selection.tab)?;
         let (start, end) = normalized_terminal_selection(selection);
         let mut lines = Vec::new();
-        for row in start.0..=end.0.min(tab.grid.len().saturating_sub(1)) {
-            let cells = &tab.grid[row];
+        for row in start.0..=end.0.min(tab.rows.saturating_sub(1)) {
+            let cells = tab.display_row(row)?;
             let first = if row == start.0 { start.1 } else { 0 };
             let last = if row == end.0 {
                 end.1.min(cells.len().saturating_sub(1))
@@ -1189,9 +2469,45 @@ impl App {
                 return Ok(());
             }
             while let Some(event) = self.conn.poll_for_event()? {
+                let img_window = self.img_win.as_ref().map(|w| w.window);
+                let txt_window = self.txt_win.as_ref().map(|w| w.window);
                 match event {
-                    Event::Expose(ev) if ev.count == 0 => needs_draw = true,
-                    Event::ConfigureNotify(ev) => {
+                    Event::Expose(ev) if ev.count == 0 => {
+                        if Some(ev.window) == img_window {
+                            if let Some(win) = self.img_win.as_mut() {
+                                win.dirty = true;
+                            }
+                        } else if Some(ev.window) == txt_window {
+                            if let Some(win) = self.txt_win.as_mut() {
+                                win.dirty = true;
+                            }
+                        } else {
+                            needs_draw = true;
+                        }
+                    }
+                    Event::ConfigureNotify(ev) if Some(ev.window) == img_window => {
+                        if let Some(win) = self.img_win.as_mut() {
+                            if ev.width != win.width || ev.height != win.height {
+                                win.width = ev.width;
+                                win.height = ev.height;
+                                if !win.state.user_zoomed {
+                                    win.state
+                                        .fit(i32::from(ev.width), i32::from(ev.height));
+                                }
+                                win.dirty = true;
+                            }
+                        }
+                    }
+                    Event::ConfigureNotify(ev) if Some(ev.window) == txt_window => {
+                        if let Some(win) = self.txt_win.as_mut() {
+                            if ev.width != win.width || ev.height != win.height {
+                                win.width = ev.width;
+                                win.height = ev.height;
+                                win.dirty = true;
+                            }
+                        }
+                    }
+                    Event::ConfigureNotify(ev) if ev.window == self.window => {
                         if ev.width != self.width || ev.height != self.height {
                             self.width = ev.width;
                             self.height = ev.height;
@@ -1209,18 +2525,49 @@ impl App {
                         }
                     }
                     Event::ButtonPress(ev) => {
-                        self.on_click(
-                            i32::from(ev.event_x),
-                            i32::from(ev.event_y),
-                            ev.detail,
-                            u16::from(ev.state),
-                        );
-                        needs_draw = true;
+                        if Some(ev.event) == img_window {
+                            self.on_img_click(
+                                i32::from(ev.event_x),
+                                i32::from(ev.event_y),
+                                ev.detail,
+                            );
+                            if let Some(win) = self.img_win.as_mut() {
+                                win.dirty = true;
+                            }
+                        } else if Some(ev.event) == txt_window {
+                            self.on_txt_click(
+                                i32::from(ev.event_x),
+                                i32::from(ev.event_y),
+                                ev.detail,
+                            );
+                        } else {
+                            self.on_click(
+                                i32::from(ev.event_x),
+                                i32::from(ev.event_y),
+                                ev.detail,
+                                u16::from(ev.state),
+                            );
+                            needs_draw = true;
+                        }
                     }
                     Event::ButtonRelease(ev) => {
+                        if Some(ev.event) == txt_window {
+                            self.on_txt_release();
+                        }
+                        let drag_started =
+                            self.file_drag.as_ref().is_some_and(|drag| drag.started);
                         if self.file_drag.is_some() {
                             self.drag_out_release(ev.time)?;
                         }
+                        if drag_started {
+                            self.pending_open = None;
+                        } else if let Some(action) = self.pending_open.take() {
+                            match action {
+                                PendingOpen::Preview(idx) => self.preview_entry(idx),
+                                PendingOpen::Open(idx) => self.open_entry(idx),
+                            }
+                        }
+                        self.on_img_release();
                         self.finish_terminal_selection();
                         if let Some(Viewer::Model(model)) = self.viewer.as_mut() {
                             model.dragging = None;
@@ -1237,26 +2584,44 @@ impl App {
                                 ev.time,
                             )?;
                         }
-                        if self.update_terminal_selection(
-                            i32::from(ev.event_x),
-                            i32::from(ev.event_y),
-                        ) {
-                            needs_draw = true;
-                        }
-                        if let Some(Viewer::Model(model)) = self.viewer.as_mut() {
-                            if let Some((sx, sy)) = model.dragging {
-                                model.yaw += f32::from(ev.event_x - sx) * 0.01;
-                                model.pitch += f32::from(ev.event_y - sy) * 0.01;
-                                model.dragging = Some((ev.event_x, ev.event_y));
+                        if Some(ev.event) == img_window {
+                            self.on_img_motion(
+                                i32::from(ev.event_x),
+                                i32::from(ev.event_y),
+                            );
+                        } else if Some(ev.event) == txt_window {
+                            self.on_txt_motion(
+                                i32::from(ev.event_x),
+                                i32::from(ev.event_y),
+                            );
+                        } else {
+                            if self.update_terminal_selection(
+                                i32::from(ev.event_x),
+                                i32::from(ev.event_y),
+                            ) {
                                 needs_draw = true;
+                            }
+                            if let Some(Viewer::Model(model)) = self.viewer.as_mut() {
+                                if let Some((sx, sy)) = model.dragging {
+                                    model.yaw += f32::from(ev.event_x - sx) * 0.01;
+                                    model.pitch += f32::from(ev.event_y - sy) * 0.01;
+                                    model.dragging = Some((ev.event_x, ev.event_y));
+                                    needs_draw = true;
+                                }
                             }
                         }
                     }
                     Event::KeyPress(ev) => {
-                        if self.on_key(ev)? {
-                            return Ok(());
+                        if Some(ev.event) == img_window {
+                            self.on_img_key(ev)?;
+                        } else if Some(ev.event) == txt_window {
+                            self.on_txt_key(ev)?;
+                        } else {
+                            if self.on_key(ev)? {
+                                return Ok(());
+                            }
+                            needs_draw = true;
                         }
-                        needs_draw = true;
                     }
                     Event::SelectionRequest(ev) => {
                         self.handle_selection_request(&ev)?;
@@ -1271,8 +2636,14 @@ impl App {
                             self.handle_folder_tab_message();
                             needs_draw = true;
                         } else if ev.data.as_data32()[0] == self.wm_delete {
-                            self.viewer_close();
-                            return Ok(());
+                            if Some(ev.window) == img_window {
+                                self.close_image_window();
+                            } else if Some(ev.window) == txt_window {
+                                self.close_text_window();
+                            } else {
+                                self.viewer_close();
+                                return Ok(());
+                            }
                         }
                     }
                     _ => {}
@@ -1302,6 +2673,9 @@ impl App {
             if self.copy_terminal_selection_if_due() {
                 needs_draw = true;
             }
+            if self.poll_directory_refresh() {
+                needs_draw = true;
+            }
             if self
                 .terminal_notice
                 .as_ref()
@@ -1315,6 +2689,20 @@ impl App {
                 self.conn.flush()?;
                 needs_draw = false;
                 last_draw = Instant::now();
+            }
+            if self.img_win.as_ref().is_some_and(|win| win.dirty) {
+                self.draw_image_window()?;
+                self.conn.flush()?;
+                if let Some(win) = self.img_win.as_mut() {
+                    win.dirty = false;
+                }
+            }
+            if self.txt_win.as_ref().is_some_and(|win| win.dirty) {
+                self.draw_text_window()?;
+                self.conn.flush()?;
+                if let Some(win) = self.txt_win.as_mut() {
+                    win.dirty = false;
+                }
             }
             std::thread::sleep(Duration::from_millis(if term_changed { 2 } else { 9 }));
         }
@@ -1348,6 +2736,14 @@ impl App {
             }
             self.folder_tabs_open = false;
         }
+        // File/folder context menu: consume clicks while it is open.
+        if self.file_menu.is_some() && (button == 1 || button == 3) {
+            let handled = self.handle_file_menu_click(x, y);
+            self.file_menu = None;
+            if handled {
+                return;
+            }
+        }
         let (tx, ty, tw, th) = self.terminal_rect();
         let _ = (tx, tw);
         // Terminal area
@@ -1373,6 +2769,11 @@ impl App {
                     && x <= 8 + self.tabs.len() as i32 * tab_w + 28
                 {
                     self.new_tab();
+                }
+            } else if button == 4 || button == 5 {
+                self.clear_terminal_selection();
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.scroll_view(if button == 4 { 3 } else { -3 });
                 }
             } else if button == 1 {
                 let mouse_enabled = self
@@ -1414,18 +2815,18 @@ impl App {
             self.sort_open = false;
         }
         if self.more_open {
-            let menu_x = i32::from(self.width) - 214;
-            if x >= menu_x + 8 && x <= menu_x + 186 && y >= 86 && y <= 116 {
-                self.show_hidden = !self.show_hidden;
+            let menu_x = i32::from(self.width) - 234;
+            let menu_y = 54;
+            let item_count = self.more_menu_items().len() as i32;
+            let row = (y - menu_y - 36) / 30;
+            if x >= menu_x + 8
+                && x <= menu_x + 206
+                && y >= menu_y + 36
+                && row >= 0
+                && row < item_count
+            {
                 self.more_open = false;
-                self.refresh_entries();
-                self.selected = None;
-                self.scroll = 0;
-                self.status = if self.show_hidden {
-                    "Showing hidden files".into()
-                } else {
-                    "Hidden files are hidden".into()
-                };
+                self.more_menu_action(row as usize);
                 return;
             }
             self.more_open = false;
@@ -1524,6 +2925,7 @@ impl App {
                     target: 0,
                     target_ver: 0,
                     accepted: false,
+                    src_win: self.window,
                 });
             }
         }
@@ -1553,8 +2955,9 @@ impl App {
                     self.focus = Focus::Editor;
                     let line = (text.scroll as i32 + (y - cy - 44) / 18).max(0) as usize;
                     if line < text.lines.len() {
-                        let col = ((x - cx - 18) / 8).max(0) as usize;
-                        text.cursor = (line, col.min(text.lines[line].chars().count()));
+                        let col =
+                            text_column_at_x(&self.mono, &text.lines[line], x - cx - 18);
+                        text.cursor = (line, col);
                     }
                 }
                 Viewer::Media(media) => {
@@ -1606,24 +3009,57 @@ impl App {
         if row >= 0 {
             let idx = self.scroll + row as usize;
             if idx < self.entries.len() {
-                let is_parent = self.entries.get(idx).is_some_and(|entry| {
-                    entry.name == ".."
-                        && entry.kind == FileKind::Directory
-                        && self.cwd.parent().is_some_and(|parent| parent == entry.path)
-                });
-                if is_parent {
-                    self.open_entry(idx);
+                // Right click: open the context menu for this entry.
+                if button == 3 {
+                    self.selected = Some(idx);
+                    if let Some(entry) = self.entries.get(idx) {
+                        self.file_menu = Some((x, y, entry.path.clone()));
+                    }
                     return;
                 }
-                let now = Instant::now();
-                let double = self
-                    .last_click
-                    .is_some_and(|(i, at)| i == idx && now.duration_since(at).as_millis() < 450);
-                self.last_click = Some((idx, now));
-                if double || self.selected == Some(idx) {
-                    self.open_entry(idx);
-                } else {
+                if button != 1 {
+                    return;
+                }
+                let same_entry = self.selected == Some(idx);
+                let is_directory = self.entries[idx].kind == FileKind::Directory;
+                let path = &self.entries[idx].path;
+                let current_view_is_normal = self
+                    .img_win
+                    .as_ref()
+                    .is_some_and(|win| win.state.path == *path && !win.compact)
+                    || self
+                        .txt_win
+                        .as_ref()
+                        .is_some_and(|win| win.text.path == *path && !win.compact);
+                // First click selects and (for text/images) shows a compact
+                // preview. Repeated clicks toggle compact and normal sizes.
+                self.pending_open = Some(if same_entry && current_view_is_normal {
+                    PendingOpen::Preview(idx)
+                } else if same_entry {
+                    PendingOpen::Open(idx)
+                } else if is_directory {
+                    // Directories have no preview; the first click only selects.
+                    self.pending_open = None;
+                    self.last_click = Some((idx, Instant::now()));
                     self.selected = Some(idx);
+                    return;
+                } else {
+                    PendingOpen::Preview(idx)
+                });
+                self.last_click = Some((idx, Instant::now()));
+                self.selected = Some(idx);
+                // Arm a potential drag of this entry to another application.
+                if let Some(entry) = self.entries.get(idx) {
+                    self.file_drag = Some(FileDrag {
+                        path: entry.path.clone(),
+                        start_x: x,
+                        start_y: y,
+                        started: false,
+                        target: 0,
+                        target_ver: 0,
+                        accepted: false,
+                        src_win: self.window,
+                    });
                 }
             }
         }
@@ -1635,6 +3071,7 @@ impl App {
         let state = u16::from(ev.state);
         let shift = state & u16::from(KeyButMask::SHIFT) != 0;
         let ctrl = state & u16::from(KeyButMask::CONTROL) != 0;
+        let super_key = state & u16::from(KeyButMask::MOD4) != 0;
         let column = usize::from(shift && mapping.keysyms_per_keycode > 1);
         let keysym = mapping
             .keysyms
@@ -1651,10 +3088,16 @@ impl App {
                         self.new_tab();
                         return Ok(false);
                     }
-                    if ctrl && matches!(keysym, 0x76 | 0x56) {
+                    // Clipboard paste is deliberately limited to Ctrl+Shift+V
+                    // (and Super+V). Plain Ctrl+V must fall through and be sent
+                    // to the PTY as 0x16 for standard shell quoted-insert.
+                    let paste_shortcut =
+                        matches!(keysym, 0x76 | 0x56) && ((ctrl && shift) || super_key);
+                    if paste_shortcut {
                         if let Some(text) = read_text_from_system_clipboard() {
                             self.clear_terminal_selection();
-                            if let Some(tab) = self.tabs.get(self.active_tab) {
+                            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                                tab.scroll_to_bottom();
                                 if tab.bracketed_paste {
                                     tab.write_input(b"\x1b[200~");
                                     tab.write_input(text.as_bytes());
@@ -1663,6 +3106,32 @@ impl App {
                                     tab.write_input(text.as_bytes());
                                 }
                             }
+                        }
+                        return Ok(false);
+                    }
+                    if ctrl && shift && matches!(keysym, 0x63 | 0x43) {
+                        if let Some(text) = self
+                            .terminal_selected_text()
+                            .filter(|value| !value.is_empty())
+                        {
+                            if copy_text_to_system_clipboard(&text) {
+                                self.terminal_notice =
+                                    Some(("Copied to clipboard".into(), Instant::now()));
+                            }
+                        }
+                        return Ok(false);
+                    }
+                    if shift && keysym == 0xff55 {
+                        self.clear_terminal_selection();
+                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                            tab.scroll_view(tab.rows.saturating_sub(1) as i32);
+                        }
+                        return Ok(false);
+                    }
+                    if shift && keysym == 0xff56 {
+                        self.clear_terminal_selection();
+                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                            tab.scroll_view(-(tab.rows.saturating_sub(1) as i32));
                         }
                         return Ok(false);
                     }
@@ -1680,19 +3149,15 @@ impl App {
                         0xff55 => b"\x1b[5~".to_vec(),
                         0xff56 => b"\x1b[6~".to_vec(),
                         0xffff => b"\x1b[3~".to_vec(),
-                        0x20..=0x7e => {
-                            let ch = keysym as u8;
-                            if ctrl {
-                                vec![ch.to_ascii_uppercase().wrapping_sub(b'@') & 0x1f]
-                            } else {
-                                vec![ch]
-                            }
-                        }
+                        0x20..=0x7e => terminal_printable_input(keysym, ctrl)
+                            .into_iter()
+                            .collect(),
                         _ => Vec::new(),
                     };
                     if !bytes.is_empty() {
                         self.clear_terminal_selection();
-                        if let Some(tab) = self.tabs.get(self.active_tab) {
+                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                            tab.scroll_to_bottom();
                             tab.write_input(&bytes);
                         }
                     }
@@ -1794,6 +3259,7 @@ impl App {
             self.draw_terminal(&mut c);
         }
         self.draw_header_menus(&mut c);
+        self.draw_file_menu(&mut c);
         self.draw_image_menu(&mut c);
         self.upload(&c)?;
         Ok(())
@@ -1950,41 +3416,140 @@ impl App {
             );
         }
         if self.more_open {
-            let menu_x = i32::from(self.width) - 214;
+            let menu_x = i32::from(self.width) - 234;
             let menu_y = 54;
+            let items = self.more_menu_items();
+            let menu_h = 40 + items.len() as i32 * 30 + 8;
             c.draw_round_rect(
                 menu_x,
                 menu_y,
-                194,
-                72,
+                214,
+                menu_h,
                 12,
-                Color::rgba(250, 254, 255, 242),
+                Color::rgba(250, 254, 255, 246),
             );
-            c.draw_text(&self.bold, "View", menu_x + 14, menu_y + 12, 14.0, INK);
-            c.draw_round_rect(
-                menu_x + 8,
-                menu_y + 32,
-                178,
-                30,
-                7,
-                Color::rgba(234, 246, 249, 150),
-            );
+            let target = self.menu_target_path();
+            let target_name = target
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".into());
             c.draw_text(
-                &self.regular,
-                if self.show_hidden {
-                    "Hide hidden files"
-                } else {
-                    "Show hidden files"
-                },
-                menu_x + 18,
-                menu_y + 39,
-                12.0,
+                &self.bold,
+                &compact(&target_name, 24),
+                menu_x + 14,
+                menu_y + 10,
+                13.0,
                 INK,
             );
-            if self.show_hidden {
-                c.draw_circle(menu_x + 172, menu_y + 47, 4, MINT_DARK);
+            for (idx, label) in items.iter().enumerate() {
+                let iy = menu_y + 36 + idx as i32 * 30;
+                c.draw_round_rect(
+                    menu_x + 8,
+                    iy,
+                    198,
+                    26,
+                    7,
+                    Color::rgba(234, 246, 249, 130),
+                );
+                let color = if *label == "Paste" && self.copied_path.is_none() {
+                    MUTED
+                } else {
+                    INK
+                };
+                c.draw_text(&self.regular, label, menu_x + 18, iy + 4, 12.0, color);
+                if idx == 0 && self.show_hidden {
+                    c.draw_circle(menu_x + 192, iy + 13, 4, MINT_DARK);
+                }
             }
         }
+    }
+
+    fn more_menu_items(&self) -> Vec<&'static str> {
+        vec![
+            if self.show_hidden {
+                "Hide hidden files"
+            } else {
+                "Show hidden files"
+            },
+            "Pin folder to sidebar",
+            "Copy path",
+            "Copy",
+            "Paste",
+            "Copy parent path",
+        ]
+    }
+
+    /// Path the 3-dot menu operates on: the selected entry, or the folder.
+    fn menu_target_path(&self) -> PathBuf {
+        self.selected
+            .and_then(|idx| self.entries.get(idx))
+            .map(|entry| entry.path.clone())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    fn more_menu_action(&mut self, row: usize) {
+        let target = self.menu_target_path();
+        match row {
+            0 => {
+                self.show_hidden = !self.show_hidden;
+                self.reset_dir_watch();
+                self.refresh_entries();
+                self.selected = None;
+                self.scroll = 0;
+                self.status = if self.show_hidden {
+                    "Showing hidden files".into()
+                } else {
+                    "Hidden files are hidden".into()
+                };
+            }
+            1 => self.pin_current_folder(),
+            2 => self.action_copy_path(&target),
+            3 => self.action_copy_entry(&target),
+            4 => self.paste_copied_file(),
+            _ => self.action_copy_parent_path(&target),
+        }
+    }
+
+    /// Add the current folder to the sidebar places (persisted).
+    fn pin_current_folder(&mut self) {
+        if self.places.iter().any(|place| place.path == self.cwd) {
+            self.status = "Folder already in sidebar".into();
+            return;
+        }
+        add_pinned(&self.cwd);
+        self.places = places();
+        self.status = "Folder added to sidebar".into();
+    }
+
+    fn action_copy_path(&mut self, path: &Path) {
+        let text = path.to_string_lossy().into_owned();
+        self.status = if copy_text_to_system_clipboard(&text) {
+            format!("Path copied: {}", compact(&text, 40))
+        } else {
+            "Copy failed (install xclip)".into()
+        };
+    }
+
+    fn action_copy_entry(&mut self, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".into());
+        let _ = copy_text_to_system_clipboard(&path.to_string_lossy());
+        self.copied_path = Some(path.to_path_buf());
+        self.status = format!("Copied {} (use Paste)", compact(&name, 28));
+    }
+
+    fn action_copy_parent_path(&mut self, path: &Path) {
+        let parent = path
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".into());
+        self.status = if copy_text_to_system_clipboard(&parent) {
+            format!("Parent path copied: {}", compact(&parent, 34))
+        } else {
+            "Copy failed (install xclip)".into()
+        };
     }
 
     fn draw_home_icon(&self, c: &mut Canvas, cx: i32, cy: i32) {
@@ -2166,15 +3731,27 @@ impl App {
                     c.draw_text(&self.regular, &text.status, cx + cw - 130, cy + 10, 11.0, MINT_DARK);
                 }
                 let visible = ((ch - 56) / 18).max(1) as usize;
+                let max_chars = ((cw - 40) / 8).max(1) as usize;
                 for (row, line) in text.lines.iter().skip(text.scroll).take(visible).enumerate() {
                     let y = cy + 44 + row as i32 * 18;
                     let line_idx = text.scroll + row;
                     if text.editable && line_idx == text.cursor.0 && self.focus == Focus::Editor {
                         c.draw_rect(cx + 12, y - 2, cw - 26, 18, Color::rgba(116, 213, 198, 40));
-                        let cursor_x = cx + 18 + 8 * text.cursor.1.min(line.chars().count()) as i32;
-                        c.draw_rect(cursor_x, y - 2, 2, 17, MINT_DARK);
+                        if text.cursor.1 <= max_chars {
+                            let cursor_x = cx
+                                + 18
+                                + text_prefix_width(&self.mono, line, text.cursor.1);
+                            c.draw_rect(cursor_x, y - 2, 2, 17, MINT_DARK);
+                        }
                     }
-                    c.draw_text(&self.mono, &compact(line, ((cw - 40) / 8) as usize), cx + 18, y, 13.0, INK);
+                    c.draw_text(
+                        &self.mono,
+                        &compact(line, max_chars),
+                        cx + 18,
+                        y,
+                        TEXT_FONT_SIZE,
+                        INK,
+                    );
                 }
             }
             Viewer::Image(img) => {
@@ -2317,6 +3894,104 @@ impl App {
         (cx + cw - bw - 10, cy + 6, bw, bw)
     }
 
+    const FILE_MENU_ITEMS: [&'static str; 4] =
+        ["Copy path", "Copy", "Paste", "Copy parent path"];
+
+    fn file_menu_geometry(&self) -> (i32, i32, i32, i32) {
+        let (mx, my) = self
+            .file_menu
+            .as_ref()
+            .map(|(x, y, _)| (*x, *y))
+            .unwrap_or((0, 0));
+        let w = 190;
+        let h = Self::FILE_MENU_ITEMS.len() as i32 * 30 + 10;
+        let x = mx.min(i32::from(self.width) - w - 6).max(4);
+        let y = my.min(i32::from(self.height) - h - 6).max(4);
+        (x, y, w, h)
+    }
+
+    fn draw_file_menu(&self, c: &mut Canvas) {
+        if self.file_menu.is_none() {
+            return;
+        }
+        let (gx, gy, gw, gh) = self.file_menu_geometry();
+        c.draw_round_rect(gx, gy, gw, gh, 10, Color::rgb(250, 254, 255));
+        c.draw_round_rect(gx, gy, gw, gh, 10, Color::rgba(176, 198, 210, 90));
+        for (i, label) in Self::FILE_MENU_ITEMS.iter().enumerate() {
+            let ry = gy + 5 + i as i32 * 30;
+            // Grey out "Paste" until something has been copied.
+            let color = if i == 2 && self.copied_path.is_none() {
+                MUTED
+            } else {
+                INK
+            };
+            c.draw_text(&self.regular, label, gx + 16, ry + 9, 13.0, color);
+        }
+    }
+
+    /// Returns true when the click landed on a menu item (so the caller consumes it).
+    fn handle_file_menu_click(&mut self, x: i32, y: i32) -> bool {
+        let Some((_, _, path)) = self.file_menu.clone() else {
+            return false;
+        };
+        let (gx, gy, gw, gh) = self.file_menu_geometry();
+        if x < gx || x >= gx + gw || y < gy || y >= gy + gh {
+            return false;
+        }
+        let row = ((y - gy - 5) / 30).clamp(0, Self::FILE_MENU_ITEMS.len() as i32 - 1);
+        match row {
+            0 => self.action_copy_path(&path),
+            1 => self.action_copy_entry(&path),
+            2 => self.paste_copied_file(),
+            _ => self.action_copy_parent_path(&path),
+        }
+        true
+    }
+
+    /// Paste the previously copied file/folder into the current folder.
+    fn paste_copied_file(&mut self) {
+        let Some(src) = self.copied_path.clone() else {
+            self.status = "Nothing to paste (use Copy first)".into();
+            return;
+        };
+        if !src.exists() {
+            self.status = "Copied item no longer exists".into();
+            return;
+        }
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "copy".into());
+        let mut dest = self.cwd.join(&name);
+        let mut counter = 1u32;
+        while dest.exists() {
+            dest = self.cwd.join(format!("{name} (copy {counter})"));
+            counter += 1;
+            if counter > 99 {
+                self.status = "Too many copies of that name".into();
+                return;
+            }
+        }
+        let ok = Command::new("cp")
+            .arg("-a")
+            .arg("--")
+            .arg(&src)
+            .arg(&dest)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            self.known_paths.insert(dest.clone());
+            self.recent_paths.insert(0, dest.clone());
+            self.refresh_entries();
+            self.selected = self.entries.iter().position(|entry| entry.path == dest);
+            self.scroll = 0;
+            self.status = format!("Pasted {}", compact(&name, 30));
+        } else {
+            self.status = "Paste failed".into();
+        }
+    }
+
     const IMAGE_MENU_ITEMS: [&'static str; 4] =
         ["Copy image", "Zoom in", "Zoom out", "Reset zoom"];
 
@@ -2413,6 +4088,7 @@ impl App {
 
     /// Deepest XDND-aware window under the given root coordinates.
     fn xdnd_target_at(&self, root_x: i16, root_y: i16) -> AnyResult<(Window, u8)> {
+        let own_img = self.img_win.as_ref().map(|w| w.window);
         let mut win = self.root;
         let mut found = (0u32, 0u8);
         for _ in 0..16 {
@@ -2420,7 +4096,7 @@ impl App {
                 .conn
                 .translate_coordinates(self.root, win, root_x, root_y)?
                 .reply()?;
-            if win != self.root && win != self.window {
+            if win != self.root && win != self.window && Some(win) != own_img {
                 if let Some(ver) = self.xdnd_aware_version(win)? {
                     found = (win, ver);
                 }
@@ -2472,6 +4148,7 @@ impl App {
         let Some(drag) = self.file_drag.as_ref() else {
             return Ok(false);
         };
+        let src_win = drag.src_win;
         if !drag.started {
             let moved =
                 (event_x - drag.start_x).abs() > 6 || (event_y - drag.start_y).abs() > 6;
@@ -2484,7 +4161,7 @@ impl App {
                 .conn
                 .grab_pointer(
                     false,
-                    self.window,
+                    src_win,
                     EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
                     GrabMode::ASYNC,
                     GrabMode::ASYNC,
@@ -2657,11 +4334,14 @@ impl App {
             return;
         };
         let origin_y = ty + TAB_BAR_H + 6;
-        for (row, cells) in tab.grid.iter().enumerate() {
+        for row in 0..tab.rows {
             let y = origin_y + row as i32 * CELL_H;
             if y + CELL_H > ty + th {
                 break;
             }
+            let Some(cells) = tab.display_row(row) else {
+                continue;
+            };
             for col in 0..cells.len() {
                 if self.terminal_cell_selected(row, col) {
                     c.draw_rect(
@@ -2709,8 +4389,27 @@ impl App {
                 MINT_DARK,
             );
         }
+        if tab.scrollback > 0 {
+            let label = format!("up {} lines", tab.scrollback);
+            c.draw_round_rect(
+                i32::from(self.width) - 118,
+                ty + th - 27,
+                104,
+                20,
+                6,
+                Color::rgba(116, 213, 198, 130),
+            );
+            c.draw_text_center(
+                &self.bold,
+                &label,
+                i32::from(self.width) - 66,
+                ty + th - 24,
+                10.0,
+                MINT_DARK,
+            );
+        }
         // Cursor
-        if !tab.dead && self.focus == Focus::Terminal {
+        if !tab.dead && self.focus == Focus::Terminal && tab.scrollback == 0 {
             let cx = 10 + tab.cur_x as i32 * CELL_W;
             let cy = origin_y + tab.cur_y as i32 * CELL_H;
             c.draw_rect(cx, cy + 1, CELL_W, CELL_H - 2, Color::rgba(29, 145, 137, 145));

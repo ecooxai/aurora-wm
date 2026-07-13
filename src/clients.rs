@@ -475,7 +475,8 @@ impl Aurora {
                     | EventMask::BUTTON_RELEASE
                     | EventMask::POINTER_MOTION
                     | EventMask::LEAVE_WINDOW
-                    | EventMask::SUBSTRUCTURE_NOTIFY,
+                    | EventMask::SUBSTRUCTURE_NOTIFY
+                    | EventMask::SUBSTRUCTURE_REDIRECT,
             )
             .cursor(self.cursor)
             .background_pixel(0)

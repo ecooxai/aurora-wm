@@ -240,6 +240,7 @@ impl Aurora {
             clipboard_dirty: true,
             last_seen_clipboard_text: None,
             last_seen_clipboard_image_sig: None,
+            command_paste_armed: false,
             wm_s_atom,
             folder_context_open: false,
             folder_context_pos: (0, 0),
@@ -351,6 +352,7 @@ impl Aurora {
             let needs_pointer_poll = self.pending_resize.is_some()
                 || self.pending_ui_resize.is_some()
                 || self.pending_client_drag.is_some()
+                || self.settings.auto_power_saver_slider_dragging
                 || self.drag.is_some()
                 || self.ui_resize.is_some()
                 || self.pending_screenshot_button.is_some();
@@ -404,6 +406,24 @@ impl Aurora {
                     } else if pending.pressed_at.elapsed() >= Duration::from_secs(2) {
                         self.pending_client_drag = None;
                     }
+                }
+            }
+            if self.settings.auto_power_saver_slider_dragging {
+                if let Some(pointer) = pointer.as_ref() {
+                    let button_down =
+                        u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
+                    if button_down {
+                        let (settings_x, _, _, _) = self.settings_geometry();
+                        self.set_auto_power_saver_from_slider(
+                            i32::from(pointer.root_x) - i32::from(settings_x),
+                        )?;
+                    } else {
+                        self.settings.auto_power_saver_slider_dragging = false;
+                        self.pending_auto_power_saver_apply = None;
+                        self.apply_auto_power_saver_setting()?;
+                        self.redraw_settings()?;
+                    }
+                    handled_event = true;
                 }
             }
             if let Some(pointer) = pointer.as_ref().filter(|_| self.drag.is_some()) {
@@ -483,6 +503,7 @@ impl Aurora {
                 || self.pending_resize.is_some()
                 || self.pending_ui_resize.is_some()
                 || self.pending_client_drag.is_some()
+                || self.settings.auto_power_saver_slider_dragging
                 || self.pending_screenshot_button.is_some();
 
             if !interactive && self.last_tick.elapsed() >= IDLE_CHECK_INTERVAL {
@@ -590,6 +611,7 @@ impl Aurora {
             || self.pending_resize.is_some()
             || self.pending_ui_resize.is_some()
             || self.pending_client_drag.is_some()
+            || self.settings.auto_power_saver_slider_dragging
             || self.pending_screenshot_button.is_some();
         let mut timeout = if handled_event {
             if interactive {
@@ -715,15 +737,8 @@ impl Aurora {
             .auto_power_saver_input
             .trim()
             .parse::<u32>()
-            .unwrap_or(0)
-            .min(240);
-        if self.settings.auto_power_saver_minutes == 0 {
-            self.settings.auto_power_saver_input = "0".to_string();
-            self.settings.auto_power_saver_enabled = false;
-            self.last_pointer_pos = None;
-            save_app_commands(&self.settings)?;
-            return Ok(true);
-        }
+            .unwrap_or(self.settings.auto_power_saver_minutes)
+            .clamp(AUTO_POWER_SAVER_MIN_MINUTES, AUTO_POWER_SAVER_MAX_MINUTES);
         self.settings.auto_power_saver_input = self.settings.auto_power_saver_minutes.to_string();
         self.last_pointer_activity = Instant::now();
         self.last_pointer_pos = None;
@@ -817,6 +832,7 @@ impl Aurora {
             .event_mask(
                 EventMask::EXPOSURE
                     | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
                     | EventMask::POINTER_MOTION
                     | EventMask::KEY_PRESS,
             )

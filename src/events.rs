@@ -70,7 +70,12 @@ impl Aurora {
             Event::KeyRelease(ev) => self.handle_key_release(ev)?,
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
             Event::ButtonRelease(ev) => {
-                if self.pending_screenshot_button.is_some() {
+                if self.settings.auto_power_saver_slider_dragging {
+                    self.settings.auto_power_saver_slider_dragging = false;
+                    self.pending_auto_power_saver_apply = None;
+                    self.apply_auto_power_saver_setting()?;
+                    self.redraw_settings()?;
+                } else if self.pending_screenshot_button.is_some() {
                     self.handle_topbar_release(ev)?;
                 } else if self.screenshot_selection.is_some() {
                     self.finish_screenshot_selection(ev.root_x, ev.root_y)?;
@@ -407,7 +412,7 @@ impl Aurora {
                 self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
                 self.conn.set_input_focus(
                     InputFocus::POINTER_ROOT,
-                    self.ui.app_menu,
+                    self.ui.settings,
                     CURRENT_TIME,
                 )?;
             }
@@ -559,6 +564,21 @@ impl Aurora {
 
     pub(crate) fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<bool> {
         self.last_pointer_activity = Instant::now();
+        if self.settings.auto_power_saver_slider_dragging {
+            let button_down = u16::from(ev.state) & u16::from(KeyButMask::BUTTON1) != 0;
+            if button_down {
+                let (settings_x, _, _, _) = self.settings_geometry();
+                self.set_auto_power_saver_from_slider(
+                    i32::from(ev.root_x) - i32::from(settings_x),
+                )?;
+            } else {
+                self.settings.auto_power_saver_slider_dragging = false;
+                self.pending_auto_power_saver_apply = None;
+                self.apply_auto_power_saver_setting()?;
+                self.redraw_settings()?;
+            }
+            return Ok(true);
+        }
         if ev.event == self.ui.topbar && self.drag.is_none() {
             self.update_topbar_tooltip(i32::from(ev.event_x))?;
         }
@@ -946,6 +966,7 @@ impl Aurora {
                     ..ResizeEdges::default()
                 },
             )?,
+            11 => self.end_drag()?,
             _ => {}
         }
         Ok(())
@@ -1136,15 +1157,10 @@ impl Aurora {
                     Duration::from_secs(3),
                 )?;
             }
-            if !info.titlebar && ev.detail == 1 && client_y >= 0 && client_y <= CSD_DRAG_TOP_HEIGHT
-            {
-                self.pending_client_drag = Some(PendingClientDrag {
-                    client,
-                    root_x: ev.root_x,
-                    root_y: ev.root_y,
-                    pressed_at: Instant::now(),
-                });
-            }
+            // A client-side decorated window owns its titlebar interaction. GTK,
+            // Chromium and Firefox send _NET_WM_MOVERESIZE when a native drag starts;
+            // arming a second WM drag here races that request and can move the client
+            // inside its frame instead of moving the whole window.
             self.focus_window_at(client, ev.time)?;
             self.conn.flush()?;
             self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
@@ -1191,18 +1207,8 @@ impl Aurora {
                         Duration::from_secs(3),
                     )?;
                 }
-                let client_y = pointer
-                    .root_y
-                    .saturating_sub(info.y)
-                    .saturating_sub(title_h);
-                if !info.titlebar && client_y >= 0 && client_y <= CSD_DRAG_TOP_HEIGHT {
-                    self.pending_client_drag = Some(PendingClientDrag {
-                        client,
-                        root_x: pointer.root_x,
-                        root_y: pointer.root_y,
-                        pressed_at: Instant::now(),
-                    });
-                }
+                // Do not synthesize a top-strip drag for CSD windows. Their own
+                // titlebar sends _NET_WM_MOVERESIZE and remains fully interactive.
             }
         }
         self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;

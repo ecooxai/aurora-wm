@@ -253,7 +253,7 @@ impl Aurora {
         if let Some(client) = self.active_client {
             let _ = self.focus_window(client);
         }
-        paste_clipboard_now(&self.display);
+        self.paste_clipboard_into_focused_app()?;
         Ok(())
     }
 

@@ -980,7 +980,9 @@ pub(crate) fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
             settings.brightness_percent.clamp(10, 100),
             u8::from(settings.compositor_enabled),
             u8::from(settings.auto_power_saver_enabled),
-            settings.auto_power_saver_minutes.min(240),
+            settings
+                .auto_power_saver_minutes
+                .clamp(AUTO_POWER_SAVER_MIN_MINUTES, AUTO_POWER_SAVER_MAX_MINUTES),
             shortcut_setting_string(settings.shortcuts.folder),
             shortcut_setting_string(settings.shortcuts.terminal),
             shortcut_setting_string(settings.shortcuts.clipboard),

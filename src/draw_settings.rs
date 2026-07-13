@@ -269,7 +269,7 @@ impl Aurora {
             13.0,
             MUTED,
         );
-        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 196);
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 206);
         c.draw_text(&self.bold, "Auto power saver", sx + 16, 106, 15.0, INK);
         let switch_x = i32::from(c.width) - 78;
         let switch_y = 98;
@@ -339,14 +339,52 @@ impl Aurora {
             MUTED,
         );
 
-        c.draw_text(&self.bold, "Power profile", sx + 16, 174, 15.0, INK);
+        let slider_left = input_x;
+        let slider_right = i32::from(c.width) - 40;
+        let slider_width = slider_right - slider_left;
+        let slider_y = 178;
+        c.draw_round_rect(
+            slider_left,
+            slider_y,
+            slider_width,
+            8,
+            4,
+            Color::rgba(211, 225, 232, 190),
+        );
+        let thumb_x = auto_power_saver_slider_x(
+            self.settings.auto_power_saver_minutes,
+            slider_left,
+            slider_width,
+        );
+        c.draw_round_rect(
+            slider_left,
+            slider_y,
+            (thumb_x - slider_left).max(4),
+            8,
+            4,
+            if self.settings.auto_power_saver_enabled {
+                Color::rgba(116, 213, 198, 220)
+            } else {
+                Color::rgba(170, 190, 195, 180)
+            },
+        );
+        c.draw_circle(
+            thumb_x,
+            slider_y + 4,
+            if self.settings.auto_power_saver_slider_dragging { 7 } else { 6 },
+            Color::rgb(255, 255, 255),
+        );
+        c.draw_text(&self.regular, "1", slider_left, 188, 10.0, MUTED);
+        c.draw_text_right(&self.regular, "1000 min", slider_right, 188, 10.0, MUTED);
+
+        c.draw_text(&self.bold, "Power profile", sx + 16, 205, 15.0, INK);
         let modes = [
             PowerMode::Saver,
             PowerMode::Balanced,
             PowerMode::Performance,
         ];
         for (idx, mode) in modes.iter().enumerate() {
-            let y = 202 + idx as i32 * 24;
+            let y = 228 + idx as i32 * 22;
             let active = *mode == self.settings.power_mode;
             c.draw_round_rect(
                 sx + 16,

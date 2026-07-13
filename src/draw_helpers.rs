@@ -77,12 +77,16 @@ pub(crate) fn draw_metric_bar(
     value: f32,
     suffix: &str,
 ) {
+    let value_right = i32::from(c.width) - 40;
+    let bar_x = x + 72;
+    let bar_right = (value_right - 44).max(bar_x + 24);
+    let bar_w = bar_right - bar_x;
     c.draw_text(font, name, x, y - 1, 12.0, MUTED);
-    c.draw_round_rect(x + 72, y, 104, 8, 4, Color::rgba(211, 225, 232, 170));
+    c.draw_round_rect(bar_x, y, bar_w, 8, 4, Color::rgba(211, 225, 232, 170));
     c.draw_round_rect(
-        x + 72,
+        bar_x,
         y,
-        (104.0 * (value / 100.0).clamp(0.0, 1.0)) as i32,
+        (bar_w as f32 * (value / 100.0).clamp(0.0, 1.0)) as i32,
         8,
         4,
         Color::rgba(116, 213, 198, 210),
@@ -90,11 +94,46 @@ pub(crate) fn draw_metric_bar(
     c.draw_text_right(
         font,
         &format!("{value:.0}{suffix}"),
-        x + 212,
+        value_right,
         y - 6,
         12.0,
         INK,
     );
+}
+
+pub(crate) fn snap_auto_power_saver_minutes(minutes: u32) -> u32 {
+    let minutes = minutes.clamp(
+        AUTO_POWER_SAVER_MIN_MINUTES,
+        AUTO_POWER_SAVER_MAX_MINUTES,
+    );
+    if minutes < AUTO_POWER_SAVER_STEP_MINUTES / 2 {
+        return AUTO_POWER_SAVER_MIN_MINUTES;
+    }
+    (((minutes + AUTO_POWER_SAVER_STEP_MINUTES / 2) / AUTO_POWER_SAVER_STEP_MINUTES)
+        * AUTO_POWER_SAVER_STEP_MINUTES)
+        .min(AUTO_POWER_SAVER_MAX_MINUTES)
+}
+
+pub(crate) fn auto_power_saver_minutes_from_slider(x: i32, left: i32, width: i32) -> u32 {
+    if width <= 0 || x <= left {
+        return AUTO_POWER_SAVER_MIN_MINUTES;
+    }
+    if x >= left + width {
+        return AUTO_POWER_SAVER_MAX_MINUTES;
+    }
+    let span = AUTO_POWER_SAVER_MAX_MINUTES - AUTO_POWER_SAVER_MIN_MINUTES;
+    let raw = AUTO_POWER_SAVER_MIN_MINUTES
+        + ((x - left) as u32 * span + width as u32 / 2) / width as u32;
+    snap_auto_power_saver_minutes(raw)
+}
+
+pub(crate) fn auto_power_saver_slider_x(minutes: u32, left: i32, width: i32) -> i32 {
+    let minutes = minutes.clamp(
+        AUTO_POWER_SAVER_MIN_MINUTES,
+        AUTO_POWER_SAVER_MAX_MINUTES,
+    );
+    left + ((minutes - AUTO_POWER_SAVER_MIN_MINUTES) as i64 * i64::from(width)
+        / i64::from(AUTO_POWER_SAVER_MAX_MINUTES - AUTO_POWER_SAVER_MIN_MINUTES)) as i32
 }
 
 pub(crate) fn draw_info_row(c: &mut Canvas, font: &Font<'static>, x: i32, y: i32, key: &str, value: &str) {
@@ -143,6 +182,21 @@ pub(crate) fn resize_corner_edges_for_frame(
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod power_slider_tests {
+    use super::*;
+
+    #[test]
+    fn slider_covers_endpoints_and_uses_fifty_minute_steps() {
+        assert_eq!(auto_power_saver_minutes_from_slider(10, 10, 100), 1);
+        assert_eq!(auto_power_saver_minutes_from_slider(110, 10, 100), 1000);
+        let middle = auto_power_saver_minutes_from_slider(60, 10, 100);
+        assert_eq!(middle % AUTO_POWER_SAVER_STEP_MINUTES, 0);
+        assert_eq!(auto_power_saver_slider_x(1, 10, 100), 10);
+        assert_eq!(auto_power_saver_slider_x(1000, 10, 100), 110);
     }
 }
 

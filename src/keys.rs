@@ -27,6 +27,7 @@ use x11rb::protocol::composite::{self, ConnectionExt as CompositeConnectionExt};
 use x11rb::protocol::screensaver::ConnectionExt as ScreenSaverConnectionExt;
 use x11rb::protocol::shape::{self, ConnectionExt as ShapeConnectionExt};
 use x11rb::protocol::xfixes::{self, ConnectionExt as XFixesConnectionExt};
+use x11rb::protocol::xtest::{self, ConnectionExt as XTestConnectionExt};
 use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::{ErrorKind, Event};
@@ -78,6 +79,57 @@ impl Aurora {
             .get(keysym_column)
             .copied()
             .unwrap_or(base_keysym);
+        // Text fields must receive ordinary keys before global shortcuts get a chance
+        // to consume them. This matters when a user configured a digit as a shortcut.
+        if self.settings_visible
+            && self.settings.tab == SettingsTab::Power
+            && self.settings.auto_power_saver_editing
+        {
+            let mut changed = false;
+            match keysym {
+                0xff08 => {
+                    self.settings.auto_power_saver_input.pop();
+                    changed = true;
+                }
+                0xff0d => {
+                    self.settings.auto_power_saver_editing = false;
+                    self.pending_auto_power_saver_apply = None;
+                    self.apply_auto_power_saver_setting()?;
+                    self.conn
+                        .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+                }
+                0xff1b => {
+                    self.settings.auto_power_saver_input =
+                        self.settings.auto_power_saver_minutes.to_string();
+                    self.settings.auto_power_saver_editing = false;
+                    self.pending_auto_power_saver_apply = None;
+                    self.conn
+                        .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+                }
+                0x30..=0x39 if self.settings.auto_power_saver_input.len() < 4 => {
+                    let digit = char::from_u32(keysym).unwrap();
+                    if self.settings.auto_power_saver_input == "0" {
+                        self.settings.auto_power_saver_input.clear();
+                    }
+                    self.settings.auto_power_saver_input.push(digit);
+                    changed = true;
+                }
+                _ => return Ok(()),
+            }
+            if changed {
+                self.settings.auto_power_saver_minutes = self
+                    .settings
+                    .auto_power_saver_input
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(AUTO_POWER_SAVER_MIN_MINUTES)
+                    .clamp(AUTO_POWER_SAVER_MIN_MINUTES, AUTO_POWER_SAVER_MAX_MINUTES);
+                self.pending_auto_power_saver_apply =
+                    Some(Instant::now() + Duration::from_secs(3));
+            }
+            self.redraw_settings()?;
+            return Ok(());
+        }
         if self.app_menu_visible
             && !command
             && !ctrl
@@ -87,7 +139,10 @@ impl Aurora {
             return Ok(());
         }
         if command && !ctrl && !alt && !shift && matches!(base_keysym, 0x76 | 0x56) {
-            paste_clipboard_now(&self.display);
+            // The passive Super+V grab still has Super and V logically held here.
+            // Paste on V release so the injected native shortcut is not polluted by
+            // the command modifier and Ctrl+V itself remains entirely untouched.
+            self.command_paste_armed = true;
             return Ok(());
         }
         if self.capture_shortcut_key(&ev)? {
@@ -157,52 +212,6 @@ impl Aurora {
                         .push(char::from_u32(keysym).unwrap());
                 }
                 _ => return Ok(()),
-            }
-            self.redraw_settings()?;
-            return Ok(());
-        }
-        if self.settings.tab == SettingsTab::Power && self.settings.auto_power_saver_editing {
-            let mut changed = false;
-            match keysym {
-                0xff08 => {
-                    self.settings.auto_power_saver_input.pop();
-                    changed = true;
-                }
-                0xff0d => {
-                    self.settings.auto_power_saver_editing = false;
-                    self.conn
-                        .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
-                }
-                0xff1b => {
-                    self.settings.auto_power_saver_input =
-                        self.settings.auto_power_saver_minutes.to_string();
-                    self.settings.auto_power_saver_editing = false;
-                    self.pending_auto_power_saver_apply = None;
-                    self.conn
-                        .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
-                }
-                0x30..=0x39 if self.settings.auto_power_saver_input.len() < 3 => {
-                    let digit = char::from_u32(keysym).unwrap();
-                    if self.settings.auto_power_saver_input == "0" {
-                        self.settings.auto_power_saver_input.clear();
-                    }
-                    self.settings.auto_power_saver_input.push(digit);
-                    changed = true;
-                }
-                _ => return Ok(()),
-            }
-            if changed {
-                self.settings.auto_power_saver_minutes = self
-                    .settings
-                    .auto_power_saver_input
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or(0)
-                    .min(240);
-                if self.settings.auto_power_saver_input.is_empty() {
-                    self.settings.auto_power_saver_minutes = 0;
-                }
-                self.pending_auto_power_saver_apply = Some(Instant::now() + Duration::from_secs(3));
             }
             self.redraw_settings()?;
             return Ok(());
@@ -284,9 +293,116 @@ impl Aurora {
 
     pub(crate) fn handle_key_release(&mut self, ev: KeyReleaseEvent) -> AnyResult<()> {
         let mapping = self.conn.get_keyboard_mapping(ev.detail, 1)?.reply()?;
+        if self.command_paste_armed && mapping.keysyms.iter().any(|key| matches!(key, 0x76 | 0x56)) {
+            self.command_paste_armed = false;
+            self.paste_clipboard_into_focused_app()?;
+            return Ok(());
+        }
         if mapping.keysyms.contains(&0xffe9) || mapping.keysyms.contains(&0xffea) {
             self.reset_alt_tab_sequence();
         }
+        Ok(())
+    }
+
+    pub(crate) fn paste_clipboard_into_focused_app(&self) -> AnyResult<()> {
+        if self
+            .conn
+            .extension_information(xtest::X11_EXTENSION_NAME)?
+            .is_none()
+        {
+            eprintln!("aurora-wm: cannot paste: XTEST extension is unavailable");
+            return Ok(());
+        }
+
+        let focused = self.conn.get_input_focus()?.reply()?.focus;
+        let class = if focused == self.ui.folder_terminal {
+            "aurora-terminal".to_string()
+        } else {
+            let target = self.client_key_for(focused).or(self.active_client);
+            target.map(|window| self.window_class(window)).unwrap_or_default()
+        };
+        let terminal = terminal_uses_native_paste_shortcut(&class);
+
+        let Some(control) = self
+            .keycode_for_keysym(0xffe3)?
+            .or(self.keycode_for_keysym(0xffe4)?)
+        else {
+            return Ok(());
+        };
+        let Some(v) = self.keycode_for_keysym(0x76)? else {
+            return Ok(());
+        };
+        let shift = if terminal {
+            self.keycode_for_keysym(0xffe1)?
+                .or(self.keycode_for_keysym(0xffe2)?)
+        } else {
+            None
+        };
+        if terminal && shift.is_none() {
+            return Ok(());
+        }
+
+        // Super+V reaches this method from V's release while Super may still be
+        // physically held. Clear both Super variants before synthesizing the
+        // receiver's native paste chord. The later physical key-up is harmless.
+        for keysym in [0xffeb, 0xffec] {
+            if let Some(keycode) = self.keycode_for_keysym(keysym)? {
+                self.conn.xtest_fake_input(
+                    KEY_RELEASE_EVENT,
+                    keycode,
+                    CURRENT_TIME,
+                    self.root,
+                    0,
+                    0,
+                    0,
+                )?;
+            }
+        }
+        self.conn.xtest_fake_input(
+            KEY_PRESS_EVENT,
+            control,
+            CURRENT_TIME,
+            self.root,
+            0,
+            0,
+            0,
+        )?;
+        if let Some(shift) = shift {
+            self.conn.xtest_fake_input(
+                KEY_PRESS_EVENT,
+                shift,
+                CURRENT_TIME,
+                self.root,
+                0,
+                0,
+                0,
+            )?;
+        }
+        self.conn
+            .xtest_fake_input(KEY_PRESS_EVENT, v, CURRENT_TIME, self.root, 0, 0, 0)?;
+        self.conn
+            .xtest_fake_input(KEY_RELEASE_EVENT, v, CURRENT_TIME, self.root, 0, 0, 0)?;
+        if let Some(shift) = shift {
+            self.conn.xtest_fake_input(
+                KEY_RELEASE_EVENT,
+                shift,
+                CURRENT_TIME,
+                self.root,
+                0,
+                0,
+                0,
+            )?;
+        }
+        self.conn.xtest_fake_input(
+            KEY_RELEASE_EVENT,
+            control,
+            CURRENT_TIME,
+            self.root,
+            0,
+            0,
+            0,
+        )?;
+        self.conn.flush()?;
         Ok(())
     }
 

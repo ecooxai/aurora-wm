@@ -224,6 +224,7 @@ pub(crate) struct SettingsState {
     pub(crate) auto_power_saver_minutes: u32,
     pub(crate) auto_power_saver_input: String,
     pub(crate) auto_power_saver_editing: bool,
+    pub(crate) auto_power_saver_slider_dragging: bool,
     pub(crate) selected_mode: usize,
     pub(crate) scroll: i32,
     pub(crate) app_kind: DefaultAppKind,
@@ -267,7 +268,8 @@ pub(crate) struct ShortcutConfig {
 
 impl Default for SettingsState {
     fn default() -> Self {
-        let auto_power_saver_minutes = read_u32_setting("auto_power_saver_minutes", 10).min(240);
+        let auto_power_saver_minutes = read_u32_setting("auto_power_saver_minutes", 50)
+            .clamp(AUTO_POWER_SAVER_MIN_MINUTES, AUTO_POWER_SAVER_MAX_MINUTES);
         let auto_power_saver_enabled =
             read_bool_setting("auto_power_saver_enabled", auto_power_saver_minutes > 0);
         Self {
@@ -280,6 +282,7 @@ impl Default for SettingsState {
             auto_power_saver_minutes,
             auto_power_saver_input: auto_power_saver_minutes.to_string(),
             auto_power_saver_editing: false,
+            auto_power_saver_slider_dragging: false,
             selected_mode: 0,
             scroll: 0,
             app_kind: DefaultAppKind::Terminal,
@@ -1071,6 +1074,7 @@ pub(crate) struct Aurora {
     pub(crate) clipboard_dirty: bool,
     pub(crate) last_seen_clipboard_text: Option<String>,
     pub(crate) last_seen_clipboard_image_sig: Option<u64>,
+    pub(crate) command_paste_armed: bool,
     pub(crate) wm_s_atom: Atom,
     pub(crate) folder_context_open: bool,
     pub(crate) folder_context_pos: (i32, i32),

@@ -3,6 +3,8 @@
 //! audio/video playback embedded via mpv (ffplay fallback).
 
 use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -27,12 +29,50 @@ pub struct TextView {
     pub dirty: bool,
     pub editable: bool,
     pub status: String,
+    pub selection: Option<TextSelection>,
+}
+
+#[derive(Clone, Copy)]
+pub struct TextSelection {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
 }
 
 impl TextView {
     pub fn open(path: &Path) -> Self {
-        let content = fs::read_to_string(path).unwrap_or_default();
-        let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+        let file_size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        let estimated_lines = (file_size / 64).min(1_000_000) as usize;
+        let mut lines = Vec::with_capacity(estimated_lines);
+        let mut read_error = None;
+        let mut ended_with_newline = false;
+        if let Ok(file) = File::open(path) {
+            let mut reader = BufReader::with_capacity(256 * 1024, file);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        ended_with_newline = line.ends_with('\n');
+                        if ended_with_newline {
+                            line.pop();
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                        }
+                        lines.push(std::mem::take(&mut line));
+                    }
+                    Err(err) => {
+                        ended_with_newline = false;
+                        read_error = Some(format!("Read stopped: {err}"));
+                        break;
+                    }
+                }
+            }
+        }
+        if ended_with_newline {
+            lines.push(String::new());
+        }
         if lines.is_empty() {
             lines.push(String::new());
         }
@@ -43,7 +83,14 @@ impl TextView {
             scroll: 0,
             dirty: false,
             editable: true,
-            status: String::new(),
+            status: read_error.unwrap_or_else(|| {
+                if file_size >= 8 * 1024 * 1024 {
+                    format!("Large file: {:.1} MB", file_size as f64 / 1_048_576.0)
+                } else {
+                    String::new()
+                }
+            }),
+            selection: None,
         }
     }
 
@@ -59,7 +106,17 @@ impl TextView {
         if !self.editable {
             return;
         }
-        match fs::write(&self.path, self.lines.join("\n")) {
+        let result = File::create(&self.path).and_then(|file| {
+            let mut writer = BufWriter::with_capacity(256 * 1024, file);
+            for (idx, line) in self.lines.iter().enumerate() {
+                if idx > 0 {
+                    writer.write_all(b"\n")?;
+                }
+                writer.write_all(line.as_bytes())?;
+            }
+            writer.flush()
+        });
+        match result {
             Ok(()) => {
                 self.dirty = false;
                 self.status = "Saved".to_string();
@@ -77,6 +134,7 @@ impl TextView {
         let byte = char_to_byte(line_text, col);
         line_text.insert(byte, ch);
         self.cursor.1 += 1;
+        self.selection = None;
         self.dirty = true;
     }
 
@@ -89,6 +147,7 @@ impl TextView {
         let rest = self.lines[line].split_off(byte);
         self.lines.insert(line + 1, rest);
         self.cursor = (line + 1, 0);
+        self.selection = None;
         self.dirty = true;
     }
 
@@ -101,12 +160,14 @@ impl TextView {
             let byte = char_to_byte(&self.lines[line], col - 1);
             self.lines[line].remove(byte);
             self.cursor.1 -= 1;
+            self.selection = None;
             self.dirty = true;
         } else if line > 0 {
             let prev_len = self.lines[line - 1].chars().count();
             let current = self.lines.remove(line);
             self.lines[line - 1].push_str(&current);
             self.cursor = (line - 1, prev_len);
+            self.selection = None;
             self.dirty = true;
         }
     }
@@ -126,6 +187,33 @@ impl TextView {
         }
         col = col.min(max_col);
         self.cursor = (line, col);
+        self.selection = None;
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        if start == end || start.0 >= self.lines.len() {
+            return None;
+        }
+        let mut selected = Vec::new();
+        for row in start.0..=end.0.min(self.lines.len() - 1) {
+            let line = &self.lines[row];
+            let char_count = line.chars().count();
+            let first = if row == start.0 { start.1.min(char_count) } else { 0 };
+            let last = if row == end.0 { end.1.min(char_count) } else { char_count };
+            selected.push(
+                line.chars()
+                    .skip(first)
+                    .take(last.saturating_sub(first))
+                    .collect::<String>(),
+            );
+        }
+        Some(selected.join("\n"))
     }
 }
 

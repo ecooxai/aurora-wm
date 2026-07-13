@@ -301,18 +301,46 @@ pub(crate) fn copy_image_to_clipboard(path: &Path) {
     }
 }
 
-pub(crate) fn paste_clipboard_now(display: &str) {
-    if !command_exists("xdotool") {
-        return;
+pub(crate) fn terminal_uses_native_paste_shortcut(window_class: &str) -> bool {
+    if window_class.contains("aurora-files") {
+        // Aurora Files owns an embedded terminal under the same top-level X11
+        // class as its folder view. Its terminal handles Ctrl+Shift+V natively.
+        return true;
     }
-    let mut cmd = Command::new("sh");
-    cmd.env("DISPLAY", display)
-        .arg("-c")
-        .arg("sleep 0.08; xdotool key ctrl+v")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    spawn_detached(cmd);
+    window_class
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            matches!(
+                part,
+                "alacritty"
+                    | "blackbox"
+                    | "console"
+                    | "contour"
+                    | "coolretroterm"
+                    | "foot"
+                    | "ghostty"
+                    | "gnometerminal"
+                    | "hyper"
+                    | "kitty"
+                    | "konsole"
+                    | "lxterminal"
+                    | "mateterminal"
+                    | "qterminal"
+                    | "rio"
+                    | "rxvt"
+                    | "st"
+                    | "tabby"
+                    | "terminator"
+                    | "terminal"
+                    | "tilix"
+                    | "urxvt"
+                    | "uxterm"
+                    | "wezterm"
+                    | "xfce4terminal"
+                    | "xterm"
+            )
+        })
 }
 
 pub(crate) fn clipboard_history_path() -> PathBuf {
@@ -517,4 +545,41 @@ pub(crate) fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
         }
     }
     Some(PathBuf::from(out))
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::terminal_uses_native_paste_shortcut;
+
+    #[test]
+    fn recognizes_terminal_window_classes() {
+        for class in [
+            "gnome-terminal-server\0Gnome-terminal",
+            "kitty\0kitty",
+            "org.gnome.Console\0org.gnome.Console",
+            "st\0St",
+            "Alacritty\0Alacritty",
+            "aurora-files\0Aurora Files",
+        ] {
+            assert!(
+                terminal_uses_native_paste_shortcut(&class.to_ascii_lowercase()),
+                "expected terminal class: {class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_standard_apps_on_standard_paste() {
+        for class in [
+            "firefox\0Firefox",
+            "google-chrome\0Google-chrome",
+            "org.gnome.Nautilus\0org.gnome.Nautilus",
+            "code\0Code",
+        ] {
+            assert!(
+                !terminal_uses_native_paste_shortcut(&class.to_ascii_lowercase()),
+                "expected standard app class: {class:?}"
+            );
+        }
+    }
 }

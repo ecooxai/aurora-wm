@@ -69,7 +69,9 @@ const FOLDER_TERMINAL_CELL_W: i32 = 8;
 const FOLDER_TERMINAL_CELL_H: i32 = 18;
 const FOLDER_ENTRY_LIMIT: usize = 512;
 const FOLDER_OTHER_ENTRY_LIMIT: usize = 64;
-const CSD_DRAG_TOP_HEIGHT: i16 = 44;
+const AUTO_POWER_SAVER_MIN_MINUTES: u32 = 1;
+const AUTO_POWER_SAVER_MAX_MINUTES: u32 = 1000;
+const AUTO_POWER_SAVER_STEP_MINUTES: u32 = 50;
 const TERMINAL_FALLBACKS: [&str; 5] = [
     "xfce4-terminal",
     "lxterminal",

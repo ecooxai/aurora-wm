@@ -1,6 +1,6 @@
 [package]
 name = "aurora-wm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -8,7 +8,7 @@ image = { version = "0.25.8", default-features = false, features = ["png", "jpeg
 libc = "0.2"
 rusttype = "0.9.3"
 time = { version = "0.3.44", features = ["formatting", "local-offset"] }
-x11rb = { version = "0.13.2", default-features = false, features = ["image", "composite", "damage", "render", "screensaver", "shape", "xfixes"] }
+x11rb = { version = "0.13.2", default-features = false, features = ["image", "composite", "damage", "render", "screensaver", "shape", "xfixes", "xtest"] }
 
 [profile.release]
 lto = "fat"

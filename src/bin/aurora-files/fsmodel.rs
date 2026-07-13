@@ -111,10 +111,36 @@ pub struct Place {
     pub path: PathBuf,
 }
 
+/// File that stores user-pinned sidebar folders, one absolute path per line.
+fn pinned_file() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("aurora-files/pinned")
+}
+
+/// Pin a folder to the sidebar (persisted across restarts).
+pub fn add_pinned(path: &Path) {
+    let file = pinned_file();
+    let mut lines: Vec<String> = fs::read_to_string(&file)
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    let entry = path.to_string_lossy().into_owned();
+    if lines.iter().any(|line| line == &entry) {
+        return;
+    }
+    lines.push(entry);
+    if let Some(parent) = file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&file, lines.join("\n") + "\n");
+}
+
 pub fn places() -> Vec<Place> {
     let home = home_dir();
     let mut out = vec![
         Place { name: "Home".into(), path: home.clone() },
+        Place { name: "Desktop".into(), path: home.join("Desktop") },
         Place { name: "Documents".into(), path: home.join("Documents") },
         Place { name: "Downloads".into(), path: home.join("Downloads") },
         Place { name: "Pictures".into(), path: home.join("Pictures") },
@@ -131,6 +157,21 @@ pub fn places() -> Vec<Place> {
                         path: entry.path(),
                     });
                 }
+            }
+        }
+    }
+    // User-pinned folders.
+    if let Ok(text) = fs::read_to_string(pinned_file()) {
+        for line in text.lines().filter(|line| !line.trim().is_empty()).take(12) {
+            let path = PathBuf::from(line);
+            if path.is_dir() && !out.iter().any(|place| place.path == path) {
+                out.push(Place {
+                    name: path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "/".into()),
+                    path,
+                });
             }
         }
     }

@@ -4,8 +4,8 @@
 //! navigates to a folder while the active tab is running a foreground
 //! program, a new tab is opened instead of disturbing it.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
-use std::io::Read;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,8 @@ use crate::canvas::Color;
 
 pub const TERM_FG: Color = Color::rgb(32, 43, 54);
 pub const TERM_BG: Color = Color::rgb(247, 252, 255);
+/// Maximum number of completed terminal rows retained per tab.
+pub const MAX_HISTORY_LINES: usize = 50_000;
 
 #[derive(Clone, Copy)]
 pub struct Cell {
@@ -37,6 +39,9 @@ pub struct Tab {
     pub cols: usize,
     pub rows: usize,
     pub grid: Vec<Vec<Cell>>,
+    pub history: VecDeque<Vec<Cell>>,
+    /// Number of rows the viewport is currently above the live screen.
+    pub scrollback: usize,
     pub cur_x: usize,
     pub cur_y: usize,
     pub saved_cursor: (usize, usize),
@@ -52,6 +57,7 @@ pub struct Tab {
     pub wrap_pending: bool,
     pub bracketed_paste: bool,
     pub mouse_enabled: bool,
+    pub alternate_screen: bool,
 }
 
 pub enum EscState {
@@ -141,6 +147,8 @@ impl Tab {
             cols,
             rows,
             grid: vec![vec![Cell::default(); cols]; rows],
+            history: VecDeque::new(),
+            scrollback: 0,
             cur_x: 0,
             cur_y: 0,
             saved_cursor: (0, 0),
@@ -159,6 +167,7 @@ impl Tab {
             wrap_pending: false,
             bracketed_paste: false,
             mouse_enabled: false,
+            alternate_screen: false,
         })
     }
 
@@ -240,6 +249,7 @@ impl Tab {
         self.cur_y = self.cur_y.min(rows - 1);
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
+        self.scrollback = self.scrollback.min(self.history.len());
         let ws = libc::winsize {
             ws_col: cols as u16,
             ws_row: rows as u16,
@@ -252,8 +262,46 @@ impl Tab {
     }
 
     fn scroll_up(&mut self) {
+        if self.scroll_top == 0 && self.scroll_bottom + 1 == self.rows && !self.alternate_screen {
+            let was_scrolled = self.scrollback > 0;
+            self.history.push_back(self.grid[self.scroll_top].clone());
+            if self.history.len() > MAX_HISTORY_LINES {
+                self.history.pop_front();
+            }
+            if was_scrolled {
+                self.scrollback = (self.scrollback + 1).min(self.history.len());
+            }
+        }
         self.grid[self.scroll_top..=self.scroll_bottom].rotate_left(1);
         self.grid[self.scroll_bottom] = vec![Cell::default(); self.cols];
+    }
+
+    /// Move the viewport through retained output. Positive values scroll up.
+    pub fn scroll_view(&mut self, lines: i32) {
+        if lines > 0 {
+            self.scrollback = (self.scrollback + lines as usize).min(self.history.len());
+        } else if lines < 0 {
+            self.scrollback = self.scrollback.saturating_sub((-lines) as usize);
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scrollback = 0;
+    }
+
+    /// A row in the current viewport, combining retained history and live grid.
+    pub fn display_row(&self, row: usize) -> Option<&[Cell]> {
+        if row >= self.rows {
+            return None;
+        }
+        let logical = self.history.len().saturating_sub(self.scrollback) + row;
+        if logical < self.history.len() {
+            self.history.get(logical).map(Vec::as_slice)
+        } else {
+            self.grid
+                .get(logical - self.history.len())
+                .map(Vec::as_slice)
+        }
     }
 
     fn scroll_down(&mut self) {
@@ -517,6 +565,7 @@ impl Tab {
                     self.bracketed_paste = enabled;
                 }
                 if buf.starts_with('?') && (p0 == 1049 || p0 == 47 || p0 == 1047) {
+                    self.alternate_screen = enabled;
                     for row in self.grid.iter_mut() {
                         for cell in row.iter_mut() {
                             *cell = Cell::default();
@@ -588,4 +637,73 @@ pub fn fd_readable(fd: RawFd) -> bool {
         revents: 0,
     };
     unsafe { libc::poll(&mut pfd, 1, 0) > 0 && pfd.revents & libc::POLLIN != 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tab(cols: usize, rows: usize) -> Tab {
+        Tab {
+            pty: -1,
+            pid: -1,
+            cols,
+            rows,
+            grid: vec![vec![Cell::default(); cols]; rows],
+            history: VecDeque::new(),
+            scrollback: 0,
+            cur_x: 0,
+            cur_y: 0,
+            saved_cursor: (0, 0),
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
+            fg: TERM_FG,
+            bold: false,
+            esc: EscState::None,
+            esc_buf: String::new(),
+            title: String::new(),
+            cwd: PathBuf::new(),
+            dead: true,
+            wrap_pending: false,
+            bracketed_paste: false,
+            mouse_enabled: false,
+            alternate_screen: false,
+        }
+    }
+
+    #[test]
+    fn scrollback_combines_history_and_live_grid() {
+        let mut tab = test_tab(4, 3);
+        for ch in ['a', 'b', 'c', 'd'] {
+            tab.grid[0][0].ch = ch;
+            tab.scroll_up();
+        }
+
+        assert_eq!(tab.history.len(), 4);
+        tab.scroll_view(2);
+        assert_eq!(tab.scrollback, 2);
+        assert_eq!(tab.display_row(0).unwrap()[0].ch, 'c');
+        assert_eq!(tab.display_row(1).unwrap()[0].ch, 'd');
+
+        tab.scroll_to_bottom();
+        assert_eq!(tab.scrollback, 0);
+        assert_eq!(tab.display_row(0).unwrap()[0].ch, ' ');
+    }
+
+    #[test]
+    fn scrollback_is_capped_at_default_limit() {
+        let mut tab = test_tab(1, 2);
+        for _ in 0..=MAX_HISTORY_LINES {
+            tab.scroll_up();
+        }
+        assert_eq!(tab.history.len(), MAX_HISTORY_LINES);
+    }
+
+    #[test]
+    fn alternate_screen_does_not_enter_history() {
+        let mut tab = test_tab(4, 3);
+        tab.alternate_screen = true;
+        tab.scroll_up();
+        assert!(tab.history.is_empty());
+    }
 }
