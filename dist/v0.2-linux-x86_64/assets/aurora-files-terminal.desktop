@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Aurora Terminal
+GenericName=Terminal Emulator
+Comment=Tabbed terminal from Aurora Files
+Exec=aurora-files --terminal
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+StartupWMClass=aurora-files
