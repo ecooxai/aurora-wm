@@ -79,6 +79,12 @@ impl Aurora {
             .get(keysym_column)
             .copied()
             .unwrap_or(base_keysym);
+        if self.recording_menu_visible {
+            if keysym == 0xff1b {
+                self.hide_recording_menu()?;
+            }
+            return Ok(());
+        }
         // Text fields must receive ordinary keys before global shortcuts get a chance
         // to consume them. This matters when a user configured a digit as a shortcut.
         if self.settings_visible

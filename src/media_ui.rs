@@ -882,12 +882,13 @@ impl Aurora {
             );
             let visible = ((i32::from(h) - 100) / 30).max(1) as usize;
             let max_scroll = rows.len().saturating_sub(visible);
+            let previous_scroll = self.app_menu_scroll;
             if button == 4 {
                 self.app_menu_scroll = self.app_menu_scroll.saturating_sub(3);
             } else {
                 self.app_menu_scroll = (self.app_menu_scroll + 3).min(max_scroll);
             }
-            self.redraw_app_menu()?;
+            if self.app_menu_scroll != previous_scroll { self.redraw_app_menu()?; }
             return Ok(());
         }
         if self.app_menu_more && x >= 264 && button == 1 && y >= 88 {

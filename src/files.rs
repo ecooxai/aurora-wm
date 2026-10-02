@@ -152,16 +152,19 @@ pub(crate) fn app_catalog_rows(
     expanded_categories: &HashSet<String>,
 ) -> Vec<AppCatalogRow> {
     let searching = !query.trim().is_empty();
-    let mut entries = read_desktop_entries()
-        .into_iter()
-        .filter_map(|entry| fuzzy_app_score(query, &entry).map(|score| (score, entry)))
+    let snapshot = cached_desktop_entries();
+    let mut entries = snapshot.iter()
+        .filter_map(|entry| fuzzy_app_score(query, entry).map(|score| (score, entry)))
         .collect::<Vec<_>>();
-    entries.sort_by(|(score_a, a), (score_b, b)| {
-        score_a
-            .cmp(score_b)
-            .then(category_rank(&a.category).cmp(&category_rank(&b.category)))
-            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    // Empty-query rows already have the snapshot's category/name order.
+    if searching {
+        entries.sort_by(|(score_a, a), (score_b, b)| {
+            score_a
+                .cmp(score_b)
+                .then(category_rank(&a.category).cmp(&category_rank(&b.category)))
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
 
     let mut rows = Vec::new();
     for category in ["Internet", "System", "Program", "Media", "Other"] {

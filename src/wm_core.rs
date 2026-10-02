@@ -122,6 +122,7 @@ impl Aurora {
             folder_terminal: conn.generate_id()?,
             screenshot_overlay: conn.generate_id()?,
             recording_notice: conn.generate_id()?,
+            recording_menu: conn.generate_id()?,
             app_menu: conn.generate_id()?,
             aurora_menu: conn.generate_id()?,
             clipboard_menu: conn.generate_id()?,
@@ -270,6 +271,9 @@ impl Aurora {
             topbar_notice: None,
             recording: None,
             recording_error_notice: None,
+            recording_max_duration: Duration::from_secs(30 * 60),
+            pending_recording_button: None,
+            recording_menu_visible: false,
             ffplay_process: None,
             pending_window_nudges: Vec::new(),
             wifi_refresh_rx: None,
@@ -328,6 +332,7 @@ impl Aurora {
             }
 
             if self.poll_screen_recording()? { handled_event = true; }
+            if self.poll_recording_button()? { handled_event = true; }
             if self.folder_terminal.visible && self.poll_folder_terminal()? {
                 handled_event = true;
             }
@@ -654,6 +659,11 @@ impl Aurora {
             timeout = timeout
                 .min((pending.pressed_at + Duration::from_secs(2)).saturating_duration_since(now));
         }
+        if let Some(pending) = self.pending_recording_button.as_ref() {
+            if !pending.menu_opened {
+                timeout = timeout.min((pending.pressed_at + crate::recording_ui::RECORDING_HOLD_DELAY).saturating_duration_since(now));
+            }
+        }
         if let Some((_, until)) = self.topbar_notice.as_ref() {
             timeout = timeout.min((*until).saturating_duration_since(now));
         }
@@ -951,6 +961,13 @@ impl Aurora {
             self.depth, self.ui.recording_notice, self.root, 0, 0, 460, 130, 0,
             WindowClass::INPUT_OUTPUT, self.visual,
             &CreateWindowAux::new().override_redirect(1).event_mask(EventMask::EXPOSURE).background_pixel(0),
+        )?;
+        self.conn.create_window(
+            self.depth, self.ui.recording_menu, self.root, 0, 0, 260, 270, 0,
+            WindowClass::INPUT_OUTPUT, self.visual,
+            &CreateWindowAux::new().override_redirect(1)
+                .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::KEY_PRESS)
+                .cursor(self.cursor).background_pixel(0),
         )?;
         let menu = self.app_menu_geometry();
         let menu_aux = CreateWindowAux::new()

@@ -1,0 +1,241 @@
+display,workload,sample,elapsed_seconds,pid,interval_seconds,cpu_percent_one_core,rss_bytes,swap_bytes,rss_plus_swap_bytes,cpu_violation,rss_violation,memory_violation
+:11,recording with All apps open and three wheel scrolls,1,1.000169,2931557,1.000169,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,2,2.000072,2931557,0.999903,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,3,3.000069,2931557,0.999998,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,4,4.000187,2931557,1.000118,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,5,5.000178,2931557,0.999991,1.000009,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,6,6.000095,2931557,0.999917,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,7,7.00018,2931557,1.000085,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,8,8.000179,2931557,0.999999,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,9,9.000111,2931557,0.999933,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,10,10.000175,2931557,1.000063,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,11,11.000122,2931557,0.999947,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,12,12.000103,2931557,0.999981,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,13,13.000177,2931557,1.000074,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,14,14.000176,2931557,0.999998,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,15,15.000182,2931557,1.000006,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,16,16.000102,2931557,0.99992,1.00008,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,17,17.000094,2931557,0.999992,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,18,18.000176,2931557,1.000082,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,19,19.000105,2931557,0.999929,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,20,20.000068,2931557,0.999963,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,21,21.000179,2931557,1.000111,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,22,22.000068,2931557,0.999889,1.000111,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,23,23.00019,2931557,1.000122,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,24,24.00018,2931557,0.99999,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,25,25.000179,2931557,0.999999,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,26,26.000176,2931557,0.999997,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,27,27.000072,2931557,0.999897,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,28,28.000105,2931557,1.000032,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,29,29.000188,2931557,1.000084,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,30,30.000071,2931557,0.999883,1.000117,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,31,31.000176,2931557,1.000105,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,32,32.000106,2931557,0.99993,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,33,33.000161,2931557,1.000054,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,34,34.000177,2931557,1.000016,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,35,35.000103,2931557,0.999927,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,36,36.000069,2931557,0.999966,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,37,37.000119,2931557,1.00005,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,38,38.000163,2931557,1.000044,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,39,39.000246,2931557,1.000083,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,40,40.000149,2931557,0.999903,1.000097,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,41,41.0001,2931557,0.999951,0.0,14278656,0,14278656,False,False,False
+:11,recording with All apps open and three wheel scrolls,42,42.000091,2931557,0.999991,1.000009,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,43,43.00007,2931557,0.999979,4.000086,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,44,44.000103,2931557,1.000033,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,45,45.000064,2931557,0.999961,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,46,46.000067,2931557,1.000003,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,47,47.000067,2931557,1.0,1.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,48,48.000069,2931557,1.000002,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,49,49.000083,2931557,1.000014,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,50,50.000103,2931557,1.00002,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,51,51.000101,2931557,0.999998,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,52,52.000067,2931557,0.999966,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,53,53.000091,2931557,1.000024,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,54,54.00018,2931557,1.000089,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,55,55.000067,2931557,0.999887,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,56,56.000065,2931557,0.999998,1.000002,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,57,57.000067,2931557,1.000002,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,58,58.000067,2931557,1.0,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,59,59.000095,2931557,1.000029,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,60,60.000096,2931557,1.0,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,61,61.000096,2931557,1.000001,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,62,62.000094,2931557,0.999998,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,63,63.000099,2931557,1.000004,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,64,64.000101,2931557,1.000002,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,65,65.000177,2931557,1.000076,0.999924,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,66,66.000143,2931557,0.999966,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,67,67.000072,2931557,0.999928,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,68,68.00009,2931557,1.000019,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,69,69.000072,2931557,0.999982,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,70,70.000181,2931557,1.000109,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,71,71.000073,2931557,0.999892,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,72,72.000104,2931557,1.000031,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,73,73.000175,2931557,1.000072,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,74,74.000171,2931557,0.999995,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,75,75.00018,2931557,1.000009,0.999991,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,76,76.000095,2931557,0.999915,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,77,77.000113,2931557,1.000018,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,78,78.000066,2931557,0.999953,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,79,79.000068,2931557,1.000001,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,80,80.000074,2931557,1.000007,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,81,81.000068,2931557,0.999994,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,82,82.000067,2931557,0.999999,1.000001,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,83,83.000085,2931557,1.000018,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,84,84.000065,2931557,0.99998,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,85,85.000177,2931557,1.000112,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,86,86.000065,2931557,0.999888,1.000112,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,87,87.000148,2931557,1.000084,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,88,88.000103,2931557,0.999954,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,89,89.000181,2931557,1.000078,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,90,90.000069,2931557,0.999888,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,91,91.000099,2931557,1.00003,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,92,92.000069,2931557,0.99997,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,93,93.000094,2931557,1.000025,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,94,94.000103,2931557,1.000009,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,95,95.000067,2931557,0.999963,1.000037,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,96,96.000106,2931557,1.00004,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,97,97.0001,2931557,0.999994,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,98,98.000104,2931557,1.000004,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,99,99.000068,2931557,0.999964,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,100,100.000065,2931557,0.999998,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,101,101.000177,2931557,1.000112,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,102,102.000074,2931557,0.999897,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,103,103.000181,2931557,1.000107,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,104,104.000184,2931557,1.000003,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,105,105.000174,2931557,0.99999,1.00001,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,106,106.000175,2931557,1.000001,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,107,107.000107,2931557,0.999932,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,108,108.000076,2931557,0.999969,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,109,109.000092,2931557,1.000016,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,110,110.000068,2931557,0.999976,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,111,111.000175,2931557,1.000107,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,112,112.000079,2931557,0.999904,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,113,113.000066,2931557,0.999987,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,114,114.000168,2931557,1.000102,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,115,115.000085,2931557,0.999917,1.000083,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,116,116.000194,2931557,1.000108,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,117,117.000065,2931557,0.999871,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,118,118.000065,2931557,1.0,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,119,119.000104,2931557,1.000039,0.0,14467072,0,14467072,False,False,False
+:11,recording with All apps open and three wheel scrolls,120,120.000099,2931557,0.999994,0.0,14467072,0,14467072,False,False,False
+:0,installed session,1,1.000069,2941772,1.000069,0.0,18878464,0,18878464,False,False,False
+:0,installed session,2,2.000066,2941772,0.999997,0.0,18878464,0,18878464,False,False,False
+:0,installed session,3,3.000065,2941772,0.999999,2.000002,20529152,0,20529152,False,False,False
+:0,installed session,4,4.000177,2941772,1.000112,0.0,20529152,0,20529152,False,False,False
+:0,installed session,5,5.000065,2941772,0.999888,0.0,20529152,0,20529152,False,False,False
+:0,installed session,6,6.0001,2941772,1.000036,0.0,20529152,0,20529152,False,False,False
+:0,installed session,7,7.000067,2941772,0.999967,0.0,20529152,0,20529152,False,False,False
+:0,installed session,8,8.000067,2941772,1.0,1.0,20529152,0,20529152,False,False,False
+:0,installed session,9,9.000066,2941772,0.999999,0.0,20529152,0,20529152,False,False,False
+:0,installed session,10,10.000069,2941772,1.000003,0.0,20529152,0,20529152,False,False,False
+:0,installed session,11,11.000074,2941772,1.000005,0.0,20529152,0,20529152,False,False,False
+:0,installed session,12,12.000066,2941772,0.999992,0.0,20529152,0,20529152,False,False,False
+:0,installed session,13,13.000072,2941772,1.000005,0.0,20529152,0,20529152,False,False,False
+:0,installed session,14,14.000186,2941772,1.000114,0.0,20529152,0,20529152,False,False,False
+:0,installed session,15,15.000065,2941772,0.999879,0.0,20529152,0,20529152,False,False,False
+:0,installed session,16,16.000066,2941772,1.0,0.0,20529152,0,20529152,False,False,False
+:0,installed session,17,17.000103,2941772,1.000038,0.0,20529152,0,20529152,False,False,False
+:0,installed session,18,18.000069,2941772,0.999966,0.0,20529152,0,20529152,False,False,False
+:0,installed session,19,19.000174,2941772,1.000105,0.0,20529152,0,20529152,False,False,False
+:0,installed session,20,20.000182,2941772,1.000008,0.0,20529152,0,20529152,False,False,False
+:0,installed session,21,21.000123,2941772,0.999941,0.0,20529152,0,20529152,False,False,False
+:0,installed session,22,22.000185,2941772,1.000062,0.0,20529152,0,20529152,False,False,False
+:0,installed session,23,23.000182,2941772,0.999997,0.0,20529152,0,20529152,False,False,False
+:0,installed session,24,24.000176,2941772,0.999993,0.0,20529152,0,20529152,False,False,False
+:0,installed session,25,25.000103,2941772,0.999927,0.0,20529152,0,20529152,False,False,False
+:0,installed session,26,26.000189,2941772,1.000086,0.0,20529152,0,20529152,False,False,False
+:0,installed session,27,27.000173,2941772,0.999984,0.0,20529152,0,20529152,False,False,False
+:0,installed session,28,28.00007,2941772,0.999897,0.0,20529152,0,20529152,False,False,False
+:0,installed session,29,29.000116,2941772,1.000046,0.0,20529152,0,20529152,False,False,False
+:0,installed session,30,30.000103,2941772,0.999988,0.0,20529152,0,20529152,False,False,False
+:0,installed session,31,31.000154,2941772,1.000051,0.0,20529152,0,20529152,False,False,False
+:0,installed session,32,32.000173,2941772,1.000019,0.0,20529152,0,20529152,False,False,False
+:0,installed session,33,33.000065,2941772,0.999892,0.0,20529152,0,20529152,False,False,False
+:0,installed session,34,34.000123,2941772,1.000058,0.0,20529152,0,20529152,False,False,False
+:0,installed session,35,35.000101,2941772,0.999978,0.0,20529152,0,20529152,False,False,False
+:0,installed session,36,36.00007,2941772,0.99997,0.0,20529152,0,20529152,False,False,False
+:0,installed session,37,37.000103,2941772,1.000032,0.0,20529152,0,20529152,False,False,False
+:0,installed session,38,38.000175,2941772,1.000072,0.0,20529152,0,20529152,False,False,False
+:0,installed session,39,39.000081,2941772,0.999906,0.0,20529152,0,20529152,False,False,False
+:0,installed session,40,40.000179,2941772,1.000098,0.0,20529152,0,20529152,False,False,False
+:0,installed session,41,41.00009,2941772,0.999911,0.0,20529152,0,20529152,False,False,False
+:0,installed session,42,42.000185,2941772,1.000096,0.0,20529152,0,20529152,False,False,False
+:0,installed session,43,43.000067,2941772,0.999882,0.0,20529152,0,20529152,False,False,False
+:0,installed session,44,44.000083,2941772,1.000016,0.0,20529152,0,20529152,False,False,False
+:0,installed session,45,45.000073,2941772,0.99999,0.0,20529152,0,20529152,False,False,False
+:0,installed session,46,46.000065,2941772,0.999993,0.0,20529152,0,20529152,False,False,False
+:0,installed session,47,47.000071,2941772,1.000006,0.0,20529152,0,20529152,False,False,False
+:0,installed session,48,48.000092,2941772,1.000021,0.0,20529152,0,20529152,False,False,False
+:0,installed session,49,49.000073,2941772,0.999981,0.0,20529152,0,20529152,False,False,False
+:0,installed session,50,50.000124,2941772,1.000052,0.0,20529152,0,20529152,False,False,False
+:0,installed session,51,51.000193,2941772,1.000068,0.0,20529152,0,20529152,False,False,False
+:0,installed session,52,52.000193,2941772,1.0,0.0,20529152,0,20529152,False,False,False
+:0,installed session,53,53.000068,2941772,0.999875,0.0,20529152,0,20529152,False,False,False
+:0,installed session,54,54.000177,2941772,1.000109,0.0,20529152,0,20529152,False,False,False
+:0,installed session,55,55.000176,2941772,0.999999,0.0,20529152,0,20529152,False,False,False
+:0,installed session,56,56.000069,2941772,0.999893,0.0,20529152,0,20529152,False,False,False
+:0,installed session,57,57.000104,2941772,1.000035,0.0,20791296,0,20791296,False,False,False
+:0,installed session,58,58.000194,2941772,1.00009,0.0,20791296,0,20791296,False,False,False
+:0,installed session,59,59.000069,2941772,0.999874,0.0,20791296,0,20791296,False,False,False
+:0,installed session,60,60.000102,2941772,1.000033,0.0,20791296,0,20791296,False,False,False
+:0,installed session,61,61.000066,2941772,0.999964,0.0,20791296,0,20791296,False,False,False
+:0,installed session,62,62.000166,2941772,1.0001,0.0,20791296,0,20791296,False,False,False
+:0,installed session,63,63.000102,2941772,0.999936,1.000064,20791296,0,20791296,False,False,False
+:0,installed session,64,64.000066,2941772,0.999964,0.0,20791296,0,20791296,False,False,False
+:0,installed session,65,65.000175,2941772,1.000109,0.0,20791296,0,20791296,False,False,False
+:0,installed session,66,66.000102,2941772,0.999927,0.0,20791296,0,20791296,False,False,False
+:0,installed session,67,67.000093,2941772,0.999991,0.0,20791296,0,20791296,False,False,False
+:0,installed session,68,68.000109,2941772,1.000015,0.0,20791296,0,20791296,False,False,False
+:0,installed session,69,69.000063,2941772,0.999954,0.0,20791296,0,20791296,False,False,False
+:0,installed session,70,70.000109,2941772,1.000047,0.0,20791296,0,20791296,False,False,False
+:0,installed session,71,71.000184,2941772,1.000075,0.0,20791296,0,20791296,False,False,False
+:0,installed session,72,72.000179,2941772,0.999996,0.0,20791296,0,20791296,False,False,False
+:0,installed session,73,73.0001,2941772,0.99992,0.0,20791296,0,20791296,False,False,False
+:0,installed session,74,74.000105,2941772,1.000005,0.0,20791296,0,20791296,False,False,False
+:0,installed session,75,75.000191,2941772,1.000086,0.0,20791296,0,20791296,False,False,False
+:0,installed session,76,76.000068,2941772,0.999877,0.0,20791296,0,20791296,False,False,False
+:0,installed session,77,77.000075,2941772,1.000007,0.0,20791296,0,20791296,False,False,False
+:0,installed session,78,78.000178,2941772,1.000103,0.0,20791296,0,20791296,False,False,False
+:0,installed session,79,79.000073,2941772,0.999895,0.0,20791296,0,20791296,False,False,False
+:0,installed session,80,80.000096,2941772,1.000023,0.0,20791296,0,20791296,False,False,False
+:0,installed session,81,81.000064,2941772,0.999968,0.0,20791296,0,20791296,False,False,False
+:0,installed session,82,82.000066,2941772,1.000002,0.0,20791296,0,20791296,False,False,False
+:0,installed session,83,83.000185,2941772,1.000119,0.0,20791296,0,20791296,False,False,False
+:0,installed session,84,84.000181,2941772,0.999997,0.0,20791296,0,20791296,False,False,False
+:0,installed session,85,85.00013,2941772,0.999948,0.0,20791296,0,20791296,False,False,False
+:0,installed session,86,86.000184,2941772,1.000055,0.0,20791296,0,20791296,False,False,False
+:0,installed session,87,87.000116,2941772,0.999932,0.0,20791296,0,20791296,False,False,False
+:0,installed session,88,88.000175,2941772,1.000059,0.0,20791296,0,20791296,False,False,False
+:0,installed session,89,89.000103,2941772,0.999928,0.0,20791296,0,20791296,False,False,False
+:0,installed session,90,90.000176,2941772,1.000073,0.0,20791296,0,20791296,False,False,False
+:0,installed session,91,91.000177,2941772,1.000002,0.0,20791296,0,20791296,False,False,False
+:0,installed session,92,92.000189,2941772,1.000012,0.0,20791296,0,20791296,False,False,False
+:0,installed session,93,93.000076,2941772,0.999887,0.0,20791296,0,20791296,False,False,False
+:0,installed session,94,94.000116,2941772,1.00004,0.0,20791296,0,20791296,False,False,False
+:0,installed session,95,95.000106,2941772,0.99999,0.0,20791296,0,20791296,False,False,False
+:0,installed session,96,96.000193,2941772,1.000088,0.0,20791296,0,20791296,False,False,False
+:0,installed session,97,97.000094,2941772,0.9999,0.0,20791296,0,20791296,False,False,False
+:0,installed session,98,98.000174,2941772,1.000081,0.0,20791296,0,20791296,False,False,False
+:0,installed session,99,99.000118,2941772,0.999943,0.0,20791296,0,20791296,False,False,False
+:0,installed session,100,100.000165,2941772,1.000047,0.0,20791296,0,20791296,False,False,False
+:0,installed session,101,101.000142,2941772,0.999976,0.0,20791296,0,20791296,False,False,False
+:0,installed session,102,102.000133,2941772,0.999992,0.0,20791296,0,20791296,False,False,False
+:0,installed session,103,103.000065,2941772,0.999932,0.0,20791296,0,20791296,False,False,False
+:0,installed session,104,104.000066,2941772,1.000001,0.0,20791296,0,20791296,False,False,False
+:0,installed session,105,105.000094,2941772,1.000028,0.0,20791296,0,20791296,False,False,False
+:0,installed session,106,106.00016,2941772,1.000066,0.0,20791296,0,20791296,False,False,False
+:0,installed session,107,107.000069,2941772,0.999909,0.0,20791296,0,20791296,False,False,False
+:0,installed session,108,108.000068,2941772,0.999999,0.0,20791296,0,20791296,False,False,False
+:0,installed session,109,109.00012,2941772,1.000052,0.0,20791296,0,20791296,False,False,False
+:0,installed session,110,110.000111,2941772,0.999991,1.000009,20881408,0,20881408,False,False,False
+:0,installed session,111,111.000098,2941772,0.999987,1.000013,20881408,0,20881408,False,False,False
+:0,installed session,112,112.000175,2941772,1.000078,0.0,20881408,0,20881408,False,False,False
+:0,installed session,113,113.000092,2941772,0.999917,0.0,20881408,0,20881408,False,False,False
+:0,installed session,114,114.000067,2941772,0.999975,0.0,20881408,0,20881408,False,False,False
+:0,installed session,115,115.000064,2941772,0.999997,0.0,20881408,0,20881408,False,False,False
+:0,installed session,116,116.000103,2941772,1.000039,0.0,20881408,0,20881408,False,False,False
+:0,installed session,117,117.000102,2941772,0.999999,0.0,20881408,0,20881408,False,False,False
+:0,installed session,118,118.000185,2941772,1.000083,0.999917,20881408,0,20881408,False,False,False
+:0,installed session,119,119.000069,2941772,0.999884,0.0,20881408,0,20881408,False,False,False
+:0,installed session,120,120.000108,2941772,1.00004,0.0,20881408,0,20881408,False,False,False

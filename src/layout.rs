@@ -83,6 +83,7 @@ impl Aurora {
         )?);
         self.wallpaper_cache[self.wallpaper_index] = Some(self.wallpaper_pixels.clone());
         self.hide_dock_more_menu()?;
+        self.hide_recording_menu()?;
         let dock = self.dock_geometry();
         let settings = self.settings_geometry();
         let folder = self.folder_geometry();
@@ -241,6 +242,12 @@ impl Aurora {
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
+        if self.recording_menu_visible {
+            self.conn.configure_window(
+                self.ui.recording_menu,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
         if self.clipboard_menu_visible {
             self.conn.configure_window(
                 self.ui.clipboard_menu,
@@ -270,6 +277,12 @@ impl Aurora {
         if self.aurora_menu_visible {
             self.conn.configure_window(
                 self.ui.aurora_menu,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
+        }
+        if self.recording_menu_visible {
+            self.conn.configure_window(
+                self.ui.recording_menu,
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
@@ -356,6 +369,10 @@ impl Aurora {
         y: i32,
         size: i32,
     ) -> bool {
+        if self.is_files_client(window) {
+            draw_folder_icon(canvas, x + size / 2, y + size / 2, BLUE_LIGHT);
+            return true;
+        }
         let Ok(cookie) = self.conn.intern_atom(false, b"_NET_WM_ICON") else {
             return false;
         };
@@ -597,12 +614,29 @@ impl Aurora {
         self.dock_pinned_count() + count.min(limit) + usize::from(count > limit)
     }
 
+    pub(crate) fn is_files_client(&self, window: Window) -> bool {
+        self.window_class(window).split('\0')
+            .any(|part| matches!(part, "aurora-files" | "aurora files" | "aurorafiles"))
+    }
+
+    pub(crate) fn files_client_window(&self) -> Option<Window> {
+        self.clients.keys().copied().filter(|window| self.is_files_client(*window))
+            .max_by_key(|window| {
+                let info = &self.clients[window];
+                (self.client_on_active_workspace(info),
+                    self.window_title(*window).starts_with("Aurora Files"),
+                    self.active_client == Some(*window),
+                    self.focus_history.iter().rposition(|candidate| candidate == window),
+                    *window)
+            })
+    }
+
     pub(crate) fn task_client_windows(&self) -> Vec<Window> {
         let mut windows = self
             .clients
             .iter()
             .filter_map(|(window, info)| {
-                self.client_on_active_workspace(info).then_some(*window)
+                (self.client_on_active_workspace(info) && !self.is_files_client(*window)).then_some(*window)
             })
             .collect::<Vec<_>>();
         windows.sort_unstable();
@@ -678,6 +712,7 @@ impl Aurora {
             || window == self.ui.folder
             || window == self.ui.folder_terminal
             || window == self.ui.recording_notice
+            || window == self.ui.recording_menu
             || window == self.ui.screenshot_overlay
             || window == self.ui.app_menu
             || window == self.ui.aurora_menu

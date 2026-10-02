@@ -27,6 +27,7 @@ pub(crate) struct RecordingPlan {
     microphone: String,
     reserved: bool,
     encoder: VideoEncoder,
+    duration_limit: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +67,7 @@ impl Drop for RecordingPlan {
 pub(crate) enum RecordingState {
     Preparing {
         result: Receiver<Result<RecordingPlan, String>>,
+        duration_limit: Duration,
     },
     Countdown {
         plan: RecordingPlan,
@@ -97,12 +99,29 @@ impl RecordingState {
         }
     }
 
+    pub(crate) fn elapsed(&self) -> Option<Duration> {
+        match self {
+            Self::Running(process) | Self::Stopping { process, .. } => Some(process.elapsed()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn duration_limit(&self) -> Option<Duration> {
+        match self {
+            Self::Preparing { duration_limit, .. } => Some(*duration_limit),
+            Self::Countdown { plan, .. } => Some(plan.duration_limit),
+            Self::Running(process) | Self::Stopping { process, .. } => Some(process.duration_limit),
+            Self::Finalizing { .. } => None,
+        }
+    }
+
     pub(crate) fn next_poll_delay(&self) -> Duration {
-        Duration::from_millis(if matches!(self, Self::Running(_)) {
-            250
-        } else {
-            50
-        })
+        match self {
+            Self::Running(process) => {
+                next_recording_tick(process.elapsed(), process.duration_limit)
+            }
+            _ => Duration::from_millis(50),
+        }
     }
 }
 
@@ -112,10 +131,22 @@ pub(crate) struct RecordingProcess {
     errors: Arc<Mutex<VecDeque<u8>>>,
     started: Instant,
     retry: Option<RecordingRetry>,
+    duration_limit: Duration,
+    shown_elapsed: u64,
+    stopped_elapsed: Option<Duration>,
 }
 
 impl RecordingProcess {
+    fn elapsed(&self) -> Duration {
+        self.stopped_elapsed
+            .unwrap_or_else(|| self.started.elapsed())
+            .min(self.duration_limit)
+    }
+
     fn stop(&mut self) {
+        if self.stopped_elapsed.is_none() {
+            self.stopped_elapsed = Some(self.started.elapsed().min(self.duration_limit));
+        }
         if let Some(child) = self.child.as_mut() {
             if let Some(mut stdin) = child.stdin.take() {
                 // FFmpeg's interactive quit writes the MP4 trailer before exiting.
@@ -169,6 +200,28 @@ impl Drop for RecordingProcess {
             });
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordingTick {
+    Stop,
+    Redraw(u64),
+    Wait,
+}
+
+fn recording_tick(elapsed: Duration, limit: Duration, shown_seconds: u64) -> RecordingTick {
+    if elapsed >= limit {
+        RecordingTick::Stop
+    } else if elapsed.as_secs() != shown_seconds {
+        RecordingTick::Redraw(elapsed.as_secs())
+    } else {
+        RecordingTick::Wait
+    }
+}
+
+fn next_recording_tick(elapsed: Duration, limit: Duration) -> Duration {
+    let next_second = Duration::from_secs(elapsed.as_secs().saturating_add(1));
+    next_second.min(limit).saturating_sub(elapsed)
 }
 
 fn pactl(args: &[&str]) -> Result<String, String> {
@@ -385,7 +438,11 @@ fn choose_video_encoder(width: u16, height: u16) -> VideoEncoder {
     VideoEncoder::Software
 }
 
-fn prepare_recording(width: u16, height: u16) -> Result<RecordingPlan, String> {
+fn prepare_recording(
+    width: u16,
+    height: u16,
+    duration_limit: Duration,
+) -> Result<RecordingPlan, String> {
     if !command_exists("ffmpeg") {
         return Err("Install FFmpeg to record your screen".into());
     }
@@ -423,6 +480,7 @@ fn prepare_recording(width: u16, height: u16) -> Result<RecordingPlan, String> {
                     microphone,
                     reserved: true,
                     encoder,
+                    duration_limit,
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -489,6 +547,8 @@ fn recorder_command(plan: &RecordingPlan, display: &str, width: u16, height: u16
             "-movflags",
             "+faststart",
         ])
+        .arg("-t")
+        .arg(plan.duration_limit.as_secs_f64().to_string())
         .arg(&plan.path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -510,6 +570,27 @@ fn recorder_command(plan: &RecordingPlan, display: &str, width: u16, height: u16
         });
     }
     command
+}
+
+fn software_retry(
+    plan: &RecordingPlan,
+    display: &str,
+    width: u16,
+    height: u16,
+) -> Option<RecordingRetry> {
+    (plan.encoder != VideoEncoder::Software).then(|| RecordingRetry {
+        plan: RecordingPlan {
+            path: plan.path.clone(),
+            monitor: plan.monitor.clone(),
+            microphone: plan.microphone.clone(),
+            reserved: false,
+            encoder: VideoEncoder::Software,
+            duration_limit: plan.duration_limit,
+        },
+        display: display.to_string(),
+        width,
+        height,
+    })
 }
 
 fn start_recording(
@@ -544,24 +625,16 @@ fn start_recording(
         });
     }
     plan.reserved = false;
-    let retry = (plan.encoder != VideoEncoder::Software).then(|| RecordingRetry {
-        plan: RecordingPlan {
-            path: plan.path.clone(),
-            monitor: plan.monitor.clone(),
-            microphone: plan.microphone.clone(),
-            reserved: false,
-            encoder: VideoEncoder::Software,
-        },
-        display: display.to_string(),
-        width,
-        height,
-    });
+    let retry = software_retry(&plan, display, width, height);
     Ok(RecordingProcess {
         child: Some(child),
         path: plan.path.clone(),
         errors,
         started: Instant::now(),
         retry,
+        duration_limit: plan.duration_limit,
+        shown_elapsed: 0,
+        stopped_elapsed: None,
     })
 }
 
@@ -620,18 +693,22 @@ impl Aurora {
             }
             None => {
                 let (width, height) = (self.screen_width, self.screen_height);
+                let duration_limit = self.recording_max_duration;
                 let (tx, result) = mpsc::channel();
                 thread::spawn(move || {
-                    let prepared = prepare_recording(width, height);
+                    let prepared = prepare_recording(width, height, duration_limit);
                     if let Err(unsent) = tx.send(prepared) {
                         if let Ok(plan) = unsent.0 {
                             drop(plan);
                         }
                     }
                 });
-                self.recording = Some(RecordingState::Preparing { result });
+                self.recording = Some(RecordingState::Preparing {
+                    result,
+                    duration_limit,
+                });
             }
-            Some(RecordingState::Preparing { result }) => {
+            Some(RecordingState::Preparing { result, .. }) => {
                 // A queued successful preparation owns an empty reservation.
                 if let Ok(Ok(plan)) = result.try_recv() {
                     drop(plan);
@@ -672,7 +749,10 @@ impl Aurora {
         };
         let mut changed = false;
         self.recording = match state {
-            RecordingState::Preparing { result } => match result.try_recv() {
+            RecordingState::Preparing {
+                result,
+                duration_limit,
+            } => match result.try_recv() {
                 Ok(Ok(plan)) => {
                     changed = true;
                     Some(RecordingState::Countdown {
@@ -686,7 +766,10 @@ impl Aurora {
                     self.recording_error(error);
                     None
                 }
-                Err(TryRecvError::Empty) => Some(RecordingState::Preparing { result }),
+                Err(TryRecvError::Empty) => Some(RecordingState::Preparing {
+                    result,
+                    duration_limit,
+                }),
                 Err(TryRecvError::Disconnected) => {
                     changed = true;
                     self.recording_error("Recording preparation failed".into());
@@ -732,7 +815,29 @@ impl Aurora {
                         changed = true;
                         self.finish_recording(process, status, false)
                     }
-                    Ok(None) => Some(RecordingState::Running(process)),
+                    Ok(None) => {
+                        match recording_tick(
+                            process.started.elapsed(),
+                            process.duration_limit,
+                            process.shown_elapsed,
+                        ) {
+                            RecordingTick::Stop => {
+                                process.stop();
+                                changed = true;
+                                Some(RecordingState::Stopping {
+                                    process,
+                                    requested: Instant::now(),
+                                    interrupted: false,
+                                })
+                            }
+                            RecordingTick::Redraw(seconds) => {
+                                process.shown_elapsed = seconds;
+                                changed = true;
+                                Some(RecordingState::Running(process))
+                            }
+                            RecordingTick::Wait => Some(RecordingState::Running(process)),
+                        }
+                    }
                     Err(error) => {
                         changed = true;
                         self.recording_error(format!("Cannot check recorder: {error}"));
@@ -818,7 +923,9 @@ impl Aurora {
                         "Screen recording: GPU startup failed; retrying software encoder: {errors}"
                     );
                     match start_recording(retry.plan, &retry.display, retry.width, retry.height) {
-                        Ok(restarted) => {
+                        Ok(mut restarted) => {
+                            restarted.started = process.started;
+                            restarted.shown_elapsed = process.shown_elapsed;
                             self.topbar_notice = Some((
                                 "GPU unavailable; recording with CPU".into(),
                                 Instant::now() + Duration::from_secs(6),
@@ -964,6 +1071,7 @@ mod tests {
             microphone: "microphone".into(),
             reserved: false,
             encoder: VideoEncoder::Software,
+            duration_limit: Duration::from_secs(1800),
         };
         let command = recorder_command(&plan, ":11", 1921, 1081);
         let args: Vec<_> = command
@@ -976,6 +1084,7 @@ mod tests {
         );
         assert!(args.windows(2).any(|pair| pair == ["-framerate", "24"]));
         assert!(args.windows(2).any(|pair| pair == ["-b:v", "3M"]));
+        assert!(args.windows(2).any(|pair| pair == ["-t", "1800"]));
         assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv444p"]));
         assert!(
             args.windows(2)
@@ -1007,5 +1116,127 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_vaapi"]));
         assert!(args.windows(2).any(|pair| pair == ["-b:v", "3M"]));
         assert!(args.windows(2).any(|pair| pair == ["-frames:v", "2"]));
+    }
+    #[test]
+    fn timer_redraws_only_when_seconds_change_and_stops_at_exact_limit() {
+        let limit = Duration::from_secs(1800);
+        assert_eq!(
+            recording_tick(Duration::from_millis(999), limit, 0),
+            RecordingTick::Wait
+        );
+        assert_eq!(
+            recording_tick(Duration::from_secs(1), limit, 0),
+            RecordingTick::Redraw(1)
+        );
+        assert_eq!(
+            recording_tick(Duration::from_millis(1999), limit, 1),
+            RecordingTick::Wait
+        );
+        assert_eq!(
+            recording_tick(Duration::from_millis(1_799_999), limit, 1799),
+            RecordingTick::Wait
+        );
+        assert_eq!(recording_tick(limit, limit, 1799), RecordingTick::Stop);
+        assert_eq!(
+            recording_tick(limit + Duration::from_secs(7), limit, 1799),
+            RecordingTick::Stop
+        );
+        for seconds in [1800, 3600, 14400, 28800, 86400] {
+            let chosen_limit = Duration::from_secs(seconds);
+            assert_eq!(
+                recording_tick(
+                    chosen_limit - Duration::from_nanos(1),
+                    chosen_limit,
+                    seconds - 1
+                ),
+                RecordingTick::Wait
+            );
+            assert_eq!(
+                recording_tick(chosen_limit, chosen_limit, seconds - 1),
+                RecordingTick::Stop
+            );
+        }
+    }
+
+    #[test]
+    fn timer_wakeup_matches_next_elapsed_second_or_limit() {
+        assert_eq!(
+            next_recording_tick(Duration::from_millis(1250), Duration::from_secs(1800)),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            next_recording_tick(Duration::from_millis(1250), Duration::from_millis(1600)),
+            Duration::from_millis(350)
+        );
+        assert_eq!(
+            next_recording_tick(Duration::from_secs(1800), Duration::from_secs(1800)),
+            Duration::ZERO
+        );
+    }
+    #[test]
+    fn hardware_retry_keeps_frozen_limit_and_both_audio_sources() {
+        let plan = RecordingPlan {
+            path: PathBuf::from("/tmp/test recording.mp4"),
+            monitor: "speakers.monitor".into(),
+            microphone: "microphone".into(),
+            reserved: false,
+            encoder: VideoEncoder::Vaapi(PathBuf::from("/dev/dri/renderD128")),
+            duration_limit: Duration::from_secs(3600),
+        };
+        let retry = software_retry(&plan, ":11", 1280, 800).unwrap();
+        assert_eq!(retry.plan.duration_limit, plan.duration_limit);
+        assert_eq!(retry.plan.monitor, plan.monitor);
+        assert_eq!(retry.plan.microphone, plan.microphone);
+        assert_eq!(retry.plan.encoder, VideoEncoder::Software);
+        assert!(software_retry(&retry.plan, ":11", 1280, 800).is_none());
+        let state = RecordingState::Countdown {
+            plan: retry.plan,
+            started: Instant::now(),
+            shown: 3,
+        };
+        assert_eq!(state.duration_limit(), Some(Duration::from_secs(3600)));
+        assert!(state.elapsed().is_none());
+    }
+
+    #[test]
+    fn graceful_stop_sends_quit_and_freezes_displayed_elapsed() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r quit; test \"$quit\" = q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut process = RecordingProcess {
+            child: Some(child),
+            path: PathBuf::new(),
+            errors: Arc::new(Mutex::new(VecDeque::new())),
+            started: Instant::now() - Duration::from_secs(5),
+            retry: None,
+            duration_limit: Duration::from_secs(1800),
+            shown_elapsed: 5,
+            stopped_elapsed: None,
+        };
+        process.stop();
+        assert!(process.child.as_ref().unwrap().stdin.is_none());
+        let frozen = process.elapsed();
+        process.started -= Duration::from_secs(100);
+        assert_eq!(process.elapsed(), frozen);
+        let mut child = process.child.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert!(status.success());
+                    break;
+                }
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("quit command not received");
+                }
+            }
+        }
     }
 }

@@ -1094,15 +1094,91 @@ pub(crate) fn file_age(path: &str) -> Option<Duration> {
         .ok()
 }
 
-pub(crate) fn read_desktop_entries() -> Vec<DesktopEntry> {
-    let mut entries = Vec::new();
-    let mut dirs = vec![
+const DESKTOP_ENTRIES_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+type DesktopEntrySources = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
+
+struct DesktopEntriesCache {
+    entries: std::sync::Arc<[DesktopEntry]>,
+    sources: DesktopEntrySources,
+    checked_at: Instant,
+    refreshing: bool,
+}
+
+impl DesktopEntriesCache {
+    fn needs_refresh(&self, now: Instant) -> bool {
+        !self.refreshing && now.saturating_duration_since(self.checked_at) >= DESKTOP_ENTRIES_REFRESH_INTERVAL
+    }
+}
+
+fn desktop_entry_dirs() -> Vec<PathBuf> {
+    vec![
         home_dir().join(".local/share/applications"),
         PathBuf::from("/usr/local/share/applications"),
         PathBuf::from("/usr/share/applications"),
-    ];
-    dirs.dedup();
+    ]
+}
+
+fn desktop_entry_sources(dirs: &[PathBuf]) -> DesktopEntrySources {
+    let mut paths = dirs.to_vec();
     for dir in dirs {
+        if let Ok(entries) = fs::read_dir(dir) {
+            paths.extend(entries.flatten().map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("desktop")));
+        }
+    }
+    paths.sort_unstable();
+    paths.into_iter().map(|path| {
+        let metadata = fs::metadata(&path).ok();
+        let size = metadata.as_ref().map(|metadata| metadata.len()).unwrap_or(0);
+        let modified = metadata.and_then(|metadata| metadata.modified().ok());
+        (path, size, modified)
+    }).collect()
+}
+
+/// Startup discovery prewarms this shared snapshot. Menus never reread desktop
+/// files synchronously; installation and file edits are checked off-thread.
+pub(crate) fn cached_desktop_entries() -> std::sync::Arc<[DesktopEntry]> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<DesktopEntriesCache>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        let sources = desktop_entry_sources(&desktop_entry_dirs());
+        std::sync::Mutex::new(DesktopEntriesCache {
+            entries: read_desktop_entries_uncached().into(),
+            sources,
+            checked_at: Instant::now(),
+            refreshing: false,
+        })
+    });
+    let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = std::sync::Arc::clone(&state.entries);
+    if state.needs_refresh(Instant::now()) {
+        state.refreshing = true;
+        state.checked_at = Instant::now();
+        drop(state);
+        let spawned = thread::Builder::new().name("aurora-app-catalog".into())
+            .stack_size(256 * 1024).spawn(move || {
+                let sources = desktop_entry_sources(&desktop_entry_dirs());
+                let changed = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sources != sources;
+                let replacement = changed.then(|| std::sync::Arc::<[DesktopEntry]>::from(read_desktop_entries_uncached()));
+                let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(entries) = replacement { state.entries = entries; }
+                state.sources = sources;
+                state.checked_at = Instant::now();
+                state.refreshing = false;
+            });
+        if spawned.is_err() {
+            cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).refreshing = false;
+        }
+    }
+    snapshot
+}
+
+pub(crate) fn read_desktop_entries() -> Vec<DesktopEntry> {
+    cached_desktop_entries().to_vec()
+}
+
+fn read_desktop_entries_uncached() -> Vec<DesktopEntry> {
+    let mut entries = Vec::new();
+    for dir in desktop_entry_dirs() {
         let Ok(read_dir) = fs::read_dir(dir) else {
             continue;
         };
@@ -1349,5 +1425,49 @@ pub(crate) fn format_bps(value: f64) -> String {
         format!("{:.1} KB/s", value / 1024.0)
     } else {
         format!("{value:.0} B/s")
+    }
+}
+
+#[cfg(test)]
+mod desktop_catalog_cache_tests {
+    use super::*;
+
+    #[test]
+    fn warm_catalog_shares_storage_and_refresh_is_throttled() {
+        let first = cached_desktop_entries();
+        let second = cached_desktop_entries();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        let now = Instant::now();
+        let mut cache = DesktopEntriesCache {
+            entries: first,
+            sources: Vec::new(),
+            checked_at: now,
+            refreshing: false,
+        };
+        assert!(!cache.needs_refresh(now + DESKTOP_ENTRIES_REFRESH_INTERVAL - Duration::from_millis(1)));
+        assert!(cache.needs_refresh(now + DESKTOP_ENTRIES_REFRESH_INTERVAL));
+        cache.refreshing = true;
+        assert!(!cache.needs_refresh(now + DESKTOP_ENTRIES_REFRESH_INTERVAL * 2));
+    }
+
+    #[test]
+    fn source_fingerprint_detects_installs_edits_and_removals() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = env::temp_dir().join(format!("aurora-catalog-cache-{}-{nonce}", process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let dirs = [directory.clone()];
+        let empty = desktop_entry_sources(&dirs);
+        let application = directory.join("example.desktop");
+        fs::write(&application, "[Desktop Entry]\nName=Example\nExec=example\n").unwrap();
+        let installed = desktop_entry_sources(&dirs);
+        assert_ne!(installed, empty);
+        fs::write(&application, "[Desktop Entry]\nName=Renamed Example\nExec=example --new\n").unwrap();
+        let edited = desktop_entry_sources(&dirs);
+        assert_ne!(edited, installed);
+        fs::remove_file(&application).unwrap();
+        let removed = desktop_entry_sources(&dirs);
+        assert_ne!(removed, edited);
+        assert!(removed.iter().all(|(path, _, _)| path != &application));
+        fs::remove_dir_all(directory).unwrap();
     }
 }

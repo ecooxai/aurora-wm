@@ -1,12 +1,13 @@
 //! File viewers/editors: text (editable), images, PDF pages (pdftoppm),
 //! office documents (text extraction), 3D wireframes (OBJ/STL), and
-//! audio/video playback embedded via mpv (ffplay fallback).
+//! audio/video playback via mpv (ffplay fallback).
 
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::fsmodel::FileKind;
 
@@ -672,9 +673,89 @@ pub struct MediaView {
     pub player_name: String,
     pub error: Option<String>,
     pub embedded: bool,
+    player_fallback: Option<(Instant, (i32, i32, u16, u16), String)>,
 }
 
 impl MediaView {
+    /// Independent player keeps the Files list and terminal available.
+    pub fn open_player_window(path: &Path, kind: FileKind, geometry: (i32, i32, u16, u16), display: &str) -> Self {
+        let mut view = Self {
+            path: path.to_path_buf(), kind, player: None,
+            player_name: String::new(), error: None, embedded: false,
+            player_fallback: None,
+        };
+        for name in ["mpv", "ffplay"] {
+            if !command_exists(name) { continue; }
+            match Self::player_command(name, path, kind, geometry, display).spawn() {
+                Ok(child) => {
+                    view.player = Some(child);
+                    view.player_name = name.into();
+                    if name == "mpv" {
+                        view.player_fallback = Some((Instant::now(), geometry, display.into()));
+                    }
+                    return view;
+                }
+                Err(_) => continue,
+            }
+        }
+        view.error = Some("Cannot start media player (install mpv or ffmpeg/ffplay)".into());
+        view
+    }
+
+    fn player_command(name: &str, path: &Path, kind: FileKind, geometry: (i32, i32, u16, u16), display: &str) -> Command {
+        let (x, y, width, height) = geometry;
+        let title = format!("Aurora {} · {}", kind.label(), path.file_name().unwrap_or_default().to_string_lossy());
+        let mut cmd = Command::new(name);
+        if name == "mpv" {
+            cmd.args(["--really-quiet", "--keep-open=yes", "--force-window=yes", "--keepaspect-window=no"])
+                .arg(format!("--geometry={width}x{height}+{x}+{y}"))
+                .arg(format!("--title={title}"));
+            if kind == FileKind::Audio {
+                // Keep controls available even without embedded cover artwork.
+                cmd.args(["--osc=yes", "--audio-display=attachment"]);
+            }
+            cmd.arg("--").arg(path);
+        } else {
+            cmd.args(["-loglevel", "quiet", "-x", &width.to_string(), "-y", &height.to_string(),
+                "-left", &x.to_string(), "-top", &y.to_string(), "-window_title"])
+                .arg(title);
+            if kind == FileKind::Audio {
+                // A visible waveform offers pause/seek controls instead of -nodisp.
+                cmd.args(["-vn", "-showmode", "waves"]);
+            }
+            cmd.arg("-i").arg(path);
+        }
+        cmd.env("DISPLAY", display).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd
+    }
+
+    pub fn finished(&mut self) -> bool {
+        match self.player.as_mut().map(|child| child.try_wait()) {
+            Some(Ok(Some(status))) => {
+                self.player = None;
+                if !status.success() {
+                    if let Some((started, geometry, display)) = self.player_fallback.take() {
+                        if started.elapsed() < Duration::from_secs(3) && command_exists("ffplay") {
+                            if let Ok(child) = Self::player_command("ffplay", &self.path, self.kind, geometry, &display).spawn() {
+                                self.player = Some(child);
+                                self.player_name = "ffplay".into();
+                                return false;
+                            }
+                        }
+                    }
+                    self.error = Some(format!("{} playback failed. Check the file and media player.", self.kind.label()));
+                }
+                true
+            }
+            Some(Ok(None)) => false,
+            Some(Err(error)) => {
+                self.error = Some(format!("Cannot check media player: {error}"));
+                true
+            }
+            None => true,
+        }
+    }
+
     /// Spawn a player. `embed_window` is an X window id for mpv's --wid.
     pub fn open(path: &Path, kind: FileKind, embed_window: u32, display: &str) -> Self {
         let mut view = Self {
@@ -684,6 +765,7 @@ impl MediaView {
             player_name: String::new(),
             error: None,
             embedded: false,
+            player_fallback: None,
         };
         let try_spawn = |cmd: &mut Command| -> Option<Child> {
             cmd.env("DISPLAY", display)
@@ -743,4 +825,40 @@ pub fn command_exists(name: &str) -> bool {
             std::env::split_paths(&paths).any(|p| p.join(name).exists())
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod standalone_media_tests {
+    use super::*;
+
+    fn arguments(command: &Command) -> Vec<String> {
+        command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn audio_ffplay_has_a_visible_waveform_and_safe_input_argument() {
+        let path = Path::new("-track with spaces 'and quotes'.mp3");
+        let command = MediaView::player_command("ffplay", path, FileKind::Audio, (498, 66, 500, 500), ":11");
+        let args = arguments(&command);
+        assert!(args.windows(2).any(|pair| pair == ["-showmode", "waves"]));
+        assert!(args.iter().any(|arg| arg == "-vn"));
+        assert!(!args.iter().any(|arg| arg == "-nodisp"));
+        assert!(args.windows(2).any(|pair| pair == ["-x", "500"]));
+        assert!(args.windows(2).any(|pair| pair == ["-y", "500"]));
+        assert!(args.windows(2).any(|pair| pair == ["-i", path.to_str().unwrap()]));
+        assert!(args.windows(2).any(|pair| pair == ["-window_title", "Aurora Audio · -track with spaces 'and quotes'.mp3"]));
+    }
+
+    #[test]
+    fn audio_mpv_keeps_a_control_window_and_video_keeps_its_output() {
+        let path = Path::new("-clip with spaces.mp4");
+        let audio = arguments(&MediaView::player_command("mpv", path, FileKind::Audio, (10, 40, 500, 500), ":11"));
+        assert!(audio.iter().any(|arg| arg == "--force-window=yes"));
+        assert!(audio.iter().any(|arg| arg == "--osc=yes"));
+        assert!(audio.iter().any(|arg| arg == "--audio-display=attachment"));
+        assert!(audio.windows(2).any(|pair| pair == ["--", path.to_str().unwrap()]));
+        let video = arguments(&MediaView::player_command("ffplay", path, FileKind::Video, (10, 40, 500, 500), ":11"));
+        assert!(!video.iter().any(|arg| arg == "-vn" || arg == "-showmode"));
+        assert!(video.windows(2).any(|pair| pair == ["-window_title", "Aurora Video · -clip with spaces.mp4"]));
+    }
 }

@@ -66,6 +66,13 @@ impl Aurora {
     pub(crate) fn launch_files_from_dock(&mut self) -> AnyResult<()> {
         self.hide_app_menu()?;
         self.hide_dock_more_menu()?;
+        if let Some(window) = self.files_client_window() {
+            if let Some(info) = self.clients.get(&window).copied() {
+                if !self.client_on_active_workspace(&info) { self.switch_workspace(info.workspace)?; }
+            }
+            self.focus_window(window)?;
+            return Ok(());
+        }
         if !self.open_file_manager_tab(&home_dir()) {
             self.show_folder(FolderMode::Home, true)?;
         }

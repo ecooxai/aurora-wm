@@ -220,6 +220,7 @@ struct App {
     root: Window,
     window: Window,
     media_embed: Window,
+    media_player: Option<MediaView>,
     gc: Gcontext,
     depth: u8,
     width: u16,
@@ -363,6 +364,35 @@ mod terminal_key_tests {
     #[test]
     fn unmodified_v_remains_printable() {
         assert_eq!(terminal_printable_input('v' as u32, false), Some(b'v'));
+    }
+}
+
+/// Square media content, with space for the WM titlebar and desktop controls.
+fn standalone_media_geometry(screen_w: u16, screen_h: u16, files_x: i32, files_y: i32, files_width: u16) -> (i32, i32, u16, u16) {
+    let side = screen_w.saturating_sub(16)
+        .min(screen_h.saturating_sub(96)).min(500).max(1);
+    let x = (files_x + i32::from(files_width) + 8)
+        .clamp(0, i32::from(screen_w.saturating_sub(side + 8)));
+    let y = (files_y - 28).max(40)
+        .min(i32::from(screen_h.saturating_sub(side + 56)).max(40));
+    (x, y, side, side)
+}
+
+#[cfg(test)]
+mod media_geometry_tests {
+    use super::standalone_media_geometry;
+
+    #[test]
+    fn player_is_five_hundred_square_beside_files() {
+        assert_eq!(standalone_media_geometry(1280, 800, 60, 94, 430), (498, 66, 500, 500));
+    }
+
+    #[test]
+    fn constrained_display_keeps_square_and_controls_visible() {
+        let (x, y, width, height) = standalone_media_geometry(600, 400, 550, 350, 430);
+        assert_eq!((width, height), (304, 304));
+        assert!(x >= 0 && x + i32::from(width) <= 592);
+        assert!(y >= 40 && y + i32::from(height) <= 344);
     }
 }
 
@@ -696,6 +726,7 @@ fn run(args: &[String]) -> AnyResult<()> {
         root: screen.root,
         window,
         media_embed,
+        media_player: None,
         gc,
         depth: screen.root_depth,
         width,
@@ -1302,6 +1333,22 @@ impl App {
         let kind = file_kind_for(path);
         if !self.viewer_only {
             match kind {
+                FileKind::Audio | FileKind::Video => {
+                    // Keep browsing while a separate, square player runs beside Files.
+                    self.viewer_close();
+                    self.media_player.take();
+                    match self.media_window_geometry() {
+                        Ok(geometry) => {
+                            let view = MediaView::open_player_window(path, kind, geometry, &self.display);
+                            self.status = view.error.clone().unwrap_or_else(|| {
+                                format!("{} opened beside Files · Space: pause · arrows: seek", kind.label())
+                            });
+                            self.media_player = Some(view);
+                        }
+                        Err(error) => self.status = format!("Cannot open media player: {error}"),
+                    }
+                    return;
+                }
                 FileKind::Image => {
                     self.viewer_close();
                     self.open_image_window(path, false);
@@ -1379,6 +1426,13 @@ impl App {
     }
 
     // ------------------------------------------------------------ image window
+
+    fn media_window_geometry(&self) -> AnyResult<(i32, i32, u16, u16)> {
+        let abs = self.conn.translate_coordinates(self.window, self.root, 0, 0)?.reply()?;
+        Ok(standalone_media_geometry(
+            self.screen_w, self.screen_h, i32::from(abs.dst_x), i32::from(abs.dst_y), self.width,
+        ))
+    }
 
     /// Normal geometry for a side view window: to the right of the file list.
     fn side_window_normal_geometry(&self) -> AnyResult<(i16, i16, u16, u16)> {
@@ -2786,6 +2840,15 @@ impl App {
             if self.poll_directory_refresh() {
                 needs_draw = true;
             }
+            if self.media_player.as_mut().is_some_and(|view| view.finished()) {
+                needs_draw = true;
+                if let Some(view) = self.media_player.take() {
+                    if let Some(error) = view.error.as_ref() {
+                        self.status = error.clone();
+                        needs_draw = true;
+                    }
+                }
+            }
             if self
                 .terminal_notice
                 .as_ref()
@@ -3726,10 +3789,16 @@ impl App {
     }
 
     fn draw_folder_tabs_icon(&self, c: &mut Canvas, cx: i32, cy: i32) {
-        c.draw_round_rect(cx - 9, cy - 7, 13, 10, 3, Color::rgba(29, 145, 137, 42));
-        c.draw_round_rect(cx - 5, cy - 3, 13, 10, 3, Color::rgba(29, 145, 137, 72));
-        c.draw_line(cx - 1, cy + 1, cx + 3, cy + 5, 2, MINT_DARK);
-        c.draw_line(cx + 3, cy + 5, cx + 7, cy + 1, 2, MINT_DARK);
+        self.draw_folder_icon(c, cx, cy);
+        c.draw_line(cx + 3, cy + 2, cx + 3, cy + 6, 1, BLUE);
+        c.draw_line(cx + 1, cy + 4, cx + 5, cy + 4, 1, BLUE);
+    }
+
+    fn draw_folder_icon(&self, c: &mut Canvas, cx: i32, cy: i32) {
+        c.draw_round_rect(cx - 9, cy - 8, 9, 5, 2, Color::rgb(112, 179, 222));
+        c.draw_round_rect(cx - 10, cy - 5, 20, 13, 3, Color::rgb(137, 199, 238));
+        c.draw_round_rect(cx - 10, cy - 3, 20, 11, 3, BLUE_LIGHT);
+        c.draw_line(cx - 6, cy - 1, cx + 5, cy - 1, 1, Color::rgb(220, 240, 253));
     }
 
     fn draw_terminal_icon(&self, c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -3763,7 +3832,7 @@ impl App {
             if active {
                 c.draw_round_rect(6, y - 3, SIDEBAR_W - 12, 28, 8, Color::rgba(116, 213, 198, 95));
             }
-            c.draw_round_rect(12, y + 2, 14, 12, 3, Color::rgb(175, 218, 245));
+            self.draw_folder_icon(c, 19, y + 8);
             c.draw_text(
                 &self.regular,
                 &compact(&place.name, 17),
@@ -3839,7 +3908,7 @@ impl App {
     fn draw_kind_icon(&self, c: &mut Canvas, kind: FileKind, cx: i32, cy: i32) {
         match kind {
             FileKind::Directory => {
-                c.draw_round_rect(cx - 9, cy - 7, 18, 14, 4, Color::rgb(175, 218, 245));
+                self.draw_folder_icon(c, cx, cy);
             }
             FileKind::Image => {
                 c.draw_round_rect(cx - 9, cy - 7, 18, 14, 4, Color::rgba(29, 145, 137, 60));

@@ -473,7 +473,10 @@ impl Aurora {
             .screen_height
             .saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + title_h + 62)
             .max(240);
-        let (x, y, width, height) = if is_ffplay {
+        let is_files_media = title.starts_with("Aurora Video · ") || title.starts_with("Aurora Audio · ");
+        let (x, y, width, height) = if is_files_media {
+            (geom.x, geom.y.max(TOPBAR_HEIGHT as i16), geom.width, geom.height)
+        } else if is_ffplay {
             self.ffplay_geometry()
         } else {
             let width = geom.width.min(max_w);
@@ -577,7 +580,7 @@ impl Aurora {
         self.apply_frame_shape(&info)?;
         self.clients.insert(window, info);
         self.send_synthetic_configure(&info)?;
-        if is_ffplay {
+        if is_ffplay && !is_files_media {
             self.schedule_window_nudge(window, width, height);
         }
         self.redraw_frame_titlebar(window)?;

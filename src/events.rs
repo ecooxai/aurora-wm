@@ -75,6 +75,8 @@ impl Aurora {
                     self.pending_auto_power_saver_apply = None;
                     self.apply_auto_power_saver_setting()?;
                     self.redraw_settings()?;
+                } else if self.pending_recording_button.is_some() {
+                    self.release_recording_button(ev)?;
                 } else if self.pending_screenshot_button.is_some() {
                     self.handle_topbar_release(ev)?;
                 } else if self.screenshot_selection.is_some() {
@@ -241,6 +243,8 @@ impl Aurora {
             self.redraw_folder()?;
         } else if ev.window == self.ui.folder_terminal && self.folder_terminal.visible {
             self.redraw_folder_terminal()?;
+        } else if ev.window == self.ui.recording_menu {
+            self.redraw_recording_menu()?;
         } else if ev.window == self.ui.recording_notice {
             self.redraw_recording_notice()?;
         } else if ev.window == self.ui.screenshot_overlay && self.screenshot_mode {
@@ -286,6 +290,10 @@ impl Aurora {
 
     pub(crate) fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
         self.last_pointer_activity = Instant::now();
+        if self.route_recording_menu_press(ev)? {
+            self.conn.flush()?;
+            return Ok(());
+        }
         // Close-confirmation dialog: route by root coordinates because the
         // synchronous root button grab reports these presses on the root
         // window first; the replayed event then reaches the dialog itself.
@@ -617,7 +625,10 @@ impl Aurora {
             }
             return Ok(true);
         }
-        if ev.event == self.ui.topbar && self.drag.is_none() {
+        if self.pending_recording_button.is_some() {
+            return Ok(false);
+        }
+        if ev.event == self.ui.topbar && self.drag.is_none() && !self.recording_menu_visible {
             self.update_topbar_tooltip(i32::from(ev.event_x))?;
         }
         if self.drag.is_none() {
@@ -1267,9 +1278,7 @@ impl Aurora {
 
     pub(crate) fn handle_topbar_press_x(&mut self, x: i32) -> AnyResult<bool> {
         let controls = self.topbar_controls();
-        let brand_x = 24;
-        let aurora_width = measure_text(&self.bold, "Aurora", 16.0);
-        let aurora_end = brand_x + 23 + aurora_width;
+        let aurora_end = self.topbar_brand_end();
         if (0..=aurora_end).contains(&x) {
             self.hide_clipboard_menu()?;
             self.hide_aurora_menu()?;
@@ -1311,9 +1320,10 @@ impl Aurora {
                 });
                 self.toggle_screenshot_mode()?;
             }
-        } else if (controls.recording_x - TOPBAR_ICON_HIT_RADIUS..=controls.recording_x + TOPBAR_ICON_HIT_RADIUS).contains(&x) {
+        } else if self.recording_button_contains(x, 20) {
+            self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
-            self.toggle_screen_recording()?;
+            self.press_recording_button()?;
         } else if (controls.display_x - TOPBAR_ICON_HIT_RADIUS
             ..=controls.display_x + TOPBAR_ICON_HIT_RADIUS)
             .contains(&x)
@@ -1353,7 +1363,7 @@ impl Aurora {
             .grab_button(
                 false,
                 self.root,
-                EventMask::BUTTON_PRESS,
+                EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE,
                 GrabMode::SYNC,
                 GrabMode::ASYNC,
                 x11rb::NONE,

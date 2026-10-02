@@ -104,6 +104,7 @@ mod dock_menus;
 mod folder_ui;
 mod screenshot;
 mod screen_record;
+mod recording_ui;
 mod terminal_ui;
 mod folder_actions;
 mod media_ui;

@@ -70,6 +70,7 @@ impl Aurora {
             self.redraw_folder_terminal()?;
         }
         self.redraw_topbar()?;
+        self.redraw_recording_menu()?;
         self.redraw_dock()?;
         if self.dock_more_visible {
             self.redraw_dock_more_menu()?;
@@ -166,13 +167,16 @@ impl Aurora {
         let network_x = battery_left - 22;
         let audio_x = network_x - TOPBAR_ICON_SPACING;
         let display_x = audio_x - TOPBAR_ICON_SPACING;
-        let recording_x = display_x - TOPBAR_ICON_SPACING;
-        let screenshot_x = recording_x - TOPBAR_ICON_SPACING;
+        let recording_half_width = if self.recording.is_some() { 44 } else { 18 };
+        let recording_spacing = recording_half_width + TOPBAR_ICON_HIT_RADIUS + 4;
+        let recording_x = display_x - recording_spacing;
+        let screenshot_x = recording_x - recording_spacing;
         let clipboard_x = screenshot_x - TOPBAR_ICON_SPACING;
         TopbarControls {
             clipboard_x,
             screenshot_x,
             recording_x,
+            recording_half_width,
             display_x,
             audio_x,
             network_x,
@@ -181,10 +185,12 @@ impl Aurora {
         }
     }
 
+    pub(crate) fn topbar_brand_end(&self) -> i32 {
+        24 + 23 + measure_text(&self.bold, "Aurora", TOPBAR_BRAND_TEXT_SIZE)
+    }
+
     pub(crate) fn workspace_x(&self, index: usize) -> i32 {
-        let brand_x = 24;
-        let aurora_width = measure_text(&self.bold, "Aurora", 16.0);
-        let start_x = brand_x + 23 + aurora_width + 24;
+        let start_x = self.topbar_brand_end() + 24;
         start_x + index as i32 * WORKSPACE_STRIDE
     }
 
@@ -211,15 +217,15 @@ impl Aurora {
 
         // Draw Brand on the far left
         let brand_x = 24;
-        c.draw_circle(brand_x, 20, 10, Color::rgba(160, 238, 220, 38));
-        c.draw_circle(brand_x, 20, 7, MINT_LIGHT);
-        c.draw_circle(brand_x - 2, 18, 2, Color::rgb(248, 255, 254));
+        c.draw_circle(brand_x, 20, 12, Color::rgba(160, 238, 220, 38));
+        c.draw_circle(brand_x, 20, 10, MINT_LIGHT);
+        c.draw_circle(brand_x - 3, 17, 3, Color::rgb(248, 255, 254));
         c.draw_text(
             &self.bold,
             "Aurora",
             brand_x + 23,
-            11,
-            16.0,
+            8,
+            TOPBAR_BRAND_TEXT_SIZE,
             Color::rgb(239, 252, 250),
         );
 
@@ -230,7 +236,7 @@ impl Aurora {
             draw_workspace_icon(
                 &mut c,
                 self.workspace_x(index),
-                11,
+                20 - WORKSPACE_SIZE / 2,
                 index == self.active_workspace,
             );
         }
@@ -261,12 +267,7 @@ impl Aurora {
 
         draw_clipboard_icon(&mut c, controls.clipboard_x, 20, MINT_LIGHT);
         draw_screenshot_icon(&mut c, controls.screenshot_x, 20, MINT_LIGHT);
-        let recording_color = if self.recording.is_some() { Color::rgb(255, 106, 106) } else { MINT_LIGHT };
-        if self.recording.as_ref().is_some_and(|state| state.is_recording()) {
-            c.draw_round_rect(controls.recording_x - 6, 14, 12, 12, 3, recording_color);
-        } else {
-            draw_record_icon(&mut c, controls.recording_x, 20, recording_color);
-        }
+        self.draw_topbar_recording_icon(&mut c, &controls);
         draw_sidebar_display_icon(&mut c, controls.display_x, 20, MINT_LIGHT);
         draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
         draw_sidebar_network_icon(&mut c, controls.network_x, 20, MINT_LIGHT);
@@ -555,6 +556,9 @@ impl Aurora {
                     Color::rgba(14, 23, 30, 245));
             }
             if slot == 0 {
+                if self.files_client_window().is_some() {
+                    c.draw_round_rect(x, 4, TOPBAR_TASK_SIZE, TOPBAR_TASK_SIZE, 9, Color::rgb(0, 0, 0));
+                }
                 draw_folder_icon(c, x + 16, 20, MINT_LIGHT);
             } else if slot == limit + 1 && windows.len() > limit {
                 for offset in [9,16,23] { c.draw_circle(x + offset, 20, 2, MINT_LIGHT); }
@@ -620,6 +624,10 @@ impl Aurora {
                     11,
                     Color::rgba(196, 219, 229, 95),
                 );
+                if i == 1 && self.files_client_window().is_some() {
+                    c.draw_round_rect(icon_x, icon_y, DOCK_ICON_SIZE, DOCK_ICON_SIZE,
+                        DOCK_ICON_RADIUS, Color::rgb(0, 0, 0));
+                }
                 draw_dock_icon(&mut c, i, icon_x + 22, icon_y + 22);
             } else if i == pinned + limit && task_windows.len() > limit {
                 c.draw_round_rect(icon_x, icon_y, 44, 44, 12, Color::rgba(255, 255, 255, 215));

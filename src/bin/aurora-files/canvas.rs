@@ -24,6 +24,7 @@ pub const MUTED: Color = Color::rgb(105, 118, 132);
 pub const SOFT_INK: Color = Color::rgb(74, 88, 103);
 pub const MINT_DARK: Color = Color::rgb(29, 145, 137);
 pub const BLUE: Color = Color::rgb(73, 156, 231);
+pub const BLUE_LIGHT: Color = Color::rgb(175, 218, 245);
 pub const PAPER: Color = Color::rgb(247, 252, 255);
 pub const CARD: Color = Color::rgba(255, 255, 255, 150);
 

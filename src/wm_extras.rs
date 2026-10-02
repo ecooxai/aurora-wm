@@ -801,8 +801,8 @@ impl Aurora {
                 controls.screenshot_x,
                 format!("Screenshot  ({})", format_shortcut(shortcuts.screenshot)),
             ))
-        } else if hit(controls.recording_x) {
-            Some((controls.recording_x, self.recording.as_ref().map(|state| state.label()).unwrap_or("Record screen with system audio and microphone").to_string()))
+        } else if self.recording_button_contains(x, 20) {
+            Some((controls.recording_x, self.recording_tooltip()))
         } else if hit(controls.display_x) {
             Some((controls.display_x, "Display settings  (click toggles)".to_string()))
         } else if hit(controls.audio_x) {
