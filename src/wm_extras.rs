@@ -1024,6 +1024,9 @@ impl Aurora {
         if !self.folder_terminal.visible {
             self.toggle_folder_terminal()?;
         }
+        self.folder_front = true;
+        self.settings_front = false;
+        self.media_front = false;
         self.conn.configure_window(
             self.ui.folder_terminal,
             &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),

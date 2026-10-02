@@ -67,14 +67,15 @@ impl Aurora {
 
     pub(crate) fn draw_topbar_recording_icon(&self, c: &mut Canvas, controls: &TopbarControls) {
         let Some(state) = self.recording.as_ref() else {
-            draw_record_icon(c, controls.recording_x, 20, RED_LIGHT);
+            draw_record_icon(c, controls.recording_x, 20, BLUE_LIGHT);
             return;
         };
         // The timer is part of the camcorder body. Keep the control wide for all
         // active stages so a press never moves while preparation finishes.
         let x = controls.recording_x - controls.recording_half_width + 4;
         let width = controls.recording_half_width * 2 - 22;
-        draw_record_camera(c, x, 20, width, RED_LIGHT);
+        let color = if state.is_recording() { RED_LIGHT } else { BLUE_LIGHT };
+        draw_record_camera(c, x, 20, width, color);
         let label = state
             .elapsed()
             .map(|elapsed| elapsed_label(elapsed.as_secs()))

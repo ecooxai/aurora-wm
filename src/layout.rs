@@ -619,6 +619,23 @@ impl Aurora {
             .any(|part| matches!(part, "aurora-files" | "aurora files" | "aurorafiles"))
     }
 
+    pub(crate) fn builtin_window_is_front(&self) -> bool {
+        (self.settings_visible && self.settings_front)
+            || self.folder_front
+            || (self.media_front && self.media_front_slot
+                .and_then(|slot| self.media_slots.get(slot))
+                .is_some_and(|media| media.is_some()))
+    }
+
+    pub(crate) fn files_client_is_active(&self) -> bool {
+        !self.builtin_window_is_front()
+            && self.active_client.is_some_and(|window| {
+                self.clients.get(&window)
+                    .is_some_and(|info| info.mapped && self.client_on_active_workspace(info))
+                    && self.is_files_client(window)
+            })
+    }
+
     pub(crate) fn files_client_window(&self) -> Option<Window> {
         self.clients.keys().copied().filter(|window| self.is_files_client(*window))
             .max_by_key(|window| {

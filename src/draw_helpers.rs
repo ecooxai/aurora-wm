@@ -945,7 +945,7 @@ pub(crate) fn draw_launcher_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32) {
         0 => draw_play_icon(c, cx, cy, BLUE),
         1 => draw_globe_icon(c, cx, cy, BLUE),
         2 => draw_camera_icon(c, cx, cy, MINT_DARK),
-        3 => draw_record_icon(c, cx, cy, RED_LIGHT),
+        3 => draw_record_icon(c, cx, cy, BLUE_LIGHT),
         4 => draw_gear_icon(c, cx, cy, SOFT_INK),
         _ => draw_more_icon(c, cx, cy, SOFT_INK),
     }
@@ -991,7 +991,8 @@ pub(crate) fn draw_record_camera(c: &mut Canvas, x: i32, cy: i32, width: i32, co
         let half_height = 3 + dx / 2;
         c.draw_rect(x + width + 1 + dx, cy - half_height, 1, half_height * 2 + 1, color);
     }
-    c.draw_line(x + 3, cy - 5, x + width - 4, cy - 5, 1, Color::rgb(255, 219, 224));
+    let highlight = if color == RED_LIGHT { Color::rgb(255, 219, 224) } else { Color::rgb(220, 240, 253) };
+    c.draw_line(x + 3, cy - 5, x + width - 4, cy - 5, 1, highlight);
 }
 
 pub(crate) fn draw_folder_icon(c: &mut Canvas, cx: i32, cy: i32, _color: Color) {

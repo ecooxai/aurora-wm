@@ -556,7 +556,7 @@ impl Aurora {
                     Color::rgba(14, 23, 30, 245));
             }
             if slot == 0 {
-                if self.files_client_window().is_some() {
+                if self.files_client_is_active() {
                     c.draw_round_rect(x, 4, TOPBAR_TASK_SIZE, TOPBAR_TASK_SIZE, 9, Color::rgb(0, 0, 0));
                 }
                 draw_folder_icon(c, x + 16, 20, MINT_LIGHT);
@@ -624,7 +624,7 @@ impl Aurora {
                     11,
                     Color::rgba(196, 219, 229, 95),
                 );
-                if i == 1 && self.files_client_window().is_some() {
+                if i == 1 && self.files_client_is_active() {
                     c.draw_round_rect(icon_x, icon_y, DOCK_ICON_SIZE, DOCK_ICON_SIZE,
                         DOCK_ICON_RADIUS, Color::rgb(0, 0, 0));
                 }
@@ -1051,6 +1051,7 @@ impl Aurora {
             b"CANCEL",
         )?;
         self.conn.unmap_window(self.ui.folder)?;
+        self.folder_front = false;
         if self.folder_terminal.visible {
             self.conn.unmap_window(self.ui.folder_terminal)?;
         }
@@ -1079,6 +1080,7 @@ impl Aurora {
             path_str.as_bytes(),
         )?;
         self.conn.unmap_window(self.ui.folder)?;
+        self.folder_front = false;
         if self.folder_terminal.visible {
             self.conn.unmap_window(self.ui.folder_terminal)?;
         }
@@ -1184,7 +1186,11 @@ impl Aurora {
                     9,
                     Color::rgba(255, 255, 255, 120),
                 );
-                draw_launcher_icon(&mut c, idx, 34, row_y + 12);
+                if idx == 3 && self.recording.as_ref().is_some_and(|state| state.is_recording()) {
+                    draw_record_icon(&mut c, 34, row_y + 12, RED_LIGHT);
+                } else {
+                    draw_launcher_icon(&mut c, idx, 34, row_y + 12);
+                }
                 c.draw_text(&self.bold, app.label, 58, row_y, 13.0, INK);
                 c.draw_text(&self.regular, app.hint, 58, row_y + 17, 10.0, MUTED);
             }

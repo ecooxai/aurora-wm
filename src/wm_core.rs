@@ -310,6 +310,7 @@ impl Aurora {
         let mut trace_counts: HashMap<&'static str, usize> = HashMap::new();
         let mut next_trace_log = Instant::now() + Duration::from_secs(1);
         let mut next_pointer_poll = Instant::now();
+        let mut last_builtin_front = self.builtin_window_is_front();
         loop {
             let mut handled_event = false;
             let mut pending_motion = None;
@@ -325,6 +326,11 @@ impl Aurora {
                         handled_event |= self.handle_motion_notify(ev)?;
                     }
                     self.handle_event(event)?;
+                    let builtin_front = self.builtin_window_is_front();
+                    if builtin_front != last_builtin_front {
+                        self.redraw_dock()?;
+                        last_builtin_front = builtin_front;
+                    }
                 }
             }
             if let Some(ev) = pending_motion.take() {
@@ -477,6 +483,15 @@ impl Aurora {
                 handled_event = true;
             }
 
+            // Built-in windows keep the previous client in active_client.
+            // Their foreground changes must repaint even when focus returns
+            // to that same client, or a drag changes focus outside dispatch.
+            let builtin_front = self.builtin_window_is_front();
+            if builtin_front != last_builtin_front {
+                self.redraw_dock()?;
+                last_builtin_front = builtin_front;
+                handled_event = true;
+            }
             if handled_event {
                 self.conn.flush()?;
             }
