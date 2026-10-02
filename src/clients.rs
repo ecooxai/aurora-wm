@@ -375,6 +375,17 @@ impl Aurora {
                             u32::from(frame_h),
                         )?;
                     }
+                    // TinyX may leave stale backing-store pixels in our own
+                    // obscured windows after an uncomposited move. Repaint once
+                    // when the gesture completes, without taxing every motion.
+                    if !self.compositor_active {
+                        self.raise_chrome()?;
+                        self.redraw_topbar()?;
+                        self.redraw_dock()?;
+                        if self.settings_visible {
+                            self.redraw_settings()?;
+                        }
+                    }
                     self.redraw_frame_titlebar(drag.client)?;
                 }
             }

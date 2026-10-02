@@ -12,6 +12,8 @@ mod fsmodel;
 mod imgwin;
 mod term;
 mod viewer;
+mod picker;
+use picker::*;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -279,6 +281,7 @@ struct App {
     file_menu: Option<(i32, i32, PathBuf)>,
     /// Path stored by the context menu's "Copy" action, used by "Paste".
     copied_path: Option<PathBuf>,
+    clipboard_cut: bool,
     /// Row pressed with button 1, opened on release if no drag started.
     pending_open: Option<PendingOpen>,
     /// The standalone image viewer window, when open.
@@ -293,6 +296,11 @@ struct App {
     xdnd: XdndAtoms,
     /// A file being dragged out of the app to another application.
     file_drag: Option<FileDrag>,
+    picker: Option<Picker>,
+    picker_service: bool,
+    picker_atom: Atom,
+    picker_done: bool,
+    edit_prompt: Option<EditPrompt>,
 }
 
 fn main() {
@@ -540,6 +548,9 @@ fn request_sticky(
 }
 
 fn run(args: &[String]) -> AnyResult<()> {
+    let picker_options = Picker::from_args(args)?;
+    let picker_service = args.iter().any(|a| a == "--picker-service");
+    let picker_mode = picker_options.is_some() || picker_service;
     let viewer_only = args.iter().any(|arg| arg == "--image-viewer");
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
     let (conn, screen_num) = RustConnection::connect(None)?;
@@ -548,7 +559,7 @@ fn run(args: &[String]) -> AnyResult<()> {
     let compact_size = (screen.width_in_pixels / 3)
         .clamp(360, 500)
         .min(screen.height_in_pixels.saturating_sub(80));
-    let width = compact_size;
+    let width = if picker_mode { 760.min(screen.width_in_pixels.saturating_sub(24)) } else { compact_size };
     let height = (screen.height_in_pixels * 4 / 5)
         .max(360)
         .min(screen.height_in_pixels.saturating_sub(40));
@@ -591,7 +602,7 @@ fn run(args: &[String]) -> AnyResult<()> {
         window,
         AtomEnum::WM_CLASS,
         AtomEnum::STRING,
-        b"aurora-files\0Aurora Files\0",
+        if picker_mode { b"aurora-picker\0Aurora Picker\0" as &[u8] } else { b"aurora-files\0Aurora Files\0" },
     )?;
     let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
     let wm_delete = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
@@ -650,17 +661,26 @@ fn run(args: &[String]) -> AnyResult<()> {
     )?;
     let gc = conn.generate_id()?;
     conn.create_gc(gc, window, &CreateGCAux::new().graphics_exposures(0))?;
-    conn.map_window(window)?;
-    if !viewer_only {
+    let picker_atom = conn.intern_atom(false, b"_AURORA_FILE_PICKER")?.reply()?.atom;
+    if picker_service {
+        let selection = conn.intern_atom(false, b"_AURORA_FILE_PICKER_SERVICE")?.reply()?.atom;
+        if conn.get_selection_owner(selection)?.reply()?.owner != 0 {
+            return Err("a file picker service is already running".into());
+        }
+        conn.set_selection_owner(window, selection, x11rb::CURRENT_TIME)?;
+    } else {
+        conn.map_window(window)?;
+    }
+    if !viewer_only && !picker_mode {
         request_sticky(&conn, screen.root, window)?;
     }
     conn.flush()?;
 
-    let start_path = args
+    let start_path = picker_options.as_ref().map(|p| p.initial.clone()).or_else(|| args
         .iter()
         .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
-        .filter(|p| p.exists())
+        .filter(|p| p.exists()))
         .unwrap_or_else(home_dir);
     let start_dir = if start_path.is_dir() {
         start_path.clone()
@@ -716,7 +736,7 @@ fn run(args: &[String]) -> AnyResult<()> {
         last_workspace_check: Instant::now(),
         viewer_only,
         close_at: viewer_only.then(|| Instant::now() + Duration::from_secs(60)),
-        terminal_visible: !viewer_only,
+        terminal_visible: !viewer_only && !picker_mode,
         terminal_h: i32::from(height) / 2,
         tabs: Vec::new(),
         active_tab: 0,
@@ -733,6 +753,7 @@ fn run(args: &[String]) -> AnyResult<()> {
         recent_paths: Vec::new(),
         file_menu: None,
         copied_path: None,
+        clipboard_cut: false,
         pending_open: None,
         img_win: None,
         txt_win: None,
@@ -740,6 +761,11 @@ fn run(args: &[String]) -> AnyResult<()> {
         image_menu: None,
         xdnd,
         file_drag: None,
+        picker: None,
+        picker_service,
+        picker_atom,
+        picker_done: false,
+        edit_prompt: None,
         focus: if args.iter().any(|a| a == "--terminal") {
             Focus::Terminal
         } else {
@@ -748,12 +774,13 @@ fn run(args: &[String]) -> AnyResult<()> {
     };
     app.reset_dir_watch();
     app.refresh_entries();
-    if !start_path.is_dir() {
+    if !start_path.is_dir() && !picker_mode {
         app.open_file_by_path(&start_path.clone());
     }
-    if !viewer_only {
+    if !viewer_only && !picker_mode {
         app.new_tab();
     }
+    if let Some(picker) = picker_options { app.begin_picker(picker)?; }
     app.event_loop()
 }
 
@@ -775,7 +802,7 @@ impl App {
             SIDEBAR_W,
             HEADER_H,
             i32::from(self.width) - SIDEBAR_W,
-            ty - HEADER_H,
+            ty - HEADER_H - if self.picker.is_some() { PICKER_FOOTER_H } else { 0 },
         )
     }
 
@@ -861,7 +888,7 @@ impl App {
     }
 
     fn sync_folder_to_active_terminal(&mut self) -> bool {
-        if self.viewer_only
+        if !self.terminal_visible || self.viewer_only
             || self.last_terminal_cwd_check.elapsed() < Duration::from_millis(150)
             || Instant::now() < self.terminal_sync_suppress_until
         {
@@ -1060,6 +1087,7 @@ impl App {
     }
 
     fn sync_workspace_folder_tab(&mut self) -> bool {
+        if self.picker.is_some() || self.picker_service { return false; }
         if self.last_workspace_check.elapsed() < Duration::from_millis(100) {
             return false;
         }
@@ -1097,7 +1125,11 @@ impl App {
     // ------------------------------------------------------------ navigation
 
     fn refresh_entries(&mut self) {
+        let selected_path = self.selected.and_then(|i| self.entries.get(i)).map(|e| e.path.clone());
         self.entries = list_dir(&self.cwd, self.show_hidden);
+        if let Some(picker) = &self.picker {
+            self.entries.retain(|entry| picker.matches(entry));
+        }
         let mode = self.sort_mode;
         self.entries.sort_by(|a, b| {
             let folders = (a.kind != FileKind::Directory).cmp(&(b.kind != FileKind::Directory));
@@ -1146,6 +1178,11 @@ impl App {
                 }
             }
         }
+        self.selected = selected_path.and_then(|path| self.entries.iter().position(|e| e.path == path));
+        self.scroll = self.scroll.min(self.entries.len().saturating_sub(self.visible_rows()));
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected.retain(|path| self.entries.iter().any(|e| &e.path == path));
+        }
     }
 
     /// Reset change tracking for the current folder (called on navigation).
@@ -1192,9 +1229,11 @@ impl App {
     }
 
     fn navigate(&mut self, path: &Path) {
-        if !path.is_dir() {
+        if let Err(err) = std::fs::read_dir(path) {
+            self.status = format!("Cannot open folder: {err}");
             return;
         }
+        if let Some(picker) = self.picker.as_mut() { picker.selected.clear(); picker.overwrite = None; }
         self.cwd = path.to_path_buf();
         self.reset_dir_watch();
         self.refresh_entries();
@@ -1228,6 +1267,8 @@ impl App {
         };
         if entry.kind == FileKind::Directory {
             self.navigate(&entry.path);
+        } else if self.picker.is_some() {
+            self.accept_picker();
         } else {
             self.open_file_by_path(&entry.path);
         }
@@ -2464,6 +2505,7 @@ impl App {
         let mut last_draw = Instant::now();
         let mut needs_draw = true;
         loop {
+            if self.picker_done { return Ok(()); }
             if self.close_at.is_some_and(|close_at| Instant::now() >= close_at) {
                 self.viewer_close();
                 return Ok(());
@@ -2627,12 +2669,15 @@ impl App {
                         self.handle_selection_request(&ev)?;
                     }
                     Event::ClientMessage(ev) => {
-                        if self.handle_xdnd_client_message(&ev) {
+                        if self.picker_service && ev.type_ == self.picker_atom && ev.format == 32 && ev.data.as_data32()[1] == 1 {
+                            self.receive_picker(ev.data.as_data32()[0], ev.data.as_data32()[2]);
                             needs_draw = true;
-                        } else if ev.type_ == self.open_screenshot_atom {
+                        } else if self.handle_xdnd_client_message(&ev) {
+                            needs_draw = true;
+                        } else if ev.type_ == self.open_screenshot_atom && !self.picker_service {
                             self.handle_screenshot_message();
                             needs_draw = true;
-                        } else if ev.type_ == self.open_folder_tab_atom {
+                        } else if ev.type_ == self.open_folder_tab_atom && !self.picker_service {
                             self.handle_folder_tab_message();
                             needs_draw = true;
                         } else if ev.data.as_data32()[0] == self.wm_delete {
@@ -2640,14 +2685,30 @@ impl App {
                                 self.close_image_window();
                             } else if Some(ev.window) == txt_window {
                                 self.close_text_window();
+                            } else if self.picker.is_some() {
+                                self.finish_picker(None);
                             } else {
                                 self.viewer_close();
-                                return Ok(());
+                                if !self.picker_service { return Ok(()); }
                             }
+                        }
+                    }
+                    Event::DestroyNotify(ev) => {
+                        if self.picker.as_ref().is_some_and(|p| p.requester == Some(ev.window)) {
+                            self.picker = None;
+                            self.conn.unmap_window(self.window)?;
                         }
                     }
                     _ => {}
                 }
+            }
+            // The resident picker is dormant between requests: do not scan
+            // directories, render an unmapped window, or run terminal polling.
+            // Process X events again within 75 ms so new dialogs remain prompt.
+            if self.picker_service && self.picker.is_none() {
+                self.conn.flush()?;
+                std::thread::sleep(Duration::from_millis(75));
+                continue;
             }
             // Poll terminals
             let mut term_changed = false;
@@ -2711,6 +2772,16 @@ impl App {
     // ------------------------------------------------------------ input
 
     fn on_click(&mut self, x: i32, y: i32, button: u8, _state: u16) {
+        if self.edit_prompt.is_some() {
+            let center = i32::from(self.width) / 2;
+            let button_y = i32::from(self.height) / 2 + 42;
+            if button == 1 && (button_y..button_y+36).contains(&y) {
+                if (center+10..i32::from(self.width)-24).contains(&x) { self.apply_edit_prompt(); }
+                else if (24..center-10).contains(&x) { self.edit_prompt = None; }
+            }
+            return;
+        }
+        if self.picker.is_some() && self.picker_click(x, y, button, _state) { return; }
         if self.folder_tabs_open {
             let menu_x = 132;
             let menu_y = 54;
@@ -2833,6 +2904,7 @@ impl App {
         }
         // Header
         if y < HEADER_H {
+            if button == 1 && y >= 49 { self.start_edit(EditKind::Location); return; }
             if (18..=48).contains(&x) && (18..=48).contains(&y) {
                 self.navigate(&home_dir());
             } else if (56..=86).contains(&x) && (18..=48).contains(&y) {
@@ -2843,6 +2915,9 @@ impl App {
                 let (cols, rows) = self.term_grid_size();
                 for tab in &mut self.tabs {
                     tab.resize(cols, rows);
+                }
+                if self.terminal_visible {
+                    self.terminal_cd(&self.cwd.clone());
                 }
             } else if (94..=124).contains(&x) && (18..=48).contains(&y) {
                 self.sort_open = !self.sort_open;
@@ -3081,6 +3156,22 @@ impl App {
             .or_else(|| mapping.keysyms.first().copied())
             .unwrap_or(0);
 
+        if self.edit_prompt.is_some() { self.edit_prompt_key(keysym, ctrl); return Ok(false); }
+        if self.picker.is_some() { self.picker_key(keysym, ctrl, shift); return Ok(false); }
+        if self.focus == Focus::Files {
+            if ctrl && matches!(keysym, 0x63 | 0x43 | 0x78 | 0x58) {
+                let path = self.menu_target_path(); self.action_copy_entry(&path);
+                if matches!(keysym, 0x78 | 0x58) { self.clipboard_cut = true; self.status = "Cut — paste to move".into(); }
+                return Ok(false);
+            }
+            if ctrl && matches!(keysym, 0x76 | 0x56) { self.paste_copied_file(); return Ok(false); }
+            if ctrl && matches!(keysym, 0x6c | 0x4c) { self.start_edit(EditKind::Location); return Ok(false); }
+            if ctrl && shift && matches!(keysym, 0x6e | 0x4e) { self.start_edit(EditKind::NewFolder); return Ok(false); }
+            if keysym == 0xffff { self.start_edit(EditKind::Trash); return Ok(false); }
+            if keysym == 0xffbf { self.start_edit(EditKind::Rename); return Ok(false); }
+            if keysym == 0xffc2 { self.refresh_entries(); return Ok(false); }
+            if ctrl && matches!(keysym, 0x68 | 0x48) { self.show_hidden = !self.show_hidden; self.refresh_entries(); return Ok(false); }
+        }
         match self.focus {
             Focus::Terminal => {
                 if self.tabs.get(self.active_tab).is_some() {
@@ -3261,11 +3352,24 @@ impl App {
         self.draw_header_menus(&mut c);
         self.draw_file_menu(&mut c);
         self.draw_image_menu(&mut c);
+        self.draw_picker_footer(&mut c);
+        self.draw_edit_prompt(&mut c);
         self.upload(&c)?;
         Ok(())
     }
 
     fn draw_header(&self, c: &mut Canvas) {
+        if self.picker.is_some() {
+            c.draw_rect(0, 0, i32::from(self.width), HEADER_H, Color::rgb(236, 245, 250));
+            for (x, label) in [(18, "Home"), (56, "Up"), (94, "Sort"), (132, "Hidden")] {
+                c.draw_round_rect(x, 16, 34, 30, 7, CARD);
+                c.draw_text(&self.bold, label, x+1, 24, 9.0, MINT_DARK);
+            }
+            c.draw_text(&self.regular, "Ctrl+L: location   Ctrl+H: hidden   Esc: cancel", 184, 26, 11.0, MUTED);
+            c.draw_text(&self.bold, "+", i32::from(self.width)-40, 22, 18.0, MINT_DARK);
+            c.draw_text(&self.regular, &compact_path(&self.cwd, ((i32::from(self.width)-32)/7) as usize), 18, 53, 13.0, INK);
+            return;
+        }
         c.draw_rect(0, 0, i32::from(self.width), HEADER_H, Color::rgb(236, 245, 250));
         c.draw_rect(0, HEADER_H - 1, i32::from(self.width), 1, Color::rgba(176, 198, 210, 120));
         // Match the desktop folder toolbar: Home, Terminal, Sort, Tabs, More.
@@ -3476,6 +3580,12 @@ impl App {
             "Copy",
             "Paste",
             "Copy parent path",
+            "Go to folder (Ctrl+L)",
+            "New folder (Ctrl+Shift+N)",
+            "Rename (F2)",
+            "Cut",
+            "Refresh (F5)",
+            "Move to Trash (Delete)",
         ]
     }
 
@@ -3506,7 +3616,13 @@ impl App {
             2 => self.action_copy_path(&target),
             3 => self.action_copy_entry(&target),
             4 => self.paste_copied_file(),
-            _ => self.action_copy_parent_path(&target),
+            5 => self.action_copy_parent_path(&target),
+            6 => self.start_edit(EditKind::Location),
+            7 => self.start_edit(EditKind::NewFolder),
+            8 => self.start_edit(EditKind::Rename),
+            9 => { self.action_copy_entry(&target); self.clipboard_cut = true; self.status = "Cut — paste to move".into(); }
+            10 => { self.refresh_entries(); self.status = "Refreshed".into(); },
+            _ => self.start_edit(EditKind::Trash),
         }
     }
 
@@ -3531,6 +3647,7 @@ impl App {
     }
 
     fn action_copy_entry(&mut self, path: &Path) {
+        self.clipboard_cut = false;
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -3625,7 +3742,7 @@ impl App {
         {
             let idx = self.scroll + row;
             let y = cy + 6 + row as i32 * ROW_H;
-            let selected = self.selected == Some(idx);
+            let selected = self.selected == Some(idx) || self.picker.as_ref().is_some_and(|p| p.selected.contains(&entry.path));
             c.draw_round_rect(
                 cx + 8,
                 y,
@@ -3894,8 +4011,8 @@ impl App {
         (cx + cw - bw - 10, cy + 6, bw, bw)
     }
 
-    const FILE_MENU_ITEMS: [&'static str; 4] =
-        ["Copy path", "Copy", "Paste", "Copy parent path"];
+    const FILE_MENU_ITEMS: [&'static str; 8] =
+        ["Copy path", "Copy", "Paste", "Copy parent path", "Rename (F2)", "Cut", "New folder", "Move to Trash"];
 
     fn file_menu_geometry(&self) -> (i32, i32, i32, i32) {
         let (mx, my) = self
@@ -3943,7 +4060,11 @@ impl App {
             0 => self.action_copy_path(&path),
             1 => self.action_copy_entry(&path),
             2 => self.paste_copied_file(),
-            _ => self.action_copy_parent_path(&path),
+            3 => self.action_copy_parent_path(&path),
+            4 => self.start_edit(EditKind::Rename),
+            5 => { self.action_copy_entry(&path); self.clipboard_cut = true; self.status = "Cut — paste to move".into(); }
+            6 => self.start_edit(EditKind::NewFolder),
+            _ => self.start_edit(EditKind::Trash),
         }
         true
     }
@@ -3954,7 +4075,7 @@ impl App {
             self.status = "Nothing to paste (use Copy first)".into();
             return;
         };
-        if !src.exists() {
+        if std::fs::symlink_metadata(&src).is_err() {
             self.status = "Copied item no longer exists".into();
             return;
         }
@@ -3964,7 +4085,7 @@ impl App {
             .unwrap_or_else(|| "copy".into());
         let mut dest = self.cwd.join(&name);
         let mut counter = 1u32;
-        while dest.exists() {
+        while std::fs::symlink_metadata(&dest).is_ok() {
             dest = self.cwd.join(format!("{name} (copy {counter})"));
             counter += 1;
             if counter > 99 {
@@ -3972,23 +4093,18 @@ impl App {
                 return;
             }
         }
-        let ok = Command::new("cp")
-            .arg("-a")
-            .arg("--")
-            .arg(&src)
-            .arg(&dest)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            self.known_paths.insert(dest.clone());
-            self.recent_paths.insert(0, dest.clone());
-            self.refresh_entries();
-            self.selected = self.entries.iter().position(|entry| entry.path == dest);
-            self.scroll = 0;
-            self.status = format!("Pasted {}", compact(&name, 30));
-        } else {
-            self.status = "Paste failed".into();
+        let result = if self.clipboard_cut { std::fs::rename(&src, &dest) } else { copy_entry_no_replace(&src, &dest) };
+        match result {
+            Ok(()) => {
+                if self.clipboard_cut { self.copied_path = None; self.clipboard_cut = false; }
+                self.known_paths.insert(dest.clone());
+                self.recent_paths.insert(0, dest.clone());
+                self.refresh_entries();
+                self.selected = self.entries.iter().position(|entry| entry.path == dest);
+                self.scroll = 0;
+                self.status = format!("Pasted {}", compact(&name, 30));
+            }
+            Err(err) => self.status = format!("Paste failed: {err}"),
         }
     }
 

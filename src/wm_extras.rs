@@ -235,7 +235,28 @@ impl Aurora {
 
     /// Publish the EWMH hints this WM understands.
     pub(crate) fn publish_ewmh_support(&self) -> AnyResult<()> {
-        let names: [&[u8]; 9] = [
+        // GTK validates this self-referencing child before trusting _NET_SUPPORTED.
+        // Without it Firefox falls back to moving its reparented client instead
+        // of asking Aurora to move the frame through _NET_WM_MOVERESIZE.
+        let check = self.conn.generate_id()?;
+        self.conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT, check, self.root,
+            0, 0, 1, 1, 0, WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT, &CreateWindowAux::new(),
+        )?;
+        let supporting = self.atom(b"_NET_SUPPORTING_WM_CHECK")?;
+        for window in [check, self.root] {
+            self.conn.change_property32(
+                PropMode::REPLACE, window, supporting, AtomEnum::WINDOW, &[check],
+            )?;
+        }
+        self.conn.change_property8(
+            PropMode::REPLACE, check, self.atom(b"_NET_WM_NAME")?,
+            self.atom(b"UTF8_STRING")?, b"Aurora",
+        )?;
+        let names: [&[u8]; 11] = [
+            b"_NET_SUPPORTING_WM_CHECK",
+            b"_NET_WM_NAME",
             b"_NET_SUPPORTED",
             b"_NET_WM_STATE",
             b"_NET_WM_STATE_FULLSCREEN",
@@ -253,7 +274,7 @@ impl Aurora {
         self.conn.change_property32(
             PropMode::REPLACE,
             self.root,
-            atoms[0],
+            self.atom(b"_NET_SUPPORTED")?,
             AtomEnum::ATOM,
             &atoms,
         )?;

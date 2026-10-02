@@ -105,6 +105,7 @@ fn color_256(v: usize) -> Color {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_pty(cwd: &Path, cols: usize, rows: usize) -> Option<(RawFd, libc::pid_t)> {
     let mut master: RawFd = -1;
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
@@ -135,6 +136,86 @@ pub fn spawn_pty(cwd: &Path, cols: usize, rows: usize) -> Option<(RawFd, libc::p
         let flags = libc::fcntl(master, libc::F_GETFL);
         libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
+    Some((master, pid))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_pty(cwd: &Path, cols: usize, rows: usize) -> Option<(RawFd, libc::pid_t)> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut name = [0i8; 64];
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    ws.ws_col = cols as u16;
+    ws.ws_row = rows as u16;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            name.as_mut_ptr(),
+            std::ptr::null(),
+            &ws,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // wasm32-linux has no fork(); posix_spawn onto the pty slave instead.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let c_shell = CString::new(shell).ok()?;
+    let c_cwd = CString::new(cwd.to_string_lossy().as_bytes()).ok()?;
+    let mut pid: libc::pid_t = 0;
+    let spawn_rc = unsafe {
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        if libc::posix_spawn_file_actions_init(&mut actions) != 0 {
+            libc::close(master);
+            libc::close(slave);
+            return None;
+        }
+        if libc::posix_spawnattr_init(&mut attr) != 0 {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            libc::close(master);
+            libc::close(slave);
+            return None;
+        }
+        let _ = libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETSID as libc::c_short);
+        let _ = libc::posix_spawn_file_actions_addclose(&mut actions, master);
+        let _ = libc::posix_spawn_file_actions_adddup2(&mut actions, slave, 0);
+        let _ = libc::posix_spawn_file_actions_adddup2(&mut actions, slave, 1);
+        let _ = libc::posix_spawn_file_actions_adddup2(&mut actions, slave, 2);
+        if slave > 2 {
+            let _ = libc::posix_spawn_file_actions_addclose(&mut actions, slave);
+        }
+        let _ = libc::posix_spawn_file_actions_addchdir_np(&mut actions, c_cwd.as_ptr());
+        let argv = [c_shell.as_ptr(), std::ptr::null()];
+        unsafe extern "C" {
+            static mut environ: *mut *mut libc::c_char;
+        }
+        std::env::set_var("TERM", "xterm-256color");
+        let rc = libc::posix_spawnp(
+            &mut pid,
+            c_shell.as_ptr(),
+            &actions,
+            &attr,
+            argv.as_ptr() as *const *mut libc::c_char,
+            environ as *const *mut libc::c_char,
+        );
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        libc::posix_spawnattr_destroy(&mut attr);
+        libc::close(slave);
+        rc
+    };
+    if spawn_rc != 0 {
+        unsafe {
+            libc::close(master);
+        }
+        return None;
+    }
+    unsafe {
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let _ = name;
     Some((master, pid))
 }
 
