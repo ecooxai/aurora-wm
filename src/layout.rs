@@ -76,11 +76,11 @@ impl Aurora {
             self.settings.selected_mode = current;
         }
         self.wallpaper_cache = vec![None; WALLPAPERS.len()];
-        self.wallpaper_pixels = render_wallpaper_pixels(
+        self.wallpaper_pixels = std::sync::Arc::new(render_wallpaper_pixels(
             WALLPAPERS[self.wallpaper_index].bytes,
             self.screen_width,
             self.screen_height,
-        )?;
+        )?);
         self.wallpaper_cache[self.wallpaper_index] = Some(self.wallpaper_pixels.clone());
         self.hide_dock_more_menu()?;
         let dock = self.dock_geometry();
@@ -440,7 +440,7 @@ impl Aurora {
     }
 
     pub(crate) fn dock_geometry(&self) -> (i16, i16, u16, u16) {
-        let buttons = self.dock_button_count().max(5);
+        let buttons = self.dock_button_count();
         let width = (buttons as i32 * DOCK_STRIDE - (DOCK_STRIDE - DOCK_ICON_SIZE))
             .max(DOCK_ICON_SIZE) as u16;
         let width = width.min(self.screen_width);
@@ -512,8 +512,9 @@ impl Aurora {
         let height = if self.app_menu_more { 540u16 } else { 350u16 }
             .min(self.screen_height.saturating_sub(TOPBAR_HEIGHT + DOCK_HEIGHT + 24));
         let dock = self.dock_geometry();
-        let x = dock.0.max(18);
-        let y = dock.1.saturating_sub(height as i16 + 10);
+        let x = if self.dock_is_merged() { 12 } else { dock.0.max(18) }
+            .min(self.screen_width.saturating_sub(width + 12) as i16);
+        let y = if self.dock_is_merged() { TOPBAR_HEIGHT as i16 + 8 } else { dock.1.saturating_sub(height as i16 + 10) };
         (x, y, width, height)
     }
 
@@ -561,13 +562,39 @@ impl Aurora {
         (x, y as i16, width, height)
     }
 
-    pub(crate) fn dock_button_count(&self) -> usize {
-        let task_windows = self.task_client_windows();
-        if task_windows.len() <= 10 {
-            5 + task_windows.len()
+    pub(crate) fn topbar_task_capacity(&self) -> usize {
+        let clock_width = measure_text(&self.regular, &format_clock(), 16.0) + 32;
+        let available = self.topbar_controls().clipboard_x - 24 - clock_width - self.topbar_tasks_x();
+        dock_slot_capacity(available, TOPBAR_TASK_STRIDE)
+    }
+
+    pub(crate) fn dock_is_merged(&self) -> bool {
+        // Keep the saved preference; fall back when the folder and overflow
+        // cannot fit beside the workspaces and clock.
+        self.settings.dock_in_topbar && self.topbar_task_capacity() >= 2
+    }
+
+    pub(crate) fn dock_pinned_count(&self) -> usize {
+        if self.dock_is_merged() { 1 } else { 3 }
+    }
+
+    pub(crate) fn topbar_tasks_x(&self) -> i32 {
+        self.add_workspace_x() + WORKSPACE_SIZE + 22
+    }
+
+    pub(crate) fn dock_task_limit(&self) -> usize {
+        let capacity = if self.dock_is_merged() {
+            self.topbar_task_capacity()
         } else {
-            5 + 10 + 1
-        }
+            dock_slot_capacity(i32::from(self.screen_width.saturating_sub(24)), DOCK_STRIDE).max(4)
+        };
+        capacity.saturating_sub(self.dock_pinned_count() + 1).min(10)
+    }
+
+    pub(crate) fn dock_button_count(&self) -> usize {
+        let count = self.task_client_windows().len();
+        let limit = self.dock_task_limit();
+        self.dock_pinned_count() + count.min(limit) + usize::from(count > limit)
     }
 
     pub(crate) fn task_client_windows(&self) -> Vec<Window> {
@@ -583,25 +610,33 @@ impl Aurora {
     }
 
     pub(crate) fn dock_more_menu_geometry(&self) -> (i16, i16, u16, u16) {
-        let (dx, dy, dw, _dh) = self.dock_geometry();
-        let mut icon_x = 15 * DOCK_STRIDE;
-        icon_x = icon_x.min(i32::from(dw).saturating_sub(DOCK_ICON_SIZE));
-        let center_x = dx + icon_x as i16 + (DOCK_ICON_SIZE / 2) as i16;
+        let (dx, dy, dw, _) = self.dock_geometry();
+        let overflow = self.dock_pinned_count() + self.dock_task_limit();
+        let center_x = if self.dock_is_merged() {
+            self.topbar_tasks_x() + overflow as i32 * TOPBAR_TASK_STRIDE + TOPBAR_TASK_SIZE / 2
+        } else {
+            i32::from(dx) + (overflow as i32 * DOCK_STRIDE).min(i32::from(dw).saturating_sub(DOCK_ICON_SIZE)) + DOCK_ICON_SIZE / 2
+        };
+        let hidden = self.task_client_windows().len().saturating_sub(self.dock_task_limit());
+        let width = 240u16.min(self.screen_width.saturating_sub(24).max(1));
+        let available_height = if self.dock_is_merged() {
+            self.screen_height.saturating_sub(TOPBAR_HEIGHT + 20)
+        } else {
+            (i32::from(dy) - i32::from(TOPBAR_HEIGHT) - 16).max(1) as u16
+        };
+        let rows = dock_overflow_visible_rows(available_height).min(hidden.max(1));
+        let height = (rows.saturating_mul(40) + 16).min(usize::from(available_height)).max(1) as u16;
+        let x = (center_x - i32::from(width) / 2).clamp(0, i32::from(self.screen_width.saturating_sub(width)));
+        let y = if self.dock_is_merged() {
+            i32::from(TOPBAR_HEIGHT) + 8
+        } else {
+            (i32::from(dy) - i32::from(height) - 8).max(0)
+        }.min(i32::from(self.screen_height.saturating_sub(height)));
+        (x as i16, y as i16, width, height)
+    }
 
-        let task_windows = self.task_client_windows();
-        let hidden_count = task_windows.len().saturating_sub(10);
-        let width = 240u16;
-        let height = (hidden_count as u16 * 40 + 16).max(40);
-
-        let mut x = center_x - (width as i16 / 2);
-        if x + width as i16 > self.screen_width as i16 - 12 {
-            x = self.screen_width as i16 - width as i16 - 12;
-        }
-        if x < 12 {
-            x = 12;
-        }
-        let y = dy - height as i16 - 8;
-        (x, y, width, height)
+    pub(crate) fn dock_more_visible_rows(&self) -> usize {
+        dock_overflow_visible_rows(self.dock_more_menu_geometry().3)
     }
 
     pub(crate) fn client_key_for(&self, window: Window) -> Option<Window> {
@@ -642,6 +677,7 @@ impl Aurora {
             || window == self.ui.settings
             || window == self.ui.folder
             || window == self.ui.folder_terminal
+            || window == self.ui.recording_notice
             || window == self.ui.screenshot_overlay
             || window == self.ui.app_menu
             || window == self.ui.aurora_menu
@@ -655,5 +691,29 @@ impl Aurora {
 
     pub(crate) fn media_slot_for_window(&self, window: Window) -> Option<usize> {
         self.ui.media.iter().position(|&media| media == window)
+    }
+}
+
+
+fn dock_slot_capacity(available_width: i32, stride: i32) -> usize {
+    (available_width.max(0) / stride.max(1)) as usize
+}
+
+fn dock_overflow_visible_rows(height: u16) -> usize {
+    (usize::from(height.saturating_sub(16)) / 40).max(1)
+}
+
+#[cfg(test)]
+mod dock_layout_tests {
+    use super::*;
+
+    #[test]
+    fn task_slots_and_overflow_rows_stay_within_available_space() {
+        assert_eq!(dock_slot_capacity(-40, 38), 0);
+        assert_eq!(dock_slot_capacity(75, 38), 1);
+        assert_eq!(dock_slot_capacity(76, 38), 2);
+        assert_eq!(dock_overflow_visible_rows(756), 18);
+        assert_eq!(dock_overflow_visible_rows(56), 1);
+        assert_eq!(dock_overflow_visible_rows(0), 1);
     }
 }

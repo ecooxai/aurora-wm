@@ -81,12 +81,12 @@ pub(crate) fn app_menu_items() -> Vec<AppMenuItem> {
         },
         AppMenuItem {
             label: "Recorder",
-            hint: "Record audio or screen",
+            hint: "Record your screen",
             action: AppAction::Recorder,
         },
         AppMenuItem {
             label: "Settings",
-            hint: "Display and power",
+            hint: "Desktop settings",
             action: AppAction::Settings,
         },
         AppMenuItem {

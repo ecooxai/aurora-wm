@@ -75,9 +75,10 @@ impl Aurora {
             SettingsTab::Apps,
             SettingsTab::Shortcuts,
             SettingsTab::About,
+            SettingsTab::Dock,
         ];
         for (idx, tab) in items.iter().enumerate() {
-            let y = SETTINGS_SIDEBAR_TOP + idx as i32 * 48;
+            let y = SETTINGS_SIDEBAR_TOP + idx as i32 * SETTINGS_SIDEBAR_STRIDE;
             let active = *tab == self.settings.tab;
             if active {
                 c.draw_round_rect(
@@ -91,6 +92,20 @@ impl Aurora {
             }
             draw_sidebar_icon(c, idx, 28, y + 12, if active { MINT_DARK } else { MUTED });
         }
+    }
+
+    pub(crate) fn draw_dock_tab(&self, c: &mut Canvas) {
+        let sx = SIDEBAR_WIDTH + 24;
+        c.draw_text(&self.bold, "Dock", sx, 22, 24.0, INK);
+        c.draw_text(&self.regular, "Choose where your apps appear.", sx, 54, 13.0, MUTED);
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 132);
+        c.draw_text(&self.bold, "Merge dock into topbar", sx + 16, 105, 16.0, INK);
+        c.draw_text(&self.regular, "Keep Files and running apps beside workspaces.", sx + 16, 144, 12.0, MUTED);
+        c.draw_text(&self.regular, "The clock moves beside the clipboard button.", sx + 16, 171, 12.0, MUTED);
+        let tx = i32::from(c.width) - 80;
+        c.draw_round_rect(tx, 103, 40, 24, 12, if self.settings.dock_in_topbar { MINT_DARK } else { Color::rgb(180,192,201) });
+        c.draw_circle(tx + if self.settings.dock_in_topbar { 28 } else { 12 }, 115, 8, Color::rgb(255,255,255));
+        c.draw_text(&self.regular, "Click Aurora to open the start menu.", sx, 246, 13.0, MUTED);
     }
 
     pub(crate) fn draw_display_tab(&self, c: &mut Canvas) {

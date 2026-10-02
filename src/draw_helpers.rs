@@ -511,7 +511,11 @@ pub(crate) fn draw_sidebar_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32, co
         6 => draw_sidebar_startup_icon(c, cx, cy, color),
         7 => draw_sidebar_apps_icon(c, cx, cy, color),
         8 => draw_sidebar_keyboard_icon(c, cx, cy, color),
-        _ => draw_sidebar_about_icon(c, cx, cy, color),
+        9 => draw_sidebar_about_icon(c, cx, cy, color),
+        _ => {
+            c.draw_round_rect(cx - 14, cy - 6, 28, 14, 4, Color::rgba(color.r, color.g, color.b, 70));
+            for offset in [-8, 0, 8] { c.draw_round_rect(cx + offset - 2, cy - 2, 5, 5, 1, color); }
+        },
     }
 }
 
@@ -839,9 +843,7 @@ pub(crate) fn draw_sidebar_about_icon(c: &mut Canvas, cx: i32, cy: i32, color: C
 pub(crate) fn draw_dock_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32) {
     match idx {
         0 => draw_apps_icon(c, cx, cy, BLUE),
-        1 => draw_picture_icon(c, cx, cy, MINT_DARK),
-        2 => draw_music_icon(c, cx, cy, MINT_DARK),
-        3 => draw_play_icon(c, cx, cy, BLUE),
+        1 => draw_folder_icon(c, cx, cy, MINT_DARK),
         _ => draw_gear_icon(c, cx, cy, SOFT_INK),
     }
 }
@@ -984,14 +986,9 @@ pub(crate) fn draw_record_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
 }
 
 pub(crate) fn draw_folder_icon(c: &mut Canvas, cx: i32, cy: i32, _color: Color) {
-    c.draw_round_rect(
-        cx - 12,
-        cy - 12,
-        24,
-        24,
-        6,
-        Color::rgb(175, 218, 245), // Simple beautiful light blue square
-    );
+    c.draw_round_rect(cx - 12, cy - 10, 12, 7, 3, Color::rgb(220,167,57));
+    c.draw_round_rect(cx - 13, cy - 6, 26, 18, 4, Color::rgb(244,190,72));
+    c.draw_round_rect(cx - 11, cy - 3, 22, 12, 3, Color::rgb(255,211,105));
 }
 
 pub(crate) fn draw_home_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {

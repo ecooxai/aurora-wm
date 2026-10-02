@@ -875,7 +875,7 @@ impl Aurora {
                 .set_input_focus(InputFocus::POINTER_ROOT, self.ui.app_menu, CURRENT_TIME)?;
             return Ok(());
         }
-        if self.app_menu_more && x >= 264 && (button == 4 || button == 5) {
+        if self.app_menu_more && (button == 4 || button == 5) {
             let rows = app_catalog_rows(
                 &self.app_menu_query,
                 &self.app_menu_expanded_categories,
@@ -955,12 +955,7 @@ impl Aurora {
             AppAction::Camera => {
                 self.launch_desktop_app_matching(&["snapshot", "camera", "cheese"], &["snapshot"]);
             }
-            AppAction::Recorder => {
-                self.launch_desktop_app_matching(
-                    &["recorder", "obs studio", "screencast"],
-                    &["obs"],
-                );
-            }
+            AppAction::Recorder => { self.toggle_screen_recording()?; }
             AppAction::Settings => {
                 self.hide_app_menu()?;
                 self.settings_visible = true;
@@ -979,7 +974,7 @@ impl Aurora {
                 self.app_menu_more = !self.app_menu_more;
                 self.app_menu_scroll = 0;
                 if self.app_menu_more {
-                    self.app_menu_expanded_categories.clear();
+                    self.app_menu_expanded_categories = app_catalog_rows("", &HashSet::new()).into_iter().filter_map(|row| match row { AppCatalogRow::Category { name, .. } => Some(name), _ => None }).collect();
                 }
                 let menu = self.app_menu_geometry();
                 self.conn.configure_window(

@@ -453,6 +453,14 @@ impl Aurora {
             self.conn.map_window(window)?;
             return Ok(());
         }
+        let requested_desktop = self.atom(b"_NET_WM_DESKTOP").ok().and_then(|atom| {
+            let reply = self.conn.get_property(false, window, atom, AtomEnum::CARDINAL, 0, 1).ok()?.reply().ok()?;
+            reply.value32().and_then(|mut values| values.next())
+        });
+        let sticky = requested_desktop == Some(u32::MAX);
+        let workspace = requested_desktop.filter(|desktop| (*desktop as usize) < self.workspace_count)
+            .map(|desktop| desktop as usize).unwrap_or(self.active_workspace);
+        let desktop_value = if sticky { u32::MAX } else { workspace as u32 };
         let was_mapped = attr.map_state != MapState::UNMAPPED;
         let geom = self.conn.get_geometry(window)?.reply()?;
         let class = self.window_class(window);
@@ -530,7 +538,7 @@ impl Aurora {
         self.conn
             .reparent_window(window, frame, 0, title_h as i16)?;
         self.conn.map_window(window)?;
-        self.conn.map_window(frame)?;
+        if sticky || workspace == self.active_workspace { self.conn.map_window(frame)?; }
         // Set EWMH _NET_WM_DESKTOP on the client window and its frame
         if let Ok(desktop_atom) = self.atom(b"_NET_WM_DESKTOP") {
             if let Ok(cardinal_atom) = self.atom(b"CARDINAL") {
@@ -539,14 +547,14 @@ impl Aurora {
                     window,
                     desktop_atom,
                     cardinal_atom,
-                    &[self.active_workspace as u32],
+                    &[desktop_value],
                 );
                 let _ = self.conn.change_property32(
                     PropMode::REPLACE,
                     frame,
                     desktop_atom,
                     cardinal_atom,
-                    &[self.active_workspace as u32],
+                    &[desktop_value],
                 );
             }
         }
@@ -554,7 +562,7 @@ impl Aurora {
         let info = ClientInfo {
             window,
             frame,
-            workspace: self.active_workspace,
+            workspace,
             mapped: true,
             x,
             y,
@@ -562,7 +570,7 @@ impl Aurora {
             height,
             titlebar,
             saved: None,
-            sticky: false,
+            sticky,
             fullscreen: false,
             fs_saved: None,
         };

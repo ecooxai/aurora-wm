@@ -253,6 +253,19 @@ impl Aurora {
 
     pub(crate) fn handle_app_menu_keypress(&mut self, keysym: u32) -> AnyResult<bool> {
         match keysym {
+            0xff52 | 0xff54 | 0xff55 | 0xff56 | 0xff50 | 0xff57 if self.app_menu_more => {
+                let rows = app_catalog_rows(&self.app_menu_query, &self.app_menu_expanded_categories);
+                let visible = ((i32::from(self.app_menu_geometry().3) - 100) / 30).max(1) as usize;
+                let max_scroll = rows.len().saturating_sub(visible);
+                self.app_menu_scroll = match keysym {
+                    0xff52 => self.app_menu_scroll.saturating_sub(1),
+                    0xff54 => (self.app_menu_scroll + 1).min(max_scroll),
+                    0xff55 => self.app_menu_scroll.saturating_sub(visible),
+                    0xff56 => (self.app_menu_scroll + visible).min(max_scroll),
+                    0xff50 => 0, _ => max_scroll,
+                };
+                self.redraw_app_menu()?;
+            }
             0xff1b => {
                 if self.app_menu_query.is_empty() {
                     self.hide_app_menu()?;

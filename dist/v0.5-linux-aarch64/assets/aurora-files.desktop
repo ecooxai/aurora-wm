@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Aurora Files
+GenericName=File Manager
+Comment=Browse files with a built-in tabbed terminal and viewers
+Exec=aurora-files %f
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileTools;FileManager;Utility;
+MimeType=inode/directory;
+StartupWMClass=aurora-files

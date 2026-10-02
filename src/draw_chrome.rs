@@ -105,12 +105,16 @@ impl Aurora {
             self.screen_width,
             self.screen_height,
         )?;
-        let canvas = Canvas {
-            width: self.screen_width,
-            height: self.screen_height,
-            data: self.wallpaper_pixels.clone(),
-        };
-        self.upload_canvas(pixmap, &canvas)?;
+        let image = Image::new(
+            self.screen_width,
+            self.screen_height,
+            ScanlinePad::Pad32,
+            self.depth,
+            BitsPerPixel::B32,
+            XrbImageOrder::LsbFirst,
+            Cow::Borrowed(&self.wallpaper_pixels),
+        )?;
+        image.put(&self.conn, pixmap, self.gc, 0, 0)?;
         self.conn.change_window_attributes(
             self.root,
             &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
@@ -162,11 +166,13 @@ impl Aurora {
         let network_x = battery_left - 22;
         let audio_x = network_x - TOPBAR_ICON_SPACING;
         let display_x = audio_x - TOPBAR_ICON_SPACING;
-        let screenshot_x = display_x - TOPBAR_ICON_SPACING;
+        let recording_x = display_x - TOPBAR_ICON_SPACING;
+        let screenshot_x = recording_x - TOPBAR_ICON_SPACING;
         let clipboard_x = screenshot_x - TOPBAR_ICON_SPACING;
         TopbarControls {
             clipboard_x,
             screenshot_x,
+            recording_x,
             display_x,
             audio_x,
             network_x,
@@ -218,7 +224,9 @@ impl Aurora {
         );
 
         // Draw Workspace icons to the right of the Brand
+        let controls = self.topbar_controls();
         for index in 0..self.workspace_count {
+            if self.workspace_x(index) + WORKSPACE_SIZE >= controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS { break; }
             draw_workspace_icon(
                 &mut c,
                 self.workspace_x(index),
@@ -227,25 +235,38 @@ impl Aurora {
             );
         }
         let add_x = self.add_workspace_x();
-        draw_add_workspace_icon(&mut c, add_x, 20);
+        if add_x + WORKSPACE_SIZE < controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS {
+            draw_add_workspace_icon(&mut c, add_x, 20);
+        }
 
         let clock = self
             .topbar_notice
             .as_ref()
             .map(|(message, _)| message.clone())
             .unwrap_or_else(format_clock);
-        c.draw_text_center(
-            &self.regular,
-            &clock,
-            i32::from(self.screen_width) / 2,
-            10,
-            16.0,
-            Color::rgb(239, 252, 250),
-        );
-
         let controls = self.topbar_controls();
+        if self.dock_is_merged() {
+            let task_right = self.topbar_tasks_x() + self.dock_button_count() as i32 * TOPBAR_TASK_STRIDE;
+            let max_width = (controls.clipboard_x - 24 - task_right - 12).max(0);
+            let mut label = clock.clone();
+            while measure_text(&self.regular, &label, 16.0) > max_width && !label.is_empty() { label.pop(); }
+            if label != clock && label.chars().count() > 3 {
+                label.pop(); label.pop(); label.push('…');
+            }
+            c.draw_text_right(&self.regular, &label, controls.clipboard_x - 24, 10, 16.0, Color::rgb(239, 252, 250));
+            self.draw_topbar_tasks(&mut c);
+        } else {
+            c.draw_text_center(&self.regular, &clock, i32::from(self.screen_width) / 2, 10, 16.0, Color::rgb(239, 252, 250));
+        }
+
         draw_clipboard_icon(&mut c, controls.clipboard_x, 20, MINT_LIGHT);
         draw_screenshot_icon(&mut c, controls.screenshot_x, 20, MINT_LIGHT);
+        let recording_color = if self.recording.is_some() { Color::rgb(255, 106, 106) } else { MINT_LIGHT };
+        if self.recording.as_ref().is_some_and(|state| state.is_recording()) {
+            c.draw_round_rect(controls.recording_x - 6, 14, 12, 12, 3, recording_color);
+        } else {
+            draw_record_icon(&mut c, controls.recording_x, 20, recording_color);
+        }
         draw_sidebar_display_icon(&mut c, controls.display_x, 20, MINT_LIGHT);
         draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
         draw_sidebar_network_icon(&mut c, controls.network_x, 20, MINT_LIGHT);
@@ -522,13 +543,44 @@ impl Aurora {
         );
     }
 
+    pub(crate) fn draw_topbar_tasks(&self, c: &mut Canvas) {
+        let windows = self.task_client_windows();
+        let limit = self.dock_task_limit();
+        for slot in 0..self.dock_button_count() {
+            let x = self.topbar_tasks_x() + slot as i32 * TOPBAR_TASK_STRIDE;
+            let client = slot.checked_sub(1).filter(|i| *i < limit).and_then(|i| windows.get(i)).copied();
+            let active = client.is_some() && self.active_client == client;
+            if active {
+                c.draw_round_rect(x, 4, TOPBAR_TASK_SIZE, TOPBAR_TASK_SIZE, 9,
+                    Color::rgba(14, 23, 30, 245));
+            }
+            if slot == 0 {
+                draw_folder_icon(c, x + 16, 20, MINT_LIGHT);
+            } else if slot == limit + 1 && windows.len() > limit {
+                for offset in [9,16,23] { c.draw_circle(x + offset, 20, 2, MINT_LIGHT); }
+            } else if let Some(window) = client {
+                if !self.paint_window_icon(c, window, x + 4, 8, 24) {
+                    draw_client_task_icon(c, &self.bold, x + 16, 20,
+                        self.clients.get(&window).is_some_and(|info| info.mapped), &self.window_title(window));
+                }
+            }
+        }
+    }
+
     pub(crate) fn redraw_dock(&mut self) -> AnyResult<()> {
         let task_windows = self.task_client_windows();
-        if task_windows.len() <= 10 {
+        let pinned = self.dock_pinned_count();
+        let limit = self.dock_task_limit();
+        if task_windows.len() <= limit {
             let _ = self.hide_dock_more_menu();
         }
 
+        if self.dock_is_merged() {
+            self.conn.unmap_window(self.ui.dock)?;
+            return self.redraw_topbar();
+        }
         let (x, y, w, h) = self.dock_geometry();
+        self.conn.map_window(self.ui.dock)?;
         self.conn.configure_window(
             self.ui.dock,
             &ConfigureWindowAux::new()
@@ -551,7 +603,7 @@ impl Aurora {
         for i in 0..buttons {
             let icon_x = i as i32 * DOCK_STRIDE;
             let icon_y = cy - DOCK_ICON_SIZE / 2;
-            if i < 5 {
+            if i < pinned {
                 c.draw_round_rect(
                     icon_x,
                     icon_y,
@@ -569,7 +621,7 @@ impl Aurora {
                     Color::rgba(196, 219, 229, 95),
                 );
                 draw_dock_icon(&mut c, i, icon_x + 22, icon_y + 22);
-            } else if i == 15 && task_windows.len() > 10 {
+            } else if i == pinned + limit && task_windows.len() > limit {
                 c.draw_round_rect(icon_x, icon_y, 44, 44, 12, Color::rgba(255, 255, 255, 215));
                 c.draw_round_rect(
                     icon_x + 1,
@@ -584,7 +636,7 @@ impl Aurora {
                 c.draw_circle(icon_x + 22, icon_y + 22, 3, dot_color);
                 c.draw_circle(icon_x + 30, icon_y + 22, 3, dot_color);
             } else if let Some(client) = task_windows
-                .get(i - 5)
+                .get(i - pinned)
                 .and_then(|window| self.clients.get(window))
                 .copied()
             {
@@ -596,9 +648,9 @@ impl Aurora {
                     44,
                     12,
                     if active {
-                        Color::rgba(28, 67, 111, 242)
+                        Color::rgb(255, 255, 255)
                     } else {
-                        Color::rgba(255, 255, 255, 235)
+                        Color::rgba(27, 38, 49, 245)
                     },
                 );
                 let title = self.window_title(client.window);
@@ -681,6 +733,7 @@ impl Aurora {
         self.draw_settings_sidebar(&mut c);
 
         match self.settings.tab {
+            SettingsTab::Dock => self.draw_dock_tab(&mut c),
             SettingsTab::Display => self.draw_display_tab(&mut c),
             SettingsTab::Power => self.draw_power_tab(&mut c),
             SettingsTab::Wallpaper => self.draw_wallpaper_tab(&mut c),

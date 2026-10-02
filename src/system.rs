@@ -971,7 +971,7 @@ pub(crate) fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
     fs::write(
         path,
         format!(
-            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\ncompositor_enabled={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\nshortcut_folder={}\nshortcut_terminal={}\nshortcut_clipboard={}\nshortcut_screenshot={}\n",
+            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\ncompositor_enabled={}\ndock_in_topbar={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\nshortcut_folder={}\nshortcut_terminal={}\nshortcut_clipboard={}\nshortcut_screenshot={}\n",
             clean(&settings.terminal_command),
             clean(&settings.browser_command),
             clean(&settings.photo_command),
@@ -979,6 +979,7 @@ pub(crate) fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
             settings.sleep_after_secs.min(7200),
             settings.brightness_percent.clamp(10, 100),
             u8::from(settings.compositor_enabled),
+            u8::from(settings.dock_in_topbar),
             u8::from(settings.auto_power_saver_enabled),
             settings
                 .auto_power_saver_minutes

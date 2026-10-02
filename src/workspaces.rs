@@ -326,6 +326,9 @@ impl Aurora {
             }
         }
 
+        if (info.sticky || workspace == self.active_workspace) && info.mapped {
+            self.conn.map_window(info.frame)?;
+        }
         // If it left the active workspace (and isn't sticky), hide it there.
         if !info.sticky && workspace != self.active_workspace && info.mapped {
             self.ignored_unmaps.push(info.frame);

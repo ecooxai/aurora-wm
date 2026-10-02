@@ -63,74 +63,58 @@ use crate::procutil::*;
 use crate::files::*;
 
 impl Aurora {
-    pub(crate) fn handle_dock_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
-        let (_, _, _, h) = self.dock_geometry();
-        let buttons = self.dock_button_count();
-        let task_windows = self.task_client_windows();
-        let cy = i32::from(h) / 2;
-        for i in 0..buttons {
-            let rx = i as i32 * DOCK_STRIDE;
-            let ry = cy - DOCK_ICON_SIZE / 2;
-            if x >= rx
-                && x < rx + DOCK_ICON_SIZE
-                && y >= ry
-                && y < ry + DOCK_ICON_SIZE
-            {
-                if i == 0 {
-                    self.dock_last_click = None;
-                    self.hide_dock_more_menu()?;
-                    self.toggle_app_menu()?;
-                } else if i >= 5 {
-                    self.hide_app_menu()?;
-                    if i == 15 && task_windows.len() > 10 {
-                        if self.dock_more_visible {
-                            self.hide_dock_more_menu()?;
-                        } else {
-                            self.show_dock_more_menu()?;
-                        }
-                    } else if let Some(client) = task_windows.get(i - 5).copied() {
-                        self.hide_dock_more_menu()?;
-                        self.handle_task_icon_click(client)?;
-                    }
-                } else {
-                    self.dock_last_click = None;
-                    self.hide_app_menu()?;
-                    self.hide_dock_more_menu()?;
-                    if i == 1 {
-                        if !self.open_file_manager_tab(&folder_path_for(FolderMode::Pictures)) {
-                            self.show_folder(FolderMode::Pictures, true)?;
-                        }
-                    } else if i == 2 {
-                        if !self.open_file_manager_tab(&folder_path_for(FolderMode::Music)) {
-                            self.show_folder(FolderMode::Music, true)?;
-                        }
-                    } else if i == 3 {
-                        if !self.open_file_manager_tab(&folder_path_for(FolderMode::Videos)) {
-                            self.show_folder(FolderMode::Videos, true)?;
-                        }
-                    } else if i == 4 {
-                        self.settings_visible = !self.settings_visible;
-                        if self.settings_visible {
-                            self.settings_front = true;
-                            self.settings_hidden_at = None;
-                            self.folder_front = false;
-                            self.media_front = false;
-                            self.conn.map_window(self.ui.settings)?;
-                            self.raise_ui()?;
-                            self.request_settings_data(self.settings.tab);
-                            self.redraw_settings()?;
-                            self.redraw_topbar()?;
-                        } else {
-                            self.settings_hidden_at = Some(Instant::now());
-                            self.conn.unmap_window(self.ui.settings)?;
-                            self.redraw_topbar()?;
-                        }
-                    }
-                }
-                return Ok(());
-            }
-        }
+    pub(crate) fn launch_files_from_dock(&mut self) -> AnyResult<()> {
+        self.hide_app_menu()?;
         self.hide_dock_more_menu()?;
+        if !self.open_file_manager_tab(&home_dir()) {
+            self.show_folder(FolderMode::Home, true)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn handle_topbar_task_click(&mut self, x: i32) -> AnyResult<bool> {
+        let relative = x - self.topbar_tasks_x();
+        if relative < 0 { return Ok(false); }
+        let slot = (relative / TOPBAR_TASK_STRIDE) as usize;
+        if slot >= self.dock_button_count() || relative % TOPBAR_TASK_STRIDE >= TOPBAR_TASK_SIZE { return Ok(false); }
+        if slot == 0 { self.launch_files_from_dock()?; }
+        else { self.handle_dock_task_slot(slot - 1)?; }
+        Ok(true)
+    }
+
+    pub(crate) fn handle_dock_task_slot(&mut self, slot: usize) -> AnyResult<()> {
+        self.hide_app_menu()?;
+        let tasks = self.task_client_windows();
+        if slot == self.dock_task_limit() && tasks.len() > slot {
+            if self.dock_more_visible { self.hide_dock_more_menu()?; }
+            else { self.show_dock_more_menu()?; }
+        } else if let Some(&window) = tasks.get(slot) {
+            self.hide_dock_more_menu()?;
+            self.handle_task_icon_click(window)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn handle_dock_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        if x < 0 || y < 0 || y >= DOCK_ICON_SIZE { return Ok(()); }
+        let slot = (x / DOCK_STRIDE) as usize;
+        if slot >= self.dock_button_count() || x % DOCK_STRIDE >= DOCK_ICON_SIZE { return Ok(()); }
+        match slot {
+            0 => { self.dock_last_click = None; self.hide_dock_more_menu()?; self.toggle_app_menu()?; }
+            1 => { self.dock_last_click = None; self.launch_files_from_dock()?; }
+            2 => {
+                self.dock_last_click = None;
+                self.hide_app_menu()?;
+                self.hide_dock_more_menu()?;
+                if self.settings_visible {
+                    self.settings_visible = false;
+                    self.settings_hidden_at = Some(Instant::now());
+                    self.conn.unmap_window(self.ui.settings)?;
+                    self.redraw_topbar()?;
+                } else { self.open_settings_tab(self.settings.tab)?; }
+            }
+            _ => self.handle_dock_task_slot(slot - self.dock_pinned_count())?,
+        }
         Ok(())
     }
 
@@ -260,9 +244,11 @@ impl Aurora {
         );
 
         let task_windows = self.task_client_windows();
-        if task_windows.len() > 10 {
-            let hidden_apps = &task_windows[10..];
-            for (idx, &window) in hidden_apps.iter().enumerate() {
+        if task_windows.len() > self.dock_task_limit() {
+            let hidden_apps = &task_windows[self.dock_task_limit()..];
+            let visible = self.dock_more_visible_rows();
+            self.dock_more_scroll = self.dock_more_scroll.min(hidden_apps.len().saturating_sub(visible));
+            for (idx, &window) in hidden_apps.iter().skip(self.dock_more_scroll).take(visible).enumerate() {
                 let row_y = 8 + idx as i32 * 40;
                 let active = self.active_client == Some(window);
                 c.draw_round_rect(
@@ -272,9 +258,9 @@ impl Aurora {
                     32,
                     8,
                     if active {
-                        Color::rgba(28, 67, 111, 225)
+                        Color::rgb(255,255,255)
                     } else {
-                        Color::rgba(255, 255, 255, 120)
+                        Color::rgba(27,38,49,245)
                     },
                 );
 
@@ -302,8 +288,18 @@ impl Aurora {
                 let text_x = 52;
                 let text_y = row_y + 8;
                 let display_title = compact(&title, 20);
-                c.draw_text(&self.bold, &display_title, text_x, text_y, 12.0, INK);
+                c.draw_text(&self.bold, &display_title, text_x, text_y, 12.0, if active { INK } else { MINT_LIGHT });
             }
+        }
+
+        let hidden = task_windows.len().saturating_sub(self.dock_task_limit());
+        let visible = self.dock_more_visible_rows();
+        if hidden > visible {
+            let track = i32::from(h).saturating_sub(16).max(1);
+            let thumb = (track * visible as i32 / hidden as i32).max(18).min(track);
+            let offset = (track - thumb) * self.dock_more_scroll as i32 / (hidden - visible) as i32;
+            c.draw_round_rect(i32::from(w) - 6, 8, 3, track, 2, Color::rgba(77,99,111,70));
+            c.draw_round_rect(i32::from(w) - 6, 8 + offset, 3, thumb, 2, MINT_DARK);
         }
 
         self.upload_canvas(self.ui.dock_more_menu, &c)?;
@@ -312,6 +308,7 @@ impl Aurora {
 
     pub(crate) fn show_dock_more_menu(&mut self) -> AnyResult<()> {
         self.dock_more_visible = true;
+        self.dock_more_scroll = 0;
         let menu = self.dock_more_menu_geometry();
         self.conn.configure_window(
             self.ui.dock_more_menu,
@@ -337,13 +334,20 @@ impl Aurora {
         Ok(())
     }
 
-    pub(crate) fn handle_dock_more_menu_click(&mut self, _x: i32, y: i32) -> AnyResult<()> {
-        let task_windows = self.task_client_windows();
-        if task_windows.len() > 10 {
-            let hidden_apps = &task_windows[10..];
-            let idx = (y - 8) / 40;
-            if idx >= 0 && idx < hidden_apps.len() as i32 {
-                let client = hidden_apps[idx as usize];
+    pub(crate) fn handle_dock_more_menu_press(&mut self, button: u8, x: i32, y: i32) -> AnyResult<()> {
+        let tasks = self.task_client_windows();
+        let limit = self.dock_task_limit();
+        let hidden = tasks.len().saturating_sub(limit);
+        let visible = self.dock_more_visible_rows();
+        let max_scroll = hidden.saturating_sub(visible);
+        self.dock_more_scroll = self.dock_more_scroll.min(max_scroll);
+        if matches!(button, 4 | 5) {
+            self.dock_more_scroll = if button == 4 { self.dock_more_scroll.saturating_sub(3) }
+                else { self.dock_more_scroll.saturating_add(3).min(max_scroll) };
+            self.redraw_dock_more_menu()?;
+        } else if button == 1 && x >= 8 && y >= 8 && (y - 8) / 40 < visible as i32 {
+            let index = limit + self.dock_more_scroll + ((y - 8) / 40) as usize;
+            if let Some(&client) = tasks.get(index) {
                 self.handle_task_icon_click(client)?;
                 self.hide_dock_more_menu()?;
             }
@@ -447,6 +451,7 @@ impl Aurora {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
+        self.shutdown_screen_recording();
         process::exit(0);
     }
 

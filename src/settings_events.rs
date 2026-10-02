@@ -180,6 +180,21 @@ impl Aurora {
         Ok(should_redraw)
     }
 
+    pub(crate) fn handle_dock_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        let width = i32::from(self.settings_geometry().2);
+        if x >= SIDEBAR_WIDTH + 24 && x <= width - 24 && (86..=132).contains(&y) {
+            self.settings.dock_in_topbar = !self.settings.dock_in_topbar;
+            save_app_commands(&self.settings)?;
+            self.hide_app_menu()?;
+            self.hide_dock_more_menu()?;
+            self.redraw_dock()?;
+            self.redraw_topbar()?;
+            self.redraw_settings()?;
+            self.raise_ui()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn handle_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         if self.settings.tab == SettingsTab::Power && self.settings.auto_power_saver_editing {
             let sx = SIDEBAR_WIDTH + 24;
@@ -195,7 +210,7 @@ impl Aurora {
             if y < SETTINGS_SIDEBAR_TOP - 4 {
                 return Ok(());
             }
-            let tab = match (y - (SETTINGS_SIDEBAR_TOP - 4)) / 48 {
+            let tab = match (y - (SETTINGS_SIDEBAR_TOP - 4)) / SETTINGS_SIDEBAR_STRIDE {
                 0 => Some(SettingsTab::Display),
                 1 => Some(SettingsTab::Power),
                 2 => Some(SettingsTab::Wallpaper),
@@ -206,6 +221,7 @@ impl Aurora {
                 7 => Some(SettingsTab::Apps),
                 8 => Some(SettingsTab::Shortcuts),
                 9 => Some(SettingsTab::About),
+                10 => Some(SettingsTab::Dock),
                 _ => None,
             };
             if let Some(tab) = tab {
@@ -224,6 +240,7 @@ impl Aurora {
         }
 
         match self.settings.tab {
+            SettingsTab::Dock => self.handle_dock_settings_click(x, y)?,
             SettingsTab::Display => self.handle_display_click(x, y)?,
             SettingsTab::Power => self.handle_power_click(x, y)?,
             SettingsTab::Wallpaper => self.handle_wallpaper_click(y)?,
@@ -260,7 +277,7 @@ impl Aurora {
                 (lines.saturating_sub(4) * 24) as i32
             }
             SettingsTab::Startup | SettingsTab::About => 180,
-            SettingsTab::Shortcuts => 0,
+            SettingsTab::Shortcuts | SettingsTab::Dock => 0,
             SettingsTab::Audio | SettingsTab::Wallpaper => 80,
             SettingsTab::Apps => self
                 .available_apps(self.settings.app_kind)
@@ -660,11 +677,17 @@ impl Aurora {
                 }
                 self.wallpaper_index = idx;
                 if self.wallpaper_cache[idx].is_none() {
-                    self.wallpaper_cache[idx] = Some(render_wallpaper_pixels(
+                    // Keep only the previous and current wallpaper, sharing the active pixels.
+                    for (cached_index, cached) in self.wallpaper_cache.iter_mut().enumerate() {
+                        if cached_index != idx && cached.as_ref().is_some_and(|pixels| !std::sync::Arc::ptr_eq(pixels, &self.wallpaper_pixels)) {
+                            *cached = None;
+                        }
+                    }
+                    self.wallpaper_cache[idx] = Some(std::sync::Arc::new(render_wallpaper_pixels(
                         WALLPAPERS[idx].bytes,
                         self.screen_width,
                         self.screen_height,
-                    )?);
+                    )?));
                 }
                 if let Some(pixels) = self.wallpaper_cache[idx].as_ref() {
                     self.wallpaper_pixels.clone_from(pixels);

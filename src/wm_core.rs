@@ -91,11 +91,11 @@ impl Aurora {
             .ok_or("failed to load terminal regular font")?;
         let terminal_bold =
             Font::try_from_bytes(FONT_TERMINAL_BOLD).ok_or("failed to load terminal bold font")?;
-        let wallpaper_pixels = render_wallpaper_pixels(
+        let wallpaper_pixels = std::sync::Arc::new(render_wallpaper_pixels(
             WALLPAPERS[0].bytes,
             screen.width_in_pixels,
             screen.height_in_pixels,
-        )?;
+        )?);
         let (clipboard_image_preview_tx, clipboard_image_preview_rx) = mpsc::channel();
         let mut wallpaper_cache = vec![None; WALLPAPERS.len()];
         wallpaper_cache[0] = Some(wallpaper_pixels.clone());
@@ -121,6 +121,7 @@ impl Aurora {
             folder: conn.generate_id()?,
             folder_terminal: conn.generate_id()?,
             screenshot_overlay: conn.generate_id()?,
+            recording_notice: conn.generate_id()?,
             app_menu: conn.generate_id()?,
             aurora_menu: conn.generate_id()?,
             clipboard_menu: conn.generate_id()?,
@@ -224,6 +225,7 @@ impl Aurora {
             app_menu_query: String::new(),
             app_menu_expanded_categories: HashSet::new(),
             dock_more_visible: false,
+            dock_more_scroll: 0,
             aurora_menu_visible: false,
             aurora_menu_about: false,
             aurora_menu_restart_confirm: false,
@@ -266,6 +268,8 @@ impl Aurora {
             screenshot_live_rect: None,
             pending_screenshot_button: None,
             topbar_notice: None,
+            recording: None,
+            recording_error_notice: None,
             ffplay_process: None,
             pending_window_nudges: Vec::new(),
             wifi_refresh_rx: None,
@@ -323,6 +327,7 @@ impl Aurora {
                 handled_event |= self.handle_motion_notify(ev)?;
             }
 
+            if self.poll_screen_recording()? { handled_event = true; }
             if self.folder_terminal.visible && self.poll_folder_terminal()? {
                 handled_event = true;
             }
@@ -625,6 +630,10 @@ impl Aurora {
             IDLE_CHECK_INTERVAL
         };
 
+        if let Some(recording) = self.recording.as_ref() { timeout = timeout.min(recording.next_poll_delay()); }
+        if let Some((_, until)) = self.recording_error_notice.as_ref() {
+            timeout = timeout.min(until.saturating_duration_since(Instant::now()));
+        }
         if needs_pointer_poll {
             timeout = timeout.min(next_pointer_poll.saturating_duration_since(now));
         }
@@ -938,6 +947,11 @@ impl Aurora {
             &overlay_aux,
         )?;
 
+        self.conn.create_window(
+            self.depth, self.ui.recording_notice, self.root, 0, 0, 460, 130, 0,
+            WindowClass::INPUT_OUTPUT, self.visual,
+            &CreateWindowAux::new().override_redirect(1).event_mask(EventMask::EXPOSURE).background_pixel(0),
+        )?;
         let menu = self.app_menu_geometry();
         let menu_aux = CreateWindowAux::new()
             .override_redirect(1)
@@ -1052,7 +1066,7 @@ impl Aurora {
         }
 
         self.conn.map_window(self.ui.topbar)?;
-        self.conn.map_window(self.ui.dock)?;
+        if !self.dock_is_merged() { self.conn.map_window(self.ui.dock)?; }
         self.conn.map_window(self.ui.settings)?;
 
         // Initialize EWMH desktops on the root window

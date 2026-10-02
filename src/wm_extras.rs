@@ -476,6 +476,10 @@ impl Aurora {
             AtomEnum::CARDINAL,
             &[value],
         )?;
+        self.conn.change_property32(PropMode::REPLACE, info.frame, desktop_atom, AtomEnum::CARDINAL, &[value])?;
+        if info.mapped && self.client_on_active_workspace(&info) {
+            self.conn.map_window(info.frame)?;
+        }
         self.publish_net_wm_state(&info)?;
         self.redraw_dock()?;
         Ok(())
@@ -797,6 +801,8 @@ impl Aurora {
                 controls.screenshot_x,
                 format!("Screenshot  ({})", format_shortcut(shortcuts.screenshot)),
             ))
+        } else if hit(controls.recording_x) {
+            Some((controls.recording_x, self.recording.as_ref().map(|state| state.label()).unwrap_or("Record screen with system audio and microphone").to_string()))
         } else if hit(controls.display_x) {
             Some((controls.display_x, "Display settings  (click toggles)".to_string()))
         } else if hit(controls.audio_x) {

@@ -1423,6 +1423,49 @@ impl App {
         (x, y, w, h)
     }
 
+    /// Reused viewers can be hidden on another workspace. Move them before
+    /// mapping, and let the window manager activate full-size viewers.
+    fn present_viewer_on_current_workspace(&self, window: Window, compact: bool) {
+        let desktop = read_current_desktop(&self.conn, self.root, self.current_desktop_atom);
+        if let Some(atom) = self
+            .conn
+            .intern_atom(false, b"_NET_WM_DESKTOP")
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        {
+            let event = ClientMessageEvent::new(32, window, atom.atom, [desktop, 1, 0, 0, 0]);
+            let _ = self.conn.send_event(
+                false,
+                self.root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            );
+        }
+        let _ = self.conn.map_window(window);
+        if !compact {
+            if let Some(atom) = self
+                .conn
+                .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+            {
+                let event = ClientMessageEvent::new(
+                    32,
+                    window,
+                    atom.atom,
+                    [1, x11rb::CURRENT_TIME, 0, 0, 0],
+                );
+                let _ = self.conn.send_event(
+                    false,
+                    self.root,
+                    EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                    event,
+                );
+            }
+        }
+        let _ = self.conn.flush();
+    }
+
     /// Open or replace an image while preserving the existing viewer surface.
     fn open_image_window(&mut self, path: &Path, compact: bool) {
         let Ok((x, y, w, h)) = self.view_window_geometry(compact) else {
@@ -1450,8 +1493,9 @@ impl App {
                     .width(u32::from(w))
                     .height(u32::from(h)),
             );
-            let _ = self.conn.map_window(win.window);
-            let focus = if compact { self.window } else { win.window };
+            let viewer_window = win.window;
+            self.present_viewer_on_current_workspace(viewer_window, compact);
+            let focus = if compact { self.window } else { viewer_window };
             let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, focus, x11rb::CURRENT_TIME);
             let _ = self.conn.flush();
             return;
@@ -1482,6 +1526,7 @@ impl App {
                 state,
                 dirty: true,
             });
+            self.present_viewer_on_current_workspace(old.window, compact);
             let focus = if compact { self.window } else { old.window };
             let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, focus, x11rb::CURRENT_TIME);
             let _ = self.conn.flush();
@@ -1489,6 +1534,7 @@ impl App {
         }
         match self.create_image_window(state, compact) {
             Ok(win) => {
+                self.present_viewer_on_current_workspace(win.window, compact);
                 let focus = if compact { self.window } else { win.window };
                 let _ = self.conn.set_input_focus(
                     InputFocus::POINTER_ROOT,
@@ -1939,8 +1985,9 @@ impl App {
                     .width(u32::from(w))
                     .height(u32::from(h)),
             );
-            let _ = self.conn.map_window(win.window);
-            let focus = if compact { self.window } else { win.window };
+            let viewer_window = win.window;
+            self.present_viewer_on_current_workspace(viewer_window, compact);
+            let focus = if compact { self.window } else { viewer_window };
             let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, focus, x11rb::CURRENT_TIME);
             let _ = self.conn.flush();
             return;
@@ -1972,6 +2019,7 @@ impl App {
                 text,
                 dirty: true,
             });
+            self.present_viewer_on_current_workspace(old.window, compact);
             let focus = if compact { self.window } else { old.window };
             let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, focus, x11rb::CURRENT_TIME);
             let _ = self.conn.flush();
@@ -1979,6 +2027,7 @@ impl App {
         }
         match self.create_text_window(text, compact) {
             Ok(win) => {
+                self.present_viewer_on_current_workspace(win.window, compact);
                 let focus = if compact { self.window } else { win.window };
                 let _ = self.conn.set_input_focus(
                     InputFocus::POINTER_ROOT,

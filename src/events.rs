@@ -109,6 +109,7 @@ impl Aurora {
             Event::XfixesSelectionNotify(ev) => self.handle_xfixes_selection_notify(ev)?,
             Event::SelectionClear(ev) => {
                 if ev.selection == self.wm_s_atom {
+                    self.shutdown_screen_recording();
                     std::process::exit(0);
                 }
             }
@@ -240,6 +241,8 @@ impl Aurora {
             self.redraw_folder()?;
         } else if ev.window == self.ui.folder_terminal && self.folder_terminal.visible {
             self.redraw_folder_terminal()?;
+        } else if ev.window == self.ui.recording_notice {
+            self.redraw_recording_notice()?;
         } else if ev.window == self.ui.screenshot_overlay && self.screenshot_mode {
             self.redraw_screenshot_overlay()?;
         } else if ev.window == self.ui.app_menu && self.app_menu_visible {
@@ -333,9 +336,28 @@ impl Aurora {
                 self.hide_title_menu()?;
             }
         }
-        if self.dock_more_visible && ev.event != self.ui.dock_more_menu && ev.event != self.ui.dock
-        {
-            self.hide_dock_more_menu()?;
+        if self.dock_more_visible {
+            let (mx, my, mw, mh) = self.dock_more_menu_geometry();
+            let rx = i32::from(ev.root_x);
+            let ry = i32::from(ev.root_y);
+            if rx >= i32::from(mx) && rx < i32::from(mx) + i32::from(mw)
+                && ry >= i32::from(my) && ry < i32::from(my) + i32::from(mh) {
+                if ev.event == self.root { self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?; }
+                self.handle_dock_more_menu_press(ev.detail, rx - i32::from(mx), ry - i32::from(my))?;
+                self.conn.flush()?;
+                return Ok(());
+            }
+            let overflow_slot = self.dock_pinned_count() + self.dock_task_limit();
+            let (ix, iy, size) = if self.dock_is_merged() {
+                (self.topbar_tasks_x() + overflow_slot as i32 * TOPBAR_TASK_STRIDE, 4, TOPBAR_TASK_SIZE)
+            } else {
+                let (dx, dy, _, _) = self.dock_geometry();
+                (i32::from(dx) + overflow_slot as i32 * DOCK_STRIDE, i32::from(dy), DOCK_ICON_SIZE)
+            };
+            let on_overflow_icon = rx >= ix && rx < ix + size && ry >= iy && ry < iy + size;
+            if matches!(ev.detail, 1..=3) && !on_overflow_icon {
+                self.hide_dock_more_menu()?;
+            }
         }
         if self.clipboard_menu_visible && ev.event != self.ui.clipboard_menu {
             let (mx, my, mw, mh) = self.clipboard_menu_geometry();
@@ -372,6 +394,18 @@ impl Aurora {
             }
             self.hide_aurora_menu()?;
         }
+        if self.app_menu_visible {
+            let (mx, my, mw, mh) = self.app_menu_geometry();
+            let rx = i32::from(ev.root_x);
+            let ry = i32::from(ev.root_y);
+            if rx >= i32::from(mx) && rx < i32::from(mx) + i32::from(mw)
+                && ry >= i32::from(my) && ry < i32::from(my) + i32::from(mh) {
+                if ev.event == self.root { self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?; }
+                self.handle_app_menu_click(ev.detail, rx - i32::from(mx), ry - i32::from(my))?;
+                self.conn.flush()?;
+                return Ok(());
+            }
+        }
         let topbar_root_click = ev.root_y >= 0 && ev.root_y < TOPBAR_HEIGHT as i16;
         if self.clipboard_menu_visible
             && ev.event != self.ui.topbar
@@ -380,12 +414,14 @@ impl Aurora {
         {
             self.hide_clipboard_menu()?;
         }
-        let pointer_target = if ev.event == self.root && ev.detail == 1 {
+        let pointer_target = if ev.event == self.root {
             self.conn.query_pointer(self.root)?.reply()?.child
         } else {
             ev.event
         };
         if self.app_menu_visible
+            && matches!(ev.detail, 1..=3)
+            && !topbar_root_click
             && ev.event != self.ui.app_menu
             && pointer_target != self.ui.app_menu
             && ev.event != self.ui.dock
@@ -439,7 +475,7 @@ impl Aurora {
             if ev.detail == 1 {
                 self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             }
-            self.handle_dock_click(event_x, event_y)?;
+            if ev.detail == 1 { self.handle_dock_click(event_x, event_y)?; }
         } else if ev.event == self.ui.folder {
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_folder_scroll(ev.detail)?;
@@ -522,7 +558,7 @@ impl Aurora {
                 i32::from(ev.event_y),
             )?;
         } else if ev.event == self.ui.dock_more_menu {
-            self.handle_dock_more_menu_click(i32::from(ev.event_x), i32::from(ev.event_y))?;
+            self.handle_dock_more_menu_press(ev.detail, i32::from(ev.event_x), i32::from(ev.event_y))?;
         } else if let Some(slot) = self.media_slot_for_window(ev.event) {
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_media_scroll(slot, ev.detail)?;
@@ -541,9 +577,11 @@ impl Aurora {
                 i32::from(ev.event_x),
                 i32::from(ev.event_y),
             )?;
-        } else if ev.event == self.ui.topbar {
-            let x = i32::from(ev.event_x);
-            let _ = self.handle_topbar_press_x(x)?;
+        } else if ev.event == self.ui.topbar || pointer_target == self.ui.topbar {
+            if ev.detail == 1 {
+                if ev.event == self.root { self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?; }
+                let _ = self.handle_topbar_press_x(i32::from(ev.root_x))?;
+            }
         } else if ev.event == self.root {
             self.hide_aurora_menu()?;
             self.handle_root_button_press(ev)?;
@@ -809,6 +847,18 @@ impl Aurora {
                     }
                 }
                 self.focus_window(client)?;
+            }
+            return Ok(());
+        }
+        if ev.type_ == self.atom(b"_NET_WM_DESKTOP")? && ev.format == 32 {
+            if let Some(client) = self.client_or_ancestor_key_for(ev.window) {
+                let desktop = ev.data.as_data32()[0];
+                if desktop == u32::MAX {
+                    self.set_sticky(client, true)?;
+                } else if (desktop as usize) < self.workspace_count {
+                    self.set_sticky(client, false)?;
+                    self.move_client_to_workspace(client, desktop as usize)?;
+                }
             }
             return Ok(());
         }
@@ -1222,17 +1272,22 @@ impl Aurora {
         let aurora_end = brand_x + 23 + aurora_width;
         if (0..=aurora_end).contains(&x) {
             self.hide_clipboard_menu()?;
-            self.toggle_aurora_menu()?;
+            self.hide_aurora_menu()?;
+            self.toggle_app_menu()?;
             return Ok(true);
         }
+        self.hide_app_menu()?;
+        if self.dock_is_merged() && self.handle_topbar_task_click(x)? { return Ok(true); }
         let workspace = (0..self.workspace_count).find(|&index| {
-            (self.workspace_x(index)..=self.workspace_x(index) + WORKSPACE_SIZE).contains(&x)
+            self.workspace_x(index) + WORKSPACE_SIZE < controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS
+                && (self.workspace_x(index)..=self.workspace_x(index) + WORKSPACE_SIZE).contains(&x)
         });
         if let Some(workspace) = workspace {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
             self.switch_workspace(workspace)?;
-        } else if (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE).contains(&x) {
+        } else if self.add_workspace_x() + WORKSPACE_SIZE < controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS
+            && (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE).contains(&x) {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
             self.add_workspace()?;
@@ -1256,6 +1311,9 @@ impl Aurora {
                 });
                 self.toggle_screenshot_mode()?;
             }
+        } else if (controls.recording_x - TOPBAR_ICON_HIT_RADIUS..=controls.recording_x + TOPBAR_ICON_HIT_RADIUS).contains(&x) {
+            self.hide_clipboard_menu()?;
+            self.toggle_screen_recording()?;
         } else if (controls.display_x - TOPBAR_ICON_HIT_RADIUS
             ..=controls.display_x + TOPBAR_ICON_HIT_RADIUS)
             .contains(&x)
