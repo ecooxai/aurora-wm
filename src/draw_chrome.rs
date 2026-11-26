@@ -107,15 +107,15 @@ impl Aurora {
             self.screen_height,
         )?;
         let image = Image::new(
-            self.screen_width,
-            self.screen_height,
+            crate::scale::px_len(u32::from(self.screen_width)) as u16,
+            crate::scale::px_len(u32::from(self.screen_height)) as u16,
             ScanlinePad::Pad32,
             self.depth,
             BitsPerPixel::B32,
             XrbImageOrder::LsbFirst,
             Cow::Borrowed(&self.wallpaper_pixels),
         )?;
-        image.put(&self.conn, pixmap, self.gc, 0, 0)?;
+        image.put(&*self.conn, pixmap, self.gc, 0, 0)?;
         self.conn.change_window_attributes(
             self.root,
             &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
@@ -161,18 +161,41 @@ impl Aurora {
     }
 
     pub(crate) fn topbar_controls(&self) -> TopbarControls {
-        let battery = self.metrics.battery.as_deref().unwrap_or("100%");
-        let battery_right = i32::from(self.screen_width) - 16;
-        let battery_left = battery_right - measure_text(&self.bold, battery, 19.0) - 44;
-        let network_x = battery_left - 22;
-        let audio_x = network_x - TOPBAR_ICON_SPACING;
-        let display_x = audio_x - TOPBAR_ICON_SPACING;
-        let recording_half_width = if self.recording.is_some() { 44 } else { 18 };
-        let recording_spacing = recording_half_width + TOPBAR_ICON_HIT_RADIUS + 4;
-        let recording_x = display_x - recording_spacing;
-        let screenshot_x = recording_x - recording_spacing;
-        let clipboard_x = screenshot_x - TOPBAR_ICON_SPACING;
+        // Hugs the right edge; 7 px leaves room for the nub or charging bolt.
+        let battery_right = i32::from(self.screen_width) - 3;
+        let battery_icon_x = battery_right - TOPBAR_BATTERY_W / 2 - 7;
+        let battery_left = battery_icon_x - TOPBAR_BATTERY_W / 2 - 4;
+        // Icons run right to left from the battery. A hidden icon takes no
+        // space, so the visible ones close up toward the battery.
+        let shown = self.settings.topbar_icons;
+        let mut next = battery_left - 20;
+        let mut place = |visible: bool| -> i32 {
+            if !visible {
+                return HIDDEN_TOPBAR_X;
+            }
+            let x = next;
+            next -= TOPBAR_ICON_SPACING;
+            x
+        };
+        let network_x = place(shown.wifi);
+        let audio_x = place(shown.audio);
+        let display_x = place(shown.display);
+        // Fixed square: starting a recording recolours it and shows the
+        // timer inside, so the neighbouring icons never move. A running
+        // recording keeps its icon so it can always be stopped.
+        let recording_half_width = TOPBAR_RECORD_SIZE / 2;
+        let recording_x = place(shown.recording || self.recording.is_some());
+        let screenshot_x = place(shown.screenshot);
+        let clipboard_x = place(shown.clipboard);
+        let keyboard_x = place(shown.keyboard);
+        let tray_left = [keyboard_x, clipboard_x, screenshot_x, recording_x, display_x, audio_x, network_x]
+            .into_iter()
+            .filter(|&x| topbar_icon_shown(x))
+            .min()
+            .unwrap_or(battery_left - 20);
         TopbarControls {
+            tray_left,
+            keyboard_x,
             clipboard_x,
             screenshot_x,
             recording_x,
@@ -182,11 +205,13 @@ impl Aurora {
             network_x,
             battery_left,
             battery_right,
+            battery_icon_x,
         }
     }
 
     pub(crate) fn topbar_brand_end(&self) -> i32 {
-        24 + 23 + measure_text(&self.bold, "Aurora", TOPBAR_BRAND_TEXT_SIZE)
+        // The brand is just the orb (radius 12 at x=24); no wordmark.
+        24 + 14
     }
 
     pub(crate) fn workspace_x(&self, index: usize) -> i32 {
@@ -194,8 +219,9 @@ impl Aurora {
         start_x + index as i32 * WORKSPACE_STRIDE
     }
 
-    pub(crate) fn add_workspace_x(&self) -> i32 {
-        self.workspace_x(self.workspace_count)
+    /// Right edge of the last workspace icon.
+    pub(crate) fn workspaces_end_x(&self) -> i32 {
+        self.workspace_x(self.workspace_count.max(1) - 1) + WORKSPACE_SIZE
     }
 
     pub(crate) fn redraw_topbar(&self) -> AnyResult<()> {
@@ -220,19 +246,11 @@ impl Aurora {
         c.draw_circle(brand_x, 20, 12, Color::rgba(160, 238, 220, 38));
         c.draw_circle(brand_x, 20, 10, MINT_LIGHT);
         c.draw_circle(brand_x - 3, 17, 3, Color::rgb(248, 255, 254));
-        c.draw_text(
-            &self.bold,
-            "Aurora",
-            brand_x + 23,
-            8,
-            TOPBAR_BRAND_TEXT_SIZE,
-            Color::rgb(239, 252, 250),
-        );
 
         // Draw Workspace icons to the right of the Brand
         let controls = self.topbar_controls();
         for index in 0..self.workspace_count {
-            if self.workspace_x(index) + WORKSPACE_SIZE >= controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS { break; }
+            if self.workspace_x(index) + WORKSPACE_SIZE >= controls.tray_left - TOPBAR_ICON_HIT_RADIUS { break; }
             draw_workspace_icon(
                 &mut c,
                 self.workspace_x(index),
@@ -240,60 +258,114 @@ impl Aurora {
                 index == self.active_workspace,
             );
         }
-        let add_x = self.add_workspace_x();
-        if add_x + WORKSPACE_SIZE < controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS {
-            draw_add_workspace_icon(&mut c, add_x, 20);
-        }
 
         let clock = self
             .topbar_notice
             .as_ref()
             .map(|(message, _)| message.clone())
-            .unwrap_or_else(format_clock);
+            .unwrap_or_else(|| format_clock(self.clock_show_date));
         let controls = self.topbar_controls();
         if self.dock_is_merged() {
             let task_right = self.topbar_tasks_x() + self.dock_button_count() as i32 * TOPBAR_TASK_STRIDE;
-            let max_width = (controls.clipboard_x - 24 - task_right - 12).max(0);
+            let max_width = (controls.tray_left - 24 - task_right - 12).max(0);
             let mut label = clock.clone();
             while measure_text(&self.regular, &label, 16.0) > max_width && !label.is_empty() { label.pop(); }
             if label != clock && label.chars().count() > 3 {
                 label.pop(); label.pop(); label.push('…');
             }
-            c.draw_text_right(&self.regular, &label, controls.clipboard_x - 24, 10, 16.0, Color::rgb(239, 252, 250));
+            c.draw_text_right(&self.regular, &label, controls.tray_left - 24, 10, 16.0, Color::rgb(239, 252, 250));
             self.draw_topbar_tasks(&mut c);
         } else {
-            c.draw_text_center(&self.regular, &clock, i32::from(self.screen_width) / 2, 10, 16.0, Color::rgb(239, 252, 250));
+            // Centred when there is room; otherwise right-aligned against the
+            // icons and truncated, never drawn over them.
+            let left = (self.workspaces_end_x() + 12).max(self.topbar_brand_end() + 12);
+            let right = controls.tray_left - TOPBAR_ICON_HIT_RADIUS - 8;
+            let width = measure_text(&self.regular, &clock, 16.0);
+            let centre = i32::from(self.screen_width) / 2;
+            if centre - width / 2 >= left && centre + width / 2 <= right {
+                c.draw_text_center(&self.regular, &clock, centre, 10, 16.0, Color::rgb(239, 252, 250));
+            } else if right > left {
+                let mut label = clock.clone();
+                while measure_text(&self.regular, &label, 16.0) > right - left && !label.is_empty() { label.pop(); }
+                c.draw_text_right(&self.regular, &label, right, 10, 16.0, Color::rgb(239, 252, 250));
+            }
         }
 
-        draw_clipboard_icon(&mut c, controls.clipboard_x, 20, MINT_LIGHT);
-        draw_screenshot_icon(&mut c, controls.screenshot_x, 20, MINT_LIGHT);
-        self.draw_topbar_recording_icon(&mut c, &controls);
-        draw_sidebar_display_icon(&mut c, controls.display_x, 20, MINT_LIGHT);
-        draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
-        draw_sidebar_network_icon(&mut c, controls.network_x, 20, MINT_LIGHT);
-        let battery = self.metrics.battery.as_deref().unwrap_or("100%");
-        c.draw_round_rect(
-            controls.battery_left,
-            7,
-            controls.battery_right - controls.battery_left,
-            26,
-            9,
-            if self.settings_visible && self.settings.tab == SettingsTab::Power {
-                Color::rgba(116, 213, 198, 118)
-            } else {
-                Color::rgba(255, 255, 255, 42)
-            },
-        );
-        draw_power_icon(&mut c, controls.battery_left + 14, 20, MINT_LIGHT);
-        c.draw_text(
-            &self.bold,
-            battery,
-            controls.battery_left + 30,
-            9,
-            19.0,
-            Color::rgb(239, 252, 250),
-        );
+        if topbar_icon_shown(controls.keyboard_x) {
+            crate::touch_keyboard::draw_keyboard_icon(&mut c, controls.keyboard_x, 20, self.osk.visible);
+        }
+        if topbar_icon_shown(controls.clipboard_x) {
+            draw_clipboard_icon(&mut c, controls.clipboard_x, 20, MINT_LIGHT);
+        }
+        if topbar_icon_shown(controls.screenshot_x) {
+            draw_screenshot_icon(&mut c, controls.screenshot_x, 20, MINT_LIGHT);
+        }
+        if topbar_icon_shown(controls.recording_x) {
+            self.draw_topbar_recording_icon(&mut c, &controls);
+        }
+        if topbar_icon_shown(controls.display_x) {
+            draw_sidebar_display_icon(&mut c, controls.display_x, 20, MINT_LIGHT);
+        }
+        if topbar_icon_shown(controls.audio_x) {
+            draw_sidebar_audio_icon(&mut c, controls.audio_x, 20, MINT_LIGHT);
+        }
+        if topbar_icon_shown(controls.network_x) {
+            draw_sidebar_network_icon(&mut c, controls.network_x, 20, MINT_LIGHT);
+        }
+        if self.settings_visible && self.settings.tab == SettingsTab::Power {
+            c.draw_round_rect(
+                controls.battery_left - 4,
+                6,
+                controls.battery_right - controls.battery_left + 6,
+                28,
+                9,
+                Color::rgba(116, 213, 198, 118),
+            );
+        }
+        let status = self.topbar_status;
+        self.draw_topbar_battery(&mut c, controls.battery_icon_x, 20, status);
         self.upload_canvas(self.ui.topbar, &c)
+    }
+
+    /// Borderless battery glyph in the style of the other topbar icons: a
+    /// light blue body, the remaining charge in darker blue, the level in
+    /// white inside. Plugged in, a bolt replaces the terminal nub.
+    fn draw_topbar_battery(&self, c: &mut Canvas, cx: i32, cy: i32, status: TopbarStatus) {
+        let (w, h) = (TOPBAR_BATTERY_W, 20);
+        let (x, y) = (cx - w / 2, cy - h / 2);
+        let pct = status.battery_pct.unwrap_or(100);
+        let body = Color::rgb(150, 203, 242);
+        let charge = if pct <= 15 && !status.charging {
+            Color::rgb(236, 120, 112)
+        } else {
+            // One step darker than the body, not a heavy contrast block.
+            Color::rgb(102, 168, 230)
+        };
+        c.draw_round_rect(x, y, w, h, 5, body);
+        let fill_w = (w * i32::from(pct) / 100).clamp(0, w);
+        if fill_w > 0 {
+            c.draw_round_rect(x, y, fill_w, h, 5.min(fill_w / 2), charge);
+            if fill_w > 10 && fill_w < w - 5 {
+                // Square right edge: the level line is straight.
+                c.draw_rect(x + fill_w - 5, y, 5, h, charge);
+            }
+        }
+        if status.charging {
+            // Bolt beside the body.
+            let bx = x + w + 5;
+            let ink = Color::rgb(150, 203, 242);
+            c.draw_line(bx + 2, cy - 7, bx - 2, cy + 1, 2, ink);
+            c.draw_line(bx - 2, cy + 1, bx + 2, cy - 1, 2, ink);
+            c.draw_line(bx + 2, cy - 1, bx - 2, cy + 7, 2, ink);
+        } else {
+            c.draw_round_rect(x + w + 1, cy - 4, 3, 8, 1, body);
+        }
+        let label = match status.battery_pct {
+            Some(p) => p.to_string(),
+            None => "AC".to_string(),
+        };
+        let size = if label.len() >= 3 { 12.5 } else { 14.0 };
+        c.draw_text_center(&self.bold, &label, cx, y + 2, size, Color::rgb(16, 24, 32));
     }
 
     pub(crate) fn redraw_clipboard_menu(&mut self) -> AnyResult<()> {
@@ -307,33 +379,29 @@ impl Aurora {
             14,
             Color::rgb(247, 252, 255),
         );
-        c.draw_text(&self.bold, "Clipboard", 18, 16, 15.0, INK);
+        // Shortcut icons (copy, select all, undo, redo) and the page nav share the top row.
+        self.draw_clipboard_shortcut_row(&mut c);
         let page_count = self.clipboard_page_count();
         let page = self.clamped_clipboard_page();
         let has_prev = page > 0;
         let has_next = page + 1 < page_count;
-        self.draw_clipboard_nav_button(&mut c, CLIPBOARD_MENU_PREV_X, "<", has_prev);
-        self.draw_clipboard_nav_button(&mut c, CLIPBOARD_MENU_NEXT_X, ">", has_next);
+        let (prev_x, next_x) = clipboard_nav_xs(i32::from(w));
+        self.draw_clipboard_nav_button(&mut c, prev_x, "<", has_prev);
+        self.draw_clipboard_nav_button(&mut c, next_x, ">", has_next);
         let page_label = if page_count == 0 {
             "0/0".to_string()
         } else {
             format!("{}/{}", page + 1, page_count)
         };
-        c.draw_text_right(
-            &self.bold,
-            &page_label,
-            i32::from(w) - 16,
-            16,
-            12.0,
-            SOFT_INK,
-        );
+        c.draw_text_right(&self.bold, &page_label, prev_x - 8, 16, 12.0, SOFT_INK);
+        self.draw_clipboard_selection_pill(&mut c, i32::from(w));
         if self.clipboard_history.is_empty() {
-            draw_clipboard_icon(&mut c, i32::from(w) / 2, 78, MUTED);
+            draw_clipboard_icon(&mut c, i32::from(w) / 2, 116, MUTED);
             c.draw_text_center(
                 &self.regular,
                 "No clipboard history yet",
                 i32::from(w) / 2,
-                112,
+                146,
                 13.0,
                 MUTED,
             );
@@ -342,7 +410,7 @@ impl Aurora {
 
         let (start, end) = self.clipboard_page_range();
         let visible_entries = self.clipboard_history[start..end].to_vec();
-        let mut row_y = 46;
+        let mut row_y = CLIPBOARD_MENU_LIST_TOP + 8;
         for entry in visible_entries.iter() {
             let row_h = clipboard_entry_row_height(entry);
             c.draw_round_rect(
@@ -741,7 +809,7 @@ impl Aurora {
         self.draw_settings_sidebar(&mut c);
 
         match self.settings.tab {
-            SettingsTab::Dock => self.draw_dock_tab(&mut c),
+            SettingsTab::Multitask => self.draw_multitask_tab(&mut c),
             SettingsTab::Display => self.draw_display_tab(&mut c),
             SettingsTab::Power => self.draw_power_tab(&mut c),
             SettingsTab::Wallpaper => self.draw_wallpaper_tab(&mut c),
@@ -1110,7 +1178,7 @@ impl Aurora {
         c.draw_text(&self.bold, "Apps", 20, 18, 20.0, INK);
 
         let search_x = 92;
-        let search_w = i32::from(w) - search_x - 18;
+        let search_w = self.app_menu_power_pill().0 - 10 - search_x;
         c.draw_round_rect(search_x, 11, search_w, 34, 11, Color::rgba(255, 255, 255, 205));
         c.draw_round_rect(
             search_x + 1,
@@ -1122,20 +1190,20 @@ impl Aurora {
         );
         draw_search_icon(&mut c, search_x + 18, 28, MINT_DARK);
         let search_label = if self.app_menu_query.is_empty() {
-            "Search all apps (typos are okay)"
+            if self.app_menu_more { "Search all apps (typos are okay)" } else { "Search apps" }
         } else {
             &self.app_menu_query
         };
         c.draw_text(
             &self.regular,
-            &compact(search_label, if self.app_menu_more { 62 } else { 32 }),
+            &compact(search_label, if self.app_menu_more { 52 } else { 20 }),
             search_x + 36,
             20,
             12.0,
             if self.app_menu_query.is_empty() { MUTED } else { INK },
         );
         if self.app_menu_visible && !self.app_menu_query.is_empty() {
-            let shown_query = compact(&self.app_menu_query, if self.app_menu_more { 62 } else { 32 });
+            let shown_query = compact(&self.app_menu_query, if self.app_menu_more { 52 } else { 20 });
             let cursor_x = search_x
                 + 38
                 + measure_text(&self.regular, &shown_query, 12.0) as i32;
@@ -1282,6 +1350,7 @@ impl Aurora {
                 );
             }
         }
+        self.draw_app_menu_power(&mut c);
         self.upload_canvas(self.ui.app_menu, &c)
     }
 

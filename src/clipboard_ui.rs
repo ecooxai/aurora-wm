@@ -62,7 +62,178 @@ use crate::textutil::*;
 use crate::procutil::*;
 use crate::files::*;
 
+/// Clipboard menu shortcut row: copy, select all, undo, redo (sent to the focused window).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardShortcut {
+    Copy,
+    SelectAll,
+    Undo,
+    Redo,
+}
+
+const CLIPBOARD_SHORTCUTS: [ClipboardShortcut; 4] = [
+    ClipboardShortcut::Copy,
+    ClipboardShortcut::SelectAll,
+    ClipboardShortcut::Undo,
+    ClipboardShortcut::Redo,
+];
+const CLIPBOARD_SHORTCUT_X: i32 = 14;
+const CLIPBOARD_SHORTCUT_Y: i32 = 8;
+const CLIPBOARD_SHORTCUT_STRIDE: i32 = 38;
+const CLIPBOARD_SHORTCUT_SIZE: i32 = 32;
+/// How often the menu re-reads the focused window's selection.
+const SELECTION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// X keysyms used by the clipboard shortcuts and the long-press paste.
+const KEYSYM_SHIFT_L: u32 = 0xffe1;
+const KEYSYM_CONTROL_L: u32 = 0xffe3;
+const KEYSYM_A: u32 = 0x61;
+const KEYSYM_C: u32 = 0x63;
+const KEYSYM_V: u32 = 0x76;
+const KEYSYM_Z: u32 = 0x7a;
+
+/// Page nav button x positions, anchored to the menu's right edge.
+pub(crate) fn clipboard_nav_xs(width: i32) -> (i32, i32) {
+    let next = width - 12 - CLIPBOARD_MENU_NAV_W;
+    (next - CLIPBOARD_MENU_NAV_W - 6, next)
+}
+
+fn clipboard_shortcut_at(x: i32, y: i32) -> Option<ClipboardShortcut> {
+    if !(CLIPBOARD_SHORTCUT_Y..CLIPBOARD_SHORTCUT_Y + CLIPBOARD_SHORTCUT_SIZE).contains(&y) {
+        return None;
+    }
+    let relative = x - CLIPBOARD_SHORTCUT_X;
+    if relative < 0 {
+        return None;
+    }
+    let index = (relative / CLIPBOARD_SHORTCUT_STRIDE) as usize;
+    if index >= CLIPBOARD_SHORTCUTS.len()
+        || relative % CLIPBOARD_SHORTCUT_STRIDE >= CLIPBOARD_SHORTCUT_SIZE
+    {
+        return None;
+    }
+    Some(CLIPBOARD_SHORTCUTS[index])
+}
+
 impl Aurora {
+    pub(crate) fn draw_clipboard_shortcut_row(&self, c: &mut Canvas) {
+        for (index, shortcut) in CLIPBOARD_SHORTCUTS.iter().enumerate() {
+            let x = CLIPBOARD_SHORTCUT_X + index as i32 * CLIPBOARD_SHORTCUT_STRIDE;
+            c.draw_round_rect(
+                x,
+                CLIPBOARD_SHORTCUT_Y,
+                CLIPBOARD_SHORTCUT_SIZE,
+                CLIPBOARD_SHORTCUT_SIZE,
+                9,
+                Color::rgba(255, 255, 255, 190),
+            );
+            let cx = x + CLIPBOARD_SHORTCUT_SIZE / 2;
+            let cy = CLIPBOARD_SHORTCUT_Y + CLIPBOARD_SHORTCUT_SIZE / 2;
+            match shortcut {
+                ClipboardShortcut::Copy => draw_copy_icon(c, cx, cy, INK),
+                ClipboardShortcut::SelectAll => draw_select_all_icon(c, cx, cy, INK),
+                ClipboardShortcut::Undo => draw_undo_icon(c, cx, cy, false, INK),
+                ClipboardShortcut::Redo => draw_undo_icon(c, cx, cy, true, INK),
+            }
+        }
+    }
+
+    /// The focused window's current selection, shown without being added to the history.
+    pub(crate) fn draw_clipboard_selection_pill(&self, c: &mut Canvas, width: i32) {
+        c.draw_round_rect(
+            12,
+            CLIPBOARD_MENU_PREVIEW_Y,
+            width - 24,
+            26,
+            13,
+            Color::rgba(255, 255, 255, 200),
+        );
+        c.draw_text(&self.regular, "Selection", 26, CLIPBOARD_MENU_PREVIEW_Y + 7, 11.0, SOFT_INK);
+        let line = self.clipboard_selection.as_deref().and_then(|text| {
+            text.lines().map(str::trim).find(|line| !line.is_empty())
+        });
+        let (label, color) = match line {
+            Some(line) => (compact(line, 44), INK),
+            None => ("Nothing selected".to_string(), MUTED),
+        };
+        c.draw_text(&self.regular, &label, 96, CLIPBOARD_MENU_PREVIEW_Y + 6, 12.5, color);
+    }
+
+    pub(crate) fn poll_selection_preview(&mut self) -> AnyResult<()> {
+        if !self.clipboard_menu_visible {
+            return Ok(());
+        }
+        if let Some(rx) = self.selection_poll_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(text) => {
+                    self.selection_poll_rx = None;
+                    return self.apply_selection_preview(text);
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    self.selection_poll_rx = None;
+                    return Ok(());
+                }
+            }
+        }
+        if self.last_selection_poll.elapsed() < SELECTION_POLL_INTERVAL {
+            return Ok(());
+        }
+        self.last_selection_poll = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(read_primary_selection());
+        });
+        self.selection_poll_rx = Some(rx);
+        Ok(())
+    }
+
+    fn apply_selection_preview(&mut self, text: Option<String>) -> AnyResult<()> {
+        // Preview only: deliberately never passed to remember_clipboard_item.
+        let text = text
+            .map(|text| text.trim_end_matches('\0').to_string())
+            .filter(|text| !text.trim().is_empty() && text.len() <= 100_000);
+        if text == self.clipboard_selection {
+            return Ok(());
+        }
+        self.clipboard_selection = text;
+        self.redraw_clipboard_menu()
+    }
+
+    /// Sends a shortcut to the focused window. Terminals only get copy: Ctrl+A, Ctrl+Z
+    /// and Ctrl+Shift+Z mean other things there (Ctrl+Z suspends the running job).
+    pub(crate) fn run_clipboard_shortcut(&mut self, shortcut: ClipboardShortcut) -> AnyResult<()> {
+        if let Some(client) = self.active_client {
+            let _ = self.focus_window(client);
+        }
+        let terminal = self.focused_app_is_terminal()?;
+        let (modifiers, key): (&[u32], u32) = match (shortcut, terminal) {
+            (ClipboardShortcut::Copy, false) => (&[KEYSYM_CONTROL_L][..], KEYSYM_C),
+            (ClipboardShortcut::Copy, true) => (&[KEYSYM_CONTROL_L, KEYSYM_SHIFT_L][..], KEYSYM_C),
+            (ClipboardShortcut::SelectAll, false) => (&[KEYSYM_CONTROL_L][..], KEYSYM_A),
+            (ClipboardShortcut::Undo, false) => (&[KEYSYM_CONTROL_L][..], KEYSYM_Z),
+            (ClipboardShortcut::Redo, false) => (&[KEYSYM_CONTROL_L, KEYSYM_SHIFT_L][..], KEYSYM_Z),
+            _ => return Ok(()),
+        };
+        self.send_key_chord(modifiers, key)
+    }
+
+    /// Long-press on the clipboard icon: paste into the focused window without opening the menu.
+    /// Ctrl+Shift+V for text, Ctrl+V when the newest clipboard entry is an image.
+    pub(crate) fn paste_from_clipboard_icon(&mut self) -> AnyResult<()> {
+        let holds_image = matches!(
+            self.clipboard_history.first().map(|entry| &entry.item),
+            Some(ClipboardItem::Image(_))
+        );
+        if let Some(client) = self.active_client {
+            let _ = self.focus_window(client);
+        }
+        if holds_image {
+            self.send_key_chord(&[KEYSYM_CONTROL_L][..], KEYSYM_V)
+        } else {
+            self.send_key_chord(&[KEYSYM_CONTROL_L, KEYSYM_SHIFT_L][..], KEYSYM_V)
+        }
+    }
+
     pub(crate) fn remember_clipboard_item(&mut self, item: ClipboardItem) -> bool {
         if matches!(&item, ClipboardItem::Text(text) if text.is_empty()) {
             return false;
@@ -164,6 +335,10 @@ impl Aurora {
         }
         self.clipboard_menu_visible = true;
         self.clipboard_history_page = 0;
+        // Refresh the selection preview on the next periodic tick.
+        self.last_selection_poll = Instant::now()
+            .checked_sub(SELECTION_POLL_INTERVAL)
+            .unwrap_or_else(Instant::now);
         self.configure_clipboard_menu()?;
         self.conn.map_window(self.ui.clipboard_menu)?;
         // Without a compositor an override-redirect window has no pixel storage until it is
@@ -189,11 +364,15 @@ impl Aurora {
         if detail != 1 {
             return Ok(());
         }
-        if y < 38 {
+        if y < CLIPBOARD_MENU_PREVIEW_Y {
+            if let Some(shortcut) = clipboard_shortcut_at(x, y) {
+                return self.run_clipboard_shortcut(shortcut);
+            }
+            let (prev_x, next_x) = clipboard_nav_xs(i32::from(self.clipboard_menu_geometry().2));
             if point_in_rect(
                 x,
                 y,
-                CLIPBOARD_MENU_PREV_X,
+                prev_x,
                 CLIPBOARD_MENU_NAV_Y,
                 CLIPBOARD_MENU_NAV_W,
                 CLIPBOARD_MENU_NAV_H,
@@ -206,7 +385,7 @@ impl Aurora {
             } else if point_in_rect(
                 x,
                 y,
-                CLIPBOARD_MENU_NEXT_X,
+                next_x,
                 CLIPBOARD_MENU_NAV_Y,
                 CLIPBOARD_MENU_NAV_W,
                 CLIPBOARD_MENU_NAV_H,
@@ -220,8 +399,12 @@ impl Aurora {
             }
             return Ok(());
         }
+        if y < CLIPBOARD_MENU_LIST_TOP {
+            // The selection preview: display only.
+            return Ok(());
+        }
         let (start, end) = self.clipboard_page_range();
-        let mut row_y = 46;
+        let mut row_y = CLIPBOARD_MENU_LIST_TOP + 8;
         let mut selected_idx = None;
         for (offset, entry) in self.clipboard_history[start..end].iter().enumerate() {
             let row_h = clipboard_entry_row_height(entry);

@@ -696,13 +696,22 @@ impl Aurora {
 
     // -------------------------------------------------------------- confirm
 
+    pub(crate) fn confirm_open(&self) -> bool {
+        self.confirm_close.is_some() || self.confirm_command.is_some() || self.confirm_workspace.is_some()
+    }
+
     pub(crate) fn confirm_geometry(&self) -> (i16, i16, u16, u16) {
+        if let Some(action) = self.confirm_command {
+            return self.command_confirm_geometry(action);
+        }
         let x = ((self.screen_width.saturating_sub(CONFIRM_W)) / 2) as i16;
         let y = ((self.screen_height.saturating_sub(CONFIRM_H)) / 3) as i16;
         (x, y, CONFIRM_W, CONFIRM_H)
     }
 
     pub(crate) fn show_close_confirm(&mut self, client: Window) -> AnyResult<()> {
+        self.confirm_command = None;
+        self.confirm_workspace = None;
         self.confirm_close = Some(client);
         let (x, y, w, h) = self.confirm_geometry();
         self.conn.configure_window(
@@ -720,13 +729,21 @@ impl Aurora {
     }
 
     pub(crate) fn hide_close_confirm(&mut self) -> AnyResult<()> {
-        if self.confirm_close.take().is_some() {
+        let command = self.confirm_command.take().is_some();
+        let workspace = self.confirm_workspace.take().is_some();
+        if self.confirm_close.take().is_some() || command || workspace {
             self.conn.unmap_window(self.ui.confirm_dialog)?;
         }
         Ok(())
     }
 
     pub(crate) fn redraw_close_confirm(&self) -> AnyResult<()> {
+        if self.confirm_command.is_some() {
+            return self.redraw_command_confirm();
+        }
+        if let Some(index) = self.confirm_workspace {
+            return self.redraw_workspace_confirm(index);
+        }
         let Some(client) = self.confirm_close else {
             return Ok(());
         };
@@ -765,6 +782,12 @@ impl Aurora {
     }
 
     pub(crate) fn handle_confirm_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+        if self.confirm_command.is_some() {
+            return self.handle_command_confirm_click(x, y);
+        }
+        if let Some(index) = self.confirm_workspace {
+            return self.handle_workspace_confirm_click(index, x, y);
+        }
         let Some(client) = self.confirm_close else {
             return Ok(());
         };
@@ -791,7 +814,9 @@ impl Aurora {
         let controls = self.topbar_controls();
         let shortcuts = self.settings.shortcuts;
         let hit = |cx: i32| (cx - TOPBAR_ICON_HIT_RADIUS..=cx + TOPBAR_ICON_HIT_RADIUS).contains(&x);
-        let label = if hit(controls.clipboard_x) {
+        let label = if hit(controls.keyboard_x) {
+            Some((controls.keyboard_x, "Touch keyboard".to_string()))
+        } else if hit(controls.clipboard_x) {
             Some((
                 controls.clipboard_x,
                 format!("Clipboard  ({})", format_shortcut(shortcuts.clipboard)),
@@ -812,7 +837,7 @@ impl Aurora {
         } else if (controls.battery_left..=controls.battery_right).contains(&x) {
             Some((
                 (controls.battery_left + controls.battery_right) / 2,
-                "Power settings  (click toggles)".to_string(),
+                read_battery().unwrap_or_else(|| "Power settings".to_string()),
             ))
         } else {
             let workspace = (0..self.workspace_count).find(|&index| {
@@ -822,13 +847,6 @@ impl Aurora {
                 Some((
                     self.workspace_x(idx) + WORKSPACE_SIZE / 2,
                     format!("Workspace {}  (Super+Left/Right)", idx + 1),
-                ))
-            } else if (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE)
-                .contains(&x)
-            {
-                Some((
-                    self.add_workspace_x() + WORKSPACE_SIZE / 2,
-                    "Add workspace".to_string(),
                 ))
             } else {
                 None
@@ -1247,6 +1265,29 @@ impl Aurora {
     /// falling back to xrandr's software gamma.
     pub(crate) fn apply_brightness_all(&self, percent: u8) -> Result<(), String> {
         let percent = percent.clamp(10, 100);
+        // Write the backlight directly (the session user is in group video);
+        // brightnessctl only when sysfs is not writable.
+        let mut wrote = false;
+        if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(max) = fs::read_to_string(path.join("max_brightness"))
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                // Perceptual curve: equal slider steps look like equal changes.
+                let frac = f64::from(percent) / 100.0;
+                let level = ((max as f64) * (0.03 + 0.97 * frac * frac)).round().max(1.0) as u64;
+                if fs::write(path.join("brightness"), format!("{level}\n")).is_ok() {
+                    wrote = true;
+                }
+            }
+        }
+        if wrote {
+            return Ok(());
+        }
         let has_backlight = fs::read_dir("/sys/class/backlight")
             .map(|mut entries| entries.next().is_some())
             .unwrap_or(false);

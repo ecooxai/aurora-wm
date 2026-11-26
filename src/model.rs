@@ -141,7 +141,7 @@ impl AudioDeviceKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsTab {
     Display,
-    Dock,
+    Multitask,
     Power,
     Wallpaper,
     Audio,
@@ -215,11 +215,36 @@ impl PowerMode {
     }
 }
 
+/// Which optional icons appear on the topbar (Settings → Multitask).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TopbarIcons {
+    pub(crate) keyboard: bool,
+    pub(crate) clipboard: bool,
+    pub(crate) screenshot: bool,
+    pub(crate) recording: bool,
+    pub(crate) display: bool,
+    pub(crate) audio: bool,
+    pub(crate) wifi: bool,
+}
+
+/// Placeholder x for a hidden topbar icon: never inside any hit range.
+pub(crate) const HIDDEN_TOPBAR_X: i32 = i32::MIN / 4;
+
+pub(crate) fn topbar_icon_shown(x: i32) -> bool {
+    x != HIDDEN_TOPBAR_X
+}
+
 pub(crate) struct SettingsState {
     pub(crate) tab: SettingsTab,
+    pub(crate) topbar_icons: TopbarIcons,
     pub(crate) sleep_after_secs: u32,
     pub(crate) brightness_percent: u8,
+    /// GTK scale (GDK_SCALE) chosen in Settings → Display: 1, 2 or 3;
+    /// 0 = automatic (by panel density).
+    pub(crate) gdk_scale: u32,
     pub(crate) compositor_enabled: bool,
+    /// Settings → Display resolution dropdown is open (transient).
+    pub(crate) display_dropdown_open: bool,
     pub(crate) dock_in_topbar: bool,
     pub(crate) power_mode: PowerMode,
     pub(crate) auto_power_saver_enabled: bool,
@@ -278,8 +303,19 @@ impl Default for SettingsState {
             tab: SettingsTab::Display,
             sleep_after_secs: read_u32_setting("sleep_after_secs", 600).min(7200),
             brightness_percent: read_u32_setting("brightness_percent", 100).clamp(10, 100) as u8,
+            gdk_scale: saved_gdk_scale(),
             compositor_enabled: read_bool_setting("compositor_enabled", false),
+            display_dropdown_open: false,
             dock_in_topbar: read_bool_setting("dock_in_topbar", false),
+            topbar_icons: TopbarIcons {
+                keyboard: read_bool_setting("topbar_keyboard", true),
+                clipboard: read_bool_setting("topbar_clipboard", true),
+                screenshot: read_bool_setting("topbar_screenshot", true),
+                recording: read_bool_setting("topbar_recording", true),
+                display: read_bool_setting("topbar_display", true),
+                audio: read_bool_setting("topbar_audio", true),
+                wifi: read_bool_setting("topbar_wifi", true),
+            },
             power_mode: read_current_power_mode().unwrap_or(PowerMode::Balanced),
             auto_power_saver_enabled,
             auto_power_saver_minutes,
@@ -327,7 +363,15 @@ pub(crate) struct Metrics {
     pub(crate) nics: Vec<String>,
     pub(crate) net_rx_bps: f64,
     pub(crate) net_tx_bps: f64,
+    /// Per interface (name, down B/s, up B/s), excluding loopback.
+    pub(crate) nic_rates: Vec<(String, f64, f64)>,
     pub(crate) battery: Option<String>,
+    /// Highest current CPU clock across cpufreq policies, in MHz.
+    pub(crate) cpu_mhz: u32,
+    /// One line per GPU (name, clock, memory) plus an estimated load percent.
+    pub(crate) gpu_info: Vec<(String, Option<f32>)>,
+    /// Active swap areas (zram and swap files/partitions).
+    pub(crate) swaps: Vec<SwapArea>,
 }
 
 #[derive(Clone)]
@@ -352,9 +396,13 @@ pub(crate) struct NetTotals {
 pub(crate) struct SystemSampler {
     pub(crate) prev_cpu: Option<CpuTimes>,
     pub(crate) prev_net: Option<NetTotals>,
+    /// Last per-interface byte counters (name, rx, tx).
+    pub(crate) prev_nic: Vec<(String, u64, u64)>,
     pub(crate) cpu_model: String,
     pub(crate) gpus: Vec<String>,
     pub(crate) nics: Vec<String>,
+    /// Last devfreq residency table per GPU device, for load estimates.
+    pub(crate) prev_gpu_residency: std::collections::HashMap<String, Vec<(u64, u64)>>,
 }
 
 impl SystemSampler {
@@ -362,9 +410,11 @@ impl SystemSampler {
         Self {
             prev_cpu: None,
             prev_net: None,
+            prev_nic: Vec::new(),
             cpu_model: read_cpu_model(),
             gpus: read_gpus(),
             nics: read_nics(),
+            prev_gpu_residency: Default::default(),
         }
     }
 
@@ -394,10 +444,36 @@ impl SystemSampler {
             }
             _ => (0.0, 0.0),
         };
+        let nic_now = read_nic_totals();
+        let nic_rates = match (self.prev_net, net_now) {
+            (Some(prev), Some(now)) if now.at > prev.at => {
+                let dt = now.at.duration_since(prev.at).as_secs_f64().max(0.001);
+                nic_now
+                    .iter()
+                    .map(|(name, rx, tx)| {
+                        // A newly appeared interface starts at zero rather than a burst.
+                        let (prev_rx, prev_tx) = self
+                            .prev_nic
+                            .iter()
+                            .find(|(known, _, _)| known == name)
+                            .map(|(_, rx, tx)| (*rx, *tx))
+                            .unwrap_or((*rx, *tx));
+                        (
+                            name.clone(),
+                            rx.saturating_sub(prev_rx) as f64 / dt,
+                            tx.saturating_sub(prev_tx) as f64 / dt,
+                        )
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        self.prev_nic = nic_now;
         if let Some(now) = net_now {
             self.prev_net = Some(now);
         }
         Metrics {
+            nic_rates,
             cpu_model: self.cpu_model.clone(),
             cpu_usage,
             cpu_status: read_cpu_status(cpu_usage),
@@ -414,6 +490,9 @@ impl SystemSampler {
             net_rx_bps,
             net_tx_bps,
             battery: read_battery(),
+            cpu_mhz: read_cpu_mhz(),
+            gpu_info: read_gpu_info(&mut self.prev_gpu_residency),
+            swaps: read_swaps(),
         }
     }
 }
@@ -433,6 +512,7 @@ pub(crate) struct UiWindows {
     pub(crate) clipboard_menu: Window,
     pub(crate) media: [Window; MEDIA_SLOT_COUNT],
     pub(crate) dock_more_menu: Window,
+    pub(crate) hold_menu: Window,
     pub(crate) title_menu: Window,
     pub(crate) confirm_dialog: Window,
     pub(crate) tooltip: Window,
@@ -440,6 +520,11 @@ pub(crate) struct UiWindows {
 
 #[derive(Clone, Copy)]
 pub(crate) struct TopbarControls {
+    /// Left edge of everything on the right side of the bar: the leftmost
+    /// visible icon, or the battery's margin when every optional icon is hidden.
+    pub(crate) tray_left: i32,
+    /// Icon centres; `HIDDEN_TOPBAR_X` when the icon is hidden.
+    pub(crate) keyboard_x: i32,
     pub(crate) clipboard_x: i32,
     pub(crate) screenshot_x: i32,
     pub(crate) recording_x: i32,
@@ -449,6 +534,15 @@ pub(crate) struct TopbarControls {
     pub(crate) network_x: i32,
     pub(crate) battery_left: i32,
     pub(crate) battery_right: i32,
+    /// Centre of the battery glyph (the CPU clock sits left of it).
+    pub(crate) battery_icon_x: i32,
+}
+
+/// Cheap topbar status, re-read every idle tick.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct TopbarStatus {
+    pub(crate) battery_pct: Option<u8>,
+    pub(crate) charging: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -555,6 +649,24 @@ pub(crate) struct PendingClientDrag {
     pub(crate) root_x: i16,
     pub(crate) root_y: i16,
     pub(crate) pressed_at: Instant,
+}
+
+/// Titlebar button or title text pressed. The action runs on release unless the press
+/// becomes a window move first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TitlebarPress {
+    Close,
+    Minimize,
+    Maximize,
+    Title { menu_was_open: bool },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingTitlebarPress {
+    pub(crate) client: Window,
+    pub(crate) press: TitlebarPress,
+    pub(crate) root_x: i16,
+    pub(crate) root_y: i16,
 }
 
 #[derive(Clone, Copy)]
@@ -991,7 +1103,7 @@ pub(crate) mod settings_pending {
 }
 
 pub(crate) struct Aurora {
-    pub(crate) conn: RustConnection,
+    pub(crate) conn: crate::scale::ScaledConn,
     pub(crate) display: String,
     pub(crate) root: Window,
     pub(crate) depth: u8,
@@ -1006,6 +1118,10 @@ pub(crate) struct Aurora {
     pub(crate) wallpaper_previews: Vec<Option<Vec<u8>>>,
     pub(crate) wallpaper_pixmap: Option<Pixmap>,
     pub(crate) compositor_active: bool,
+    /// Screen-sleep is active (X screensaver blanked, backlight off).
+    pub(crate) screen_asleep: bool,
+    /// Black full-screen cover shown while asleep (eats the wake tap).
+    pub(crate) sleep_cover: Option<Window>,
     pub(crate) shape_supported: bool,
     pub(crate) ui: UiWindows,
     pub(crate) regular: Font<'static>,
@@ -1030,6 +1146,7 @@ pub(crate) struct Aurora {
     pub(crate) pending_ui_resize: Option<PendingUiResize>,
     pub(crate) ui_resize: Option<UiResizeState>,
     pub(crate) pending_client_drag: Option<PendingClientDrag>,
+    pub(crate) pending_titlebar: Option<PendingTitlebarPress>,
     pub(crate) title_hover: Option<(Window, TitleButton)>,
     pub(crate) ignored_unmaps: Vec<Window>,
     pub(crate) settings_visible: bool,
@@ -1065,6 +1182,12 @@ pub(crate) struct Aurora {
     pub(crate) app_menu_query: String,
     pub(crate) app_menu_expanded_categories: HashSet<String>,
     pub(crate) dock_more_visible: bool,
+    pub(crate) hold_menu_open: Option<crate::hold_menu::OpenHoldMenu>,
+    pub(crate) pending_hold: Option<crate::hold_menu::PendingHold>,
+    /// Workspace awaiting close confirmation (shares confirm_dialog).
+    pub(crate) confirm_workspace: Option<usize>,
+    /// CPU priority per WM_CLASS, loaded from ~/.config/aurora-wm/app-priority.
+    pub(crate) app_priorities: crate::app_control::PriorityMap,
     pub(crate) dock_more_scroll: usize,
     pub(crate) aurora_menu_visible: bool,
     pub(crate) aurora_menu_about: bool,
@@ -1082,6 +1205,10 @@ pub(crate) struct Aurora {
     pub(crate) clipboard_dirty: bool,
     pub(crate) last_seen_clipboard_text: Option<String>,
     pub(crate) last_seen_clipboard_image_sig: Option<u64>,
+    /// Text selected in the focused window, previewed at the top of the clipboard menu.
+    pub(crate) clipboard_selection: Option<String>,
+    pub(crate) selection_poll_rx: Option<Receiver<Option<String>>>,
+    pub(crate) last_selection_poll: Instant,
     pub(crate) command_paste_armed: bool,
     pub(crate) wm_s_atom: Atom,
     pub(crate) folder_context_open: bool,
@@ -1097,6 +1224,8 @@ pub(crate) struct Aurora {
     pub(crate) dock_last_click: Option<DockClickState>,
     pub(crate) icon_cache: HashMap<String, Option<Vec<u8>>>,
     pub(crate) last_clock_label: String,
+    /// Topbar clock shows the full date only after a click; time-only by default.
+    pub(crate) clock_show_date: bool,
     pub(crate) last_tick: Instant,
     pub(crate) last_media_tick: Instant,
     pub(crate) last_pointer_pos: Option<(i16, i16)>,
@@ -1133,6 +1262,14 @@ pub(crate) struct Aurora {
     pub(crate) title_menu_workspaces: bool,
     /// Client with a pending close-confirmation dialog.
     pub(crate) confirm_close: Option<Window>,
+    /// Session/network action awaiting confirmation (shares confirm_dialog).
+    pub(crate) confirm_command: Option<crate::session_actions::SessionAction>,
+    /// App menu: the Log out dropdown is open.
+    pub(crate) app_menu_power_open: bool,
+    /// Running network restart: its result message.
+    pub(crate) net_restart_rx: Option<Receiver<String>>,
     /// Currently shown topbar tooltip: (anchor x, label).
     pub(crate) tooltip_shown: Option<(i32, String)>,
+    pub(crate) topbar_status: TopbarStatus,
+    pub(crate) osk: crate::touch_keyboard::TouchKeyboard,
 }

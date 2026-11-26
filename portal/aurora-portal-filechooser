@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Aurora file chooser: an xdg-desktop-portal backend that shows Aurora Files.
+
+Chromium (no GTK or Qt in this build) asks org.freedesktop.portal.Desktop for a
+file dialog. xdg-desktop-portal routes FileChooser calls to the backend named in
+portals.conf, which is this service. We run the Aurora Files picker
+(aurora-files --choose-file / --choose-files / --choose-directory / --save-file)
+and return the chosen paths as file:// URIs. Cancel returns response 1.
+
+Installed as /usr/local/libexec/aurora-portal-filechooser, activated on the
+session bus by org.freedesktop.impl.portal.desktop.aurora.service.
+"""
+import os
+import sys
+import time
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+BUS_NAME = "org.freedesktop.impl.portal.desktop.aurora"
+OBJ_PATH = "/org/freedesktop/portal/desktop"
+AURORA_FILES = os.environ.get("AURORA_FILES", "/usr/local/bin/aurora-files")
+LOG_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aurora-portal-filechooser.log")
+
+
+def log(message):
+    """Append one line to the runtime log (tmpfs, cleared on reboot)."""
+    try:
+        with open(LOG_PATH, "a") as fh:
+            fh.write(time.strftime("%H:%M:%S ") + message + "\n")
+    except OSError:
+        pass
+
+INTROSPECTION = """
+<node>
+  <interface name="org.freedesktop.impl.portal.FileChooser">
+    <method name="OpenFile">
+      <arg type="o" name="handle" direction="in"/>
+      <arg type="s" name="app_id" direction="in"/>
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="u" name="response" direction="out"/>
+      <arg type="a{sv}" name="results" direction="out"/>
+    </method>
+    <method name="SaveFile">
+      <arg type="o" name="handle" direction="in"/>
+      <arg type="s" name="app_id" direction="in"/>
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="u" name="response" direction="out"/>
+      <arg type="a{sv}" name="results" direction="out"/>
+    </method>
+    <method name="SaveFiles">
+      <arg type="o" name="handle" direction="in"/>
+      <arg type="s" name="app_id" direction="in"/>
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="u" name="response" direction="out"/>
+      <arg type="a{sv}" name="results" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+</node>
+"""
+
+
+def path_from_bytes(value):
+    """Portal paths arrive as nul-terminated byte arrays (ay)."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).rstrip(b"\0").decode("utf-8", "replace")
+    if isinstance(value, list):
+        return bytes(value).rstrip(b"\0").decode("utf-8", "replace")
+    return str(value or "")
+
+
+def glob_patterns(options):
+    """Glob patterns of the active filter, or of all filters if none is active."""
+    chosen = options.get("current_filter")
+    filters = [chosen] if chosen else options.get("filters") or []
+    patterns = []
+    for entry in filters:
+        try:
+            _name, rules = entry
+        except (TypeError, ValueError):
+            continue
+        for rule in rules:
+            try:
+                kind, pattern = rule
+            except (TypeError, ValueError):
+                continue
+            if kind == 0 and pattern:
+                patterns.append(pattern)
+    return patterns
+
+
+def build_argv(method, title, options):
+    if method == "SaveFile":
+        mode = "--save-file"
+    elif method == "SaveFiles" or options.get("directory"):
+        mode = "--choose-directory"
+    elif options.get("multiple"):
+        mode = "--choose-files"
+    else:
+        mode = "--choose-file"
+
+    folder = path_from_bytes(options.get("current_folder"))
+    name = ""
+    current_file = path_from_bytes(options.get("current_file"))
+    if method == "SaveFile" and current_file:
+        folder = os.path.dirname(current_file) or folder
+        name = os.path.basename(current_file)
+    if method == "SaveFile" and not name:
+        name = str(options.get("current_name") or "")
+
+    argv = [AURORA_FILES, mode, "--null", "--title", title or "Choose a file"]
+    if folder:
+        argv += ["--path", folder]
+    if mode == "--save-file" and name:
+        argv += ["--filename", name]
+    patterns = glob_patterns(options)
+    if patterns and mode != "--choose-directory":
+        argv += ["--filter", ";".join(patterns)]
+    return argv
+
+
+def file_uri(path):
+    return GLib.filename_to_uri(path, None)
+
+
+class Backend:
+    def __init__(self):
+        self.loop = GLib.MainLoop()
+
+    def on_bus_acquired(self, conn, _name):
+        node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+        conn.register_object(
+            OBJ_PATH,
+            node.interfaces[0],
+            self.on_method_call,
+            self.on_get_property,
+            None,
+        )
+
+    def on_name_lost(self, _conn, name):
+        print(f"aurora-portal-filechooser: lost or could not own {name}", file=sys.stderr)
+        self.loop.quit()
+
+    def on_get_property(self, _conn, _sender, _path, _iface, prop):
+        if prop == "version":
+            return GLib.Variant("u", 3)
+        return None
+
+    def on_method_call(self, _conn, _sender, _path, _iface, method, params, invocation):
+        if method not in ("OpenFile", "SaveFile", "SaveFiles"):
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.UnknownMethod", f"no method {method}"
+            )
+            return
+        try:
+            _handle, _app_id, _parent, title, options = params.unpack()
+            argv = build_argv(method, title, options)
+            log(f"{method} options={options!r} argv={argv!r}")
+            proc = Gio.Subprocess.new(
+                argv,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE,
+            )
+        except Exception as err:  # never leave the caller hanging
+            print(f"aurora-portal-filechooser: {method} failed: {err}", file=sys.stderr)
+            invocation.return_dbus_error("org.freedesktop.portal.Error.Failed", str(err))
+            return
+        proc.communicate_utf8_async(None, None, self.on_picker_done, invocation)
+
+    def on_picker_done(self, proc, result, invocation):
+        try:
+            _ok, out, _err = proc.communicate_utf8_finish(result)
+        except GLib.Error as err:
+            print(f"aurora-portal-filechooser: picker failed: {err.message}", file=sys.stderr)
+            invocation.return_value(GLib.Variant("(ua{sv})", (2, {})))
+            return
+        paths = [p for p in (out or "").split("\0") if p]
+        log(f"picker exit={proc.get_exit_status()} stdout={out!r} paths={paths!r}")
+        if proc.get_if_exited() and proc.get_exit_status() == 0 and paths:
+            uris = [file_uri(p) for p in paths]
+            results = {"uris": GLib.Variant("as", uris)}
+            invocation.return_value(GLib.Variant("(ua{sv})", (0, results)))
+        else:
+            invocation.return_value(GLib.Variant("(ua{sv})", (1, {})))
+
+    def run(self):
+        Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            BUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            self.on_bus_acquired,
+            None,
+            self.on_name_lost,
+        )
+        self.loop.run()
+
+
+if __name__ == "__main__":
+    Backend().run()

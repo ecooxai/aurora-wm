@@ -869,8 +869,11 @@ impl Aurora {
     }
 
     pub(crate) fn handle_app_menu_click(&mut self, button: u8, x: i32, y: i32) -> AnyResult<()> {
-        let (_, _, w, h) = self.app_menu_geometry();
-        if button == 1 && x >= 92 && x <= i32::from(w) - 18 && (11..=45).contains(&y) {
+        let (_, _, _w, h) = self.app_menu_geometry();
+        if self.handle_app_menu_power_click(button, x, y)? {
+            return Ok(());
+        }
+        if button == 1 && x >= 92 && x <= self.app_menu_power_pill().0 - 10 && (11..=45).contains(&y) {
             self.conn
                 .set_input_focus(InputFocus::POINTER_ROOT, self.ui.app_menu, CURRENT_TIME)?;
             return Ok(());

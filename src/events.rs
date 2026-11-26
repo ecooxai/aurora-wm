@@ -35,6 +35,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 use crate::*;
+use crate::system_apply::sleep_log;
 use crate::wm_extras::*;
 use crate::canvas::*;
 use crate::model::*;
@@ -64,17 +65,43 @@ use crate::files::*;
 
 impl Aurora {
     pub(crate) fn handle_event(&mut self, event: Event) -> AnyResult<()> {
+        if let Some(cover) = self.sleep_cover {
+            match &event {
+                Event::ButtonPress(ev) | Event::ButtonRelease(ev) if ev.event == cover => return Ok(()),
+                Event::MotionNotify(ev) if ev.event == cover => return Ok(()),
+                // Asleep: anything mapped or restacked must stay under the cover.
+                Event::MapNotify(ev) if self.screen_asleep && ev.window != cover => {
+                    self.raise_sleep_cover();
+                }
+                Event::ConfigureNotify(ev)
+                    if self.screen_asleep && ev.window != cover && ev.event == self.root =>
+                {
+                    self.raise_sleep_cover();
+                }
+                _ => {}
+            }
+        }
         match event {
             Event::Expose(ev) => self.handle_expose(ev)?,
+            Event::ScreensaverNotify(ev) => {
+                sleep_log(&format!("ScreensaverNotify state={:?} forced={}", ev.state, ev.forced));
+                self.set_screen_asleep(ev.state == x11rb::protocol::screensaver::State::ON);
+            }
             Event::KeyPress(ev) => self.handle_key_press(ev)?,
             Event::KeyRelease(ev) => self.handle_key_release(ev)?,
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
             Event::ButtonRelease(ev) => {
-                if self.settings.auto_power_saver_slider_dragging {
+                if self.osk.is_window(ev.event) {
+                    self.handle_touch_keyboard_release(ev)?;
+                } else if self.settings.auto_power_saver_slider_dragging {
                     self.settings.auto_power_saver_slider_dragging = false;
                     self.pending_auto_power_saver_apply = None;
                     self.apply_auto_power_saver_setting()?;
                     self.redraw_settings()?;
+                } else if self.pending_titlebar.is_some() {
+                    self.release_titlebar_press(ev)?;
+                } else if self.pending_hold.is_some() {
+                    self.release_hold(ev)?;
                 } else if self.pending_recording_button.is_some() {
                     self.release_recording_button(ev)?;
                 } else if self.pending_screenshot_button.is_some() {
@@ -116,7 +143,7 @@ impl Aurora {
                 }
             }
             Event::CreateNotify(ev) => {
-                if ev.parent == self.root && ev.override_redirect {
+                if ev.parent == self.root && ev.override_redirect && !self.is_ui_window(ev.window) {
                     // ARGB overlays normally set WM_NAME between CreateWindow
                     // and MapWindow. Subscribe immediately so an unsupported
                     // transparent overlay can be shaped before it ever covers
@@ -130,7 +157,7 @@ impl Aurora {
             }
             Event::MapRequest(ev) => self.manage_window(ev.window)?,
             Event::MapNotify(ev) => {
-                if ev.event == self.root {
+                if ev.event == self.root && !self.is_ui_window(ev.window) {
                     if ev.override_redirect {
                         // Watch for a title assigned just after mapping as well as
                         // the usual set-title-before-map sequence.
@@ -233,6 +260,11 @@ impl Aurora {
         if ev.count != 0 {
             return Ok(());
         }
+        if self.osk.is_window(ev.window) {
+            self.redraw_touch_keyboard()?;
+            self.conn.flush()?;
+            return Ok(());
+        }
         if ev.window == self.ui.topbar {
             self.redraw_topbar()?;
         } else if ev.window == self.ui.dock {
@@ -253,7 +285,7 @@ impl Aurora {
             self.redraw_app_menu()?;
         } else if ev.window == self.ui.title_menu && self.title_menu_open.is_some() {
             self.redraw_title_menu()?;
-        } else if ev.window == self.ui.confirm_dialog && self.confirm_close.is_some() {
+        } else if ev.window == self.ui.confirm_dialog && self.confirm_open() {
             self.redraw_close_confirm()?;
         } else if ev.window == self.ui.tooltip {
             if let Some((_, text)) = self.tooltip_shown.clone() {
@@ -266,6 +298,8 @@ impl Aurora {
             self.redraw_clipboard_menu()?;
         } else if ev.window == self.ui.dock_more_menu && self.dock_more_visible {
             self.redraw_dock_more_menu()?;
+        } else if ev.window == self.ui.hold_menu && self.hold_menu_open.is_some() {
+            self.redraw_hold_menu()?;
         } else if let Some(slot) = self.media_slot_for_window(ev.window) {
             if self
                 .media_slots
@@ -290,6 +324,20 @@ impl Aurora {
 
     pub(crate) fn handle_button_press(&mut self, ev: ButtonPressEvent) -> AnyResult<()> {
         self.last_pointer_activity = Instant::now();
+        // Touch keyboard: the root grab reports the press on root first;
+        // replaying it delivers it to the keyboard window, whose implicit
+        // grab then carries the motion and release (dragging, key repeat).
+        // Focus is never touched, so keys go to the focused application.
+        if self.osk.is_window(ev.event) {
+            self.handle_touch_keyboard_press(ev)?;
+            self.conn.flush()?;
+            return Ok(());
+        }
+        if ev.event == self.root && self.touch_keyboard_contains(ev.root_x, ev.root_y) {
+            self.conn.allow_events(Allow::REPLAY_POINTER, ev.time)?;
+            self.conn.flush()?;
+            return Ok(());
+        }
         if self.route_recording_menu_press(ev)? {
             self.conn.flush()?;
             return Ok(());
@@ -297,7 +345,7 @@ impl Aurora {
         // Close-confirmation dialog: route by root coordinates because the
         // synchronous root button grab reports these presses on the root
         // window first; the replayed event then reaches the dialog itself.
-        if self.confirm_close.is_some() {
+        if self.confirm_open() {
             let (cx, cy, cw, ch) = self.confirm_geometry();
             let rx = i32::from(ev.root_x);
             let ry = i32::from(ev.root_y);
@@ -341,7 +389,34 @@ impl Aurora {
                     return Ok(());
                 }
             } else {
-                self.hide_title_menu()?;
+                // A press on this client's titlebar is resolved on release (handle_frame_click),
+                // so clicking the title again can close the menu instead of reopening it. Root
+                // coordinates are used because the press may arrive on the root (sync grab).
+                let on_titlebar = self.clients.get(&menu_client).copied().is_some_and(|info| {
+                    let fx = i32::from(ev.root_x) - i32::from(info.x);
+                    let fy = i32::from(ev.root_y) - i32::from(info.y);
+                    fx >= 0
+                        && fx < i32::from(info.width)
+                        && fy >= 0
+                        && fy < i32::from(self.titlebar_height(&info))
+                });
+                if !on_titlebar {
+                    self.hide_title_menu()?;
+                }
+            }
+        }
+        if let Some(open) = self.hold_menu_open {
+            let (mx, my, mw, mh) = self.hold_menu_geometry(open);
+            let rx = i32::from(ev.root_x);
+            let ry = i32::from(ev.root_y);
+            if rx >= mx && rx < mx + mw && ry >= my && ry < my + mh {
+                if ev.event == self.root { self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?; }
+                if ev.detail == 1 { self.handle_hold_menu_click(ry - my)?; }
+                self.conn.flush()?;
+                return Ok(());
+            }
+            if matches!(ev.detail, 1..=3) {
+                self.hide_hold_menu()?;
             }
         }
         if self.dock_more_visible {
@@ -483,7 +558,9 @@ impl Aurora {
             if ev.detail == 1 {
                 self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
             }
-            if ev.detail == 1 { self.handle_dock_click(event_x, event_y)?; }
+            if ev.detail == 1 && !self.begin_dock_hold(event_x, event_y)? {
+                self.handle_dock_click(event_x, event_y)?;
+            }
         } else if ev.event == self.ui.folder {
             if ev.detail == 4 || ev.detail == 5 {
                 self.handle_folder_scroll(ev.detail)?;
@@ -588,7 +665,9 @@ impl Aurora {
         } else if ev.event == self.ui.topbar || pointer_target == self.ui.topbar {
             if ev.detail == 1 {
                 if ev.event == self.root { self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?; }
-                let _ = self.handle_topbar_press_x(i32::from(ev.root_x))?;
+                if !self.begin_topbar_hold(i32::from(ev.root_x))? {
+                    let _ = self.handle_topbar_press_x(i32::from(ev.root_x))?;
+                }
             }
         } else if ev.event == self.root {
             self.hide_aurora_menu()?;
@@ -610,6 +689,10 @@ impl Aurora {
 
     pub(crate) fn handle_motion_notify(&mut self, ev: MotionNotifyEvent) -> AnyResult<bool> {
         self.last_pointer_activity = Instant::now();
+        if self.osk.is_window(ev.event) {
+            self.handle_touch_keyboard_motion(ev)?;
+            return Ok(true);
+        }
         if self.settings.auto_power_saver_slider_dragging {
             let button_down = u16::from(ev.state) & u16::from(KeyButMask::BUTTON1) != 0;
             if button_down {
@@ -640,6 +723,15 @@ impl Aurora {
                     return Ok(true);
                 }
                 return Ok(false);
+            }
+            if let Some(pending) = self.pending_titlebar {
+                let moved = (i32::from(ev.root_x) - i32::from(pending.root_x)).abs() > 4
+                    || (i32::from(ev.root_y) - i32::from(pending.root_y)).abs() > 4;
+                if moved {
+                    self.start_titlebar_move(pending)?;
+                    let _ = self.update_drag_position_inner(ev.root_x, ev.root_y, false)?;
+                    return Ok(true);
+                }
             }
             if let Some(pending) = self.pending_client_drag {
                 let moved = (i32::from(ev.root_x) - i32::from(pending.root_x)).abs() > 4
@@ -873,6 +965,14 @@ impl Aurora {
             }
             return Ok(());
         }
+        if ev.type_ == self.atom(b"_AURORA_RESTART_IN_PLACE")? {
+            self.restart_in_place();
+            return Ok(());
+        }
+        if ev.type_ == self.atom(b"_AURORA_TOGGLE_KEYBOARD")? {
+            self.toggle_touch_keyboard()?;
+            return Ok(());
+        }
         let open_folder_atom = self.atom(b"_AURORA_OPEN_FOLDER")?;
         if ev.type_ == open_folder_atom {
             let path_atom = self
@@ -938,8 +1038,9 @@ impl Aurora {
         let Some(client) = self.client_or_ancestor_key_for(ev.window) else {
             return Ok(());
         };
-        let root_x = data[0].min(i16::MAX as u32) as i16;
-        let root_y = data[1].min(i16::MAX as u32) as i16;
+        // Client messages carry physical root coordinates.
+        let root_x = crate::scale::lg(data[0].min(i16::MAX as u32) as i32) as i16;
+        let root_y = crate::scale::lg(data[1].min(i16::MAX as u32) as i32) as i16;
         match data[2] {
             8 => {
                 // The app is driving the move itself (CSD titlebar). Drop our own pending
@@ -948,7 +1049,22 @@ impl Aurora {
                 // black frame background inside the window during non-composited moves.
                 self.pending_client_drag = None;
                 if self.drag.is_none() {
-                    self.start_drag(client, root_x, root_y)?;
+                    // Anchor on the live pointer while button 1 is held. For touch drags,
+                    // Chromium (device scale 1.5) sends window origin + the in-window offset
+                    // in DIPs, not pixels, so the message coordinates sit short of the finger
+                    // and the window jumped by a third of the grab offset when the drag began.
+                    let (x, y) = match self
+                        .conn
+                        .query_pointer(self.root)
+                        .ok()
+                        .and_then(|cookie| cookie.reply().ok())
+                    {
+                        Some(p) if u16::from(p.mask) & u16::from(KeyButMask::BUTTON1) != 0 => {
+                            (p.root_x, p.root_y)
+                        }
+                        _ => (root_x, root_y),
+                    };
+                    self.start_drag(client, x, y)?;
                 }
             }
             0 => self.start_resize(
@@ -1170,25 +1286,37 @@ impl Aurora {
             return Ok(());
         }
         let x = ev.event_x;
-        if (12..=26).contains(&x) {
-            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
-            self.close_client(client)?;
+        let title = compact(
+            &self.window_title(info.window),
+            ((info.width / 9).max(8)) as usize,
+        );
+        let title_w = measure_text(&self.bold, &title, 13.0);
+        self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
+        let press = if (12..=26).contains(&x) {
+            Some(TitlebarPress::Close)
         } else if (34..=50).contains(&x) {
-            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
-            self.minimize_client(client)?;
+            Some(TitlebarPress::Minimize)
         } else if (57..=73).contains(&x) {
-            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
-            self.toggle_maximize_client(client)?;
+            Some(TitlebarPress::Maximize)
+        } else if i32::from(x) >= 88 && i32::from(x) <= 96 + title_w {
+            Some(TitlebarPress::Title {
+                menu_was_open: self.title_menu_open == Some(client),
+            })
         } else {
-            let title = compact(
-                &self.window_title(info.window),
-                ((info.width / 9).max(8)) as usize,
-            );
-            let title_w = measure_text(&self.bold, &title, 13.0);
-            self.conn.allow_events(Allow::ASYNC_POINTER, ev.time)?;
-            if i32::from(x) >= 88 && i32::from(x) <= 96 + title_w {
-                self.toggle_title_menu(client)?;
-            } else {
+            None
+        };
+        match press {
+            // Buttons and the title act on release, so a press that turns into a drag moves the window.
+            Some(press) => {
+                self.pending_titlebar = Some(PendingTitlebarPress {
+                    client,
+                    press,
+                    root_x: ev.root_x,
+                    root_y: ev.root_y,
+                });
+            }
+            None => {
+                self.hide_title_menu()?;
                 self.start_drag(client, ev.root_x, ev.root_y)?;
             }
         }
@@ -1276,6 +1404,20 @@ impl Aurora {
         Ok(())
     }
 
+    /// Whether a topbar press at `x` lands on the clock label.
+    pub(crate) fn topbar_clock_contains(&self, x: i32) -> bool {
+        let width = measure_text(&self.regular, &format_clock(self.clock_show_date), 16.0);
+        let (left, right) = if self.dock_is_merged() {
+            // Right-aligned against the tray, as drawn in redraw_topbar.
+            let right = self.topbar_controls().tray_left - 24;
+            (right - width - 8, right + 4)
+        } else {
+            let centre = i32::from(self.screen_width) / 2;
+            (centre - width / 2 - 8, centre + width / 2 + 8)
+        };
+        (left..=right).contains(&x)
+    }
+
     pub(crate) fn handle_topbar_press_x(&mut self, x: i32) -> AnyResult<bool> {
         let controls = self.topbar_controls();
         let aurora_end = self.topbar_brand_end();
@@ -1288,24 +1430,20 @@ impl Aurora {
         self.hide_app_menu()?;
         if self.dock_is_merged() && self.handle_topbar_task_click(x)? { return Ok(true); }
         let workspace = (0..self.workspace_count).find(|&index| {
-            self.workspace_x(index) + WORKSPACE_SIZE < controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS
+            self.workspace_x(index) + WORKSPACE_SIZE < controls.tray_left - TOPBAR_ICON_HIT_RADIUS
                 && (self.workspace_x(index)..=self.workspace_x(index) + WORKSPACE_SIZE).contains(&x)
         });
         if let Some(workspace) = workspace {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
             self.switch_workspace(workspace)?;
-        } else if self.add_workspace_x() + WORKSPACE_SIZE < controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS
-            && (self.add_workspace_x()..=self.add_workspace_x() + WORKSPACE_SIZE).contains(&x) {
-            self.hide_aurora_menu()?;
-            self.hide_clipboard_menu()?;
-            self.add_workspace()?;
-        } else if (controls.clipboard_x - TOPBAR_ICON_HIT_RADIUS
-            ..=controls.clipboard_x + TOPBAR_ICON_HIT_RADIUS)
+        } else if (controls.keyboard_x - TOPBAR_ICON_HIT_RADIUS
+            ..=controls.keyboard_x + TOPBAR_ICON_HIT_RADIUS)
             .contains(&x)
         {
             self.hide_aurora_menu()?;
-            self.toggle_clipboard_menu()?;
+            self.hide_clipboard_menu()?;
+            self.toggle_touch_keyboard()?;
         } else if (controls.screenshot_x - TOPBAR_ICON_HIT_RADIUS
             ..=controls.screenshot_x + TOPBAR_ICON_HIT_RADIUS)
             .contains(&x)
@@ -1345,6 +1483,13 @@ impl Aurora {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
             self.open_settings_tab(SettingsTab::Network)?;
+        } else if self.topbar_clock_contains(x) {
+            // Click toggles the full date; the time alone is the default.
+            self.hide_aurora_menu()?;
+            self.hide_clipboard_menu()?;
+            self.clock_show_date = !self.clock_show_date;
+            self.last_clock_label = format_clock(self.clock_show_date);
+            self.redraw_topbar()?;
         } else if (controls.battery_left..=controls.battery_right).contains(&x) {
             self.hide_aurora_menu()?;
             self.hide_clipboard_menu()?;
@@ -1483,4 +1628,48 @@ impl Aurora {
         Ok(None)
     }
 
+}
+
+impl Aurora {
+    /// Runs a titlebar button or title action once the press is known to be a click.
+    pub(crate) fn run_titlebar_press(&mut self, client: Window, press: TitlebarPress) -> AnyResult<()> {
+        match press {
+            TitlebarPress::Close => {
+                self.hide_title_menu()?;
+                self.close_client(client)?;
+            }
+            TitlebarPress::Minimize => {
+                self.hide_title_menu()?;
+                self.minimize_client(client)?;
+            }
+            TitlebarPress::Maximize => {
+                self.hide_title_menu()?;
+                self.toggle_maximize_client(client)?;
+            }
+            TitlebarPress::Title { menu_was_open: true } => self.hide_title_menu()?,
+            TitlebarPress::Title { menu_was_open: false } => self.toggle_title_menu(client)?,
+        }
+        Ok(())
+    }
+
+    /// A titlebar press that moved becomes a window move; any open title menu closes first.
+    pub(crate) fn start_titlebar_move(&mut self, pending: PendingTitlebarPress) -> AnyResult<()> {
+        self.pending_titlebar = None;
+        self.hide_title_menu()?;
+        self.start_drag(pending.client, pending.root_x, pending.root_y)
+    }
+
+    /// Button release: a press that never became a move is a click, so its action runs now.
+    pub(crate) fn release_titlebar_press(&mut self, ev: ButtonReleaseEvent) -> AnyResult<()> {
+        if ev.detail != 1 {
+            return Ok(());
+        }
+        let Some(pending) = self.pending_titlebar.take() else {
+            return Ok(());
+        };
+        if self.drag.is_none() {
+            self.run_titlebar_press(pending.client, pending.press)?;
+        }
+        Ok(())
+    }
 }

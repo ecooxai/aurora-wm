@@ -78,6 +78,9 @@ impl Aurora {
             frame_aux = frame_aux.stack_mode(stack);
         }
         self.conn.configure_window(info.frame, &frame_aux)?;
+        if stack == Some(StackMode::ABOVE) {
+            self.raise_touch_keyboard()?;
+        }
         self.conn.configure_window(
             info.window,
             &ConfigureWindowAux::new()
@@ -101,10 +104,11 @@ impl Aurora {
             event: info.window,
             window: info.window,
             above_sibling: x11rb::NONE,
-            x: info.x,
-            y: client_y,
-            width: info.width,
-            height: info.height,
+            // Synthetic events bypass ScaledConn: physical pixels.
+            x: crate::scale::px(i32::from(info.x)) as i16,
+            y: crate::scale::px(i32::from(client_y)) as i16,
+            width: crate::scale::px_len(u32::from(info.width)) as u16,
+            height: crate::scale::px_len(u32::from(info.height)) as u16,
             border_width: 0,
             override_redirect: false,
         };
@@ -448,6 +452,7 @@ impl Aurora {
         if self.is_ui_window(window) || self.client_key_for(window).is_some() {
             return Ok(());
         }
+        self.apply_saved_priority(window);
         let attr = self.conn.get_window_attributes(window)?.reply()?;
         if attr.override_redirect {
             self.conn.map_window(window)?;
@@ -722,6 +727,7 @@ impl Aurora {
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
+        self.raise_touch_keyboard()?;
         self.update_active_window_property()?;
         Ok(())
     }

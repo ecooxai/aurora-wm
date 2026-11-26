@@ -58,6 +58,7 @@ fi
 if [ -x "./$BIN_NAME" ] && [ -x "./aurora-files" ]; then
     wm_source="./$BIN_NAME"
     files_source="./aurora-files"
+    renice_source="./aurora-renice"
     echo "Using bundled release binaries."
 else
     need_cmd cargo
@@ -65,6 +66,7 @@ else
     cargo build --release --bins
     wm_source="target/release/$BIN_NAME"
     files_source="target/release/aurora-files"
+    renice_source="target/release/aurora-renice"
 fi
 
 tmp_wrapper="$(mktemp)"
@@ -80,6 +82,17 @@ as_root install -Dm644 assets/aurora-files.desktop /usr/share/applications/auror
 as_root install -Dm644 assets/aurora-files-terminal.desktop /usr/share/applications/aurora-files-terminal.desktop
 if command -v update-desktop-database >/dev/null 2>&1; then
     as_root update-desktop-database /usr/share/applications || true
+fi
+# Priority helper for the app long-press menu (High needs CAP_SYS_NICE).
+if [ -x "$renice_source" ]; then
+    echo "Installing $PREFIX/libexec/aurora-renice..."
+    as_root install -Dm755 "$renice_source" "$PREFIX/libexec/aurora-renice"
+    if command -v setcap >/dev/null 2>&1; then
+        as_root setcap cap_sys_nice+ep "$PREFIX/libexec/aurora-renice" ||
+            echo "setcap failed; High priority will not apply." >&2
+    else
+        echo "setcap not found; High priority will not apply." >&2
+    fi
 fi
 # Register Aurora Files as the default file manager for the current user.
 if command -v xdg-mime >/dev/null 2>&1; then

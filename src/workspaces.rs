@@ -221,6 +221,75 @@ impl Aurora {
         self.switch_workspace(workspace)
     }
 
+    /// Removes a workspace. Its windows move to the neighbouring workspace
+    /// (the next one, or the previous one for the last workspace). The last
+    /// remaining workspace cannot be closed.
+    pub(crate) fn close_workspace(&mut self, index: usize) -> AnyResult<()> {
+        if self.workspace_count <= 1 || index >= self.workspace_count {
+            return Ok(());
+        }
+        let neighbour = crate::hold_menu::workspace_neighbour(index, self.workspace_count);
+        if self.active_workspace == index {
+            self.switch_workspace(neighbour)?;
+        }
+        // Where the windows end up once the closed workspace is gone.
+        let target = if neighbour > index { neighbour - 1 } else { neighbour };
+        let mut moved_frames = Vec::new();
+        for info in self.clients.values_mut() {
+            if info.workspace == index {
+                info.workspace = target;
+                if info.mapped && !info.sticky {
+                    moved_frames.push(info.frame);
+                }
+            } else if info.workspace > index {
+                info.workspace -= 1;
+            }
+        }
+        if index < self.workspace_ui.len() {
+            self.workspace_ui.remove(index);
+        }
+        self.workspace_count -= 1;
+        if self.active_workspace > index {
+            self.active_workspace -= 1;
+        }
+        if target == self.active_workspace {
+            // Frames of the closed workspace were hidden; they belong on screen now.
+            for frame in moved_frames {
+                self.conn.map_window(frame)?;
+            }
+        }
+        self.publish_desktops()?;
+        self.active_client = None;
+        self.update_active_window_property()?;
+        self.conn
+            .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+        self.redraw_topbar()?;
+        self.redraw_dock()?;
+        self.raise_ui()
+    }
+
+    /// EWMH desktop count and current desktop on the root window.
+    pub(crate) fn publish_desktops(&self) -> AnyResult<()> {
+        let cardinal = self.atom(b"CARDINAL")?;
+        let count = self.atom(b"_NET_NUMBER_OF_DESKTOPS")?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            count,
+            cardinal,
+            &[self.workspace_count as u32],
+        )?;
+        let current = self.atom(b"_NET_CURRENT_DESKTOP")?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            current,
+            cardinal,
+            &[self.active_workspace as u32],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn switch_workspace(&mut self, workspace: usize) -> AnyResult<()> {
         if workspace >= self.workspace_count || workspace == self.active_workspace {
             return Ok(());
@@ -371,6 +440,7 @@ impl Aurora {
         }
         self.settings.tab = tab;
         self.settings.scroll = 0;
+        self.settings.display_dropdown_open = false;
         self.settings_visible = true;
         self.settings_front = true;
         self.settings_hidden_at = None;

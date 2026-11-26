@@ -24,7 +24,8 @@ use crate::{AnyResult, Aurora};
 pub(crate) struct RecordingPlan {
     path: PathBuf,
     monitor: String,
-    microphone: String,
+    /// None when no capture device exists (e.g. the iPad): system audio only.
+    microphone: Option<String>,
     reserved: bool,
     encoder: VideoEncoder,
     duration_limit: Duration,
@@ -275,7 +276,7 @@ fn select_audio_sources(
     sources: &str,
     sink: &str,
     default_source: &str,
-) -> Result<(String, String), String> {
+) -> Result<(String, Option<String>), String> {
     let names: Vec<&str> = sources
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
@@ -284,6 +285,7 @@ fn select_audio_sources(
     if !names.iter().any(|name| *name == monitor) {
         return Err("The current audio output has no recording monitor".into());
     }
+    // A microphone is optional: without one, record system audio only.
     let microphone = names
         .iter()
         .copied()
@@ -293,11 +295,8 @@ fn select_audio_sources(
                 .iter()
                 .copied()
                 .find(|name| !name.ends_with(".monitor"))
-        })
-        .ok_or_else(|| {
-            "No microphone is available; connect a microphone and try again".to_string()
-        })?;
-    Ok((monitor, microphone.to_string()))
+        });
+    Ok((monitor, microphone.map(str::to_string)))
 }
 
 fn append_encoder_args(command: &mut Command, encoder: &VideoEncoder, width: u16, height: u16) {
@@ -503,8 +502,8 @@ fn recorder_command(plan: &RecordingPlan, display: &str, width: u16, height: u16
             "-filter_complex_threads",
             "1",
             "-y",
-            "-thread_queue_size",
-            "512",
+            // No input -thread_queue_size: FFmpeg 9 only accepts it as a
+            // muxer (output) option and aborts with exit status 234.
             "-f",
             "x11grab",
             "-framerate",
@@ -514,11 +513,9 @@ fn recorder_command(plan: &RecordingPlan, display: &str, width: u16, height: u16
         .arg(format!("{width}x{height}"))
         .args(["-draw_mouse", "1", "-i"])
         .arg(format!("{display}+0,0"));
-    for source in [&plan.monitor, &plan.microphone] {
+    for source in std::iter::once(&plan.monitor).chain(plan.microphone.as_ref()) {
         command
             .args([
-                "-thread_queue_size",
-                "512",
                 "-f",
                 "pulse",
                 "-sample_rate",
@@ -529,10 +526,17 @@ fn recorder_command(plan: &RecordingPlan, display: &str, width: u16, height: u16
             ])
             .arg(source);
     }
-    command.args([
-        "-filter_complex", "[1:a]aresample=async=1:first_pts=0[system];[2:a]aresample=async=1:first_pts=0[mic];[system][mic]amix=inputs=2:duration=longest:dropout_transition=0:normalize=1[audio]",
-        "-map", "0:v:0", "-map", "[audio]",
-    ]);
+    if plan.microphone.is_some() {
+        command.args([
+            "-filter_complex", "[1:a]aresample=async=1:first_pts=0[system];[2:a]aresample=async=1:first_pts=0[mic];[system][mic]amix=inputs=2:duration=longest:dropout_transition=0:normalize=1[audio]",
+            "-map", "0:v:0", "-map", "[audio]",
+        ]);
+    } else {
+        command.args([
+            "-filter_complex", "[1:a]aresample=async=1:first_pts=0[audio]",
+            "-map", "0:v:0", "-map", "[audio]",
+        ]);
+    }
     append_encoder_args(&mut command, &plan.encoder, width, height);
     command
         .args([
@@ -692,7 +696,9 @@ impl Aurora {
                 ));
             }
             None => {
-                let (width, height) = (self.screen_width, self.screen_height);
+                // Physical root size: scaling the logical size back up can
+                // round past the screen edge (2048x1537 at 175%).
+                let (width, height) = self.native_screen_size();
                 let duration_limit = self.recording_max_duration;
                 let (tx, result) = mpsc::channel();
                 thread::spawn(move || {
@@ -787,12 +793,8 @@ impl Aurora {
                     self.conn.unmap_window(self.ui.recording_notice)?;
                     self.conn.sync()?;
                     changed = true;
-                    match start_recording(
-                        plan,
-                        &self.display,
-                        self.screen_width,
-                        self.screen_height,
-                    ) {
+                    let (width, height) = self.native_screen_size();
+                    match start_recording(plan, &self.display, width, height) {
                         Ok(process) => Some(RecordingState::Running(process)),
                         Err(error) => {
                             self.recording_error(error);
@@ -1014,9 +1016,15 @@ impl Aurora {
             25.0,
             Color::rgb(25, 42, 51),
         );
+        let audio = match self.recording.as_ref() {
+            Some(RecordingState::Countdown { plan, .. }) if plan.microphone.is_none() => {
+                "System audio (no microphone)"
+            }
+            _ => "System audio + microphone",
+        };
         canvas.draw_text_center(
             &self.regular,
-            "System audio + microphone",
+            audio,
             i32::from(width / 2),
             74,
             15.0,
@@ -1044,21 +1052,24 @@ mod tests {
         let sources = "1 speakers.monitor PipeWire s16le 2ch 48000Hz RUNNING\n2 microphone PipeWire s16le 2ch 48000Hz RUNNING\n3 usb_microphone PipeWire s16le 2ch 48000Hz RUNNING";
         assert_eq!(
             select_audio_sources(sources, "speakers", "usb_microphone").unwrap(),
-            ("speakers.monitor".into(), "usb_microphone".into())
+            ("speakers.monitor".into(), Some("usb_microphone".into()))
         );
         assert_eq!(
             select_audio_sources(sources, "speakers", "speakers.monitor")
                 .unwrap()
-                .1,
-            "microphone"
+                .1
+                .as_deref(),
+            Some("microphone")
         );
-        assert!(
+        assert_eq!(
             select_audio_sources(
                 "1 speakers.monitor PipeWire",
                 "speakers",
                 "speakers.monitor"
             )
-            .is_err()
+            .unwrap()
+            .1,
+            None
         );
         assert!(select_audio_sources(sources, "missing", "microphone").is_err());
     }
@@ -1068,7 +1079,7 @@ mod tests {
         let plan = RecordingPlan {
             path: PathBuf::from("/tmp/test recording.mp4"),
             monitor: "speakers.monitor".into(),
-            microphone: "microphone".into(),
+            microphone: Some("microphone".into()),
             reserved: false,
             encoder: VideoEncoder::Software,
             duration_limit: Duration::from_secs(1800),
@@ -1178,7 +1189,7 @@ mod tests {
         let plan = RecordingPlan {
             path: PathBuf::from("/tmp/test recording.mp4"),
             monitor: "speakers.monitor".into(),
-            microphone: "microphone".into(),
+            microphone: Some("microphone".into()),
             reserved: false,
             encoder: VideoEncoder::Vaapi(PathBuf::from("/dev/dri/renderD128")),
             duration_limit: Duration::from_secs(3600),

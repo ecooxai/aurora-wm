@@ -180,7 +180,7 @@ impl Aurora {
         Ok(should_redraw)
     }
 
-    pub(crate) fn handle_dock_settings_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
+    pub(crate) fn handle_multitask_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let width = i32::from(self.settings_geometry().2);
         if x >= SIDEBAR_WIDTH + 24 && x <= width - 24 && (86..=132).contains(&y) {
             self.settings.dock_in_topbar = !self.settings.dock_in_topbar;
@@ -188,6 +188,26 @@ impl Aurora {
             self.hide_app_menu()?;
             self.hide_dock_more_menu()?;
             self.redraw_dock()?;
+            self.redraw_topbar()?;
+            self.redraw_settings()?;
+            self.raise_ui()?;
+            return Ok(());
+        }
+        if let Some(index) = multitask_icon_at(x, y, width) {
+            let icons = &mut self.settings.topbar_icons;
+            let flag = match index {
+                0 => &mut icons.keyboard,
+                1 => &mut icons.clipboard,
+                2 => &mut icons.screenshot,
+                3 => &mut icons.recording,
+                4 => &mut icons.display,
+                5 => &mut icons.audio,
+                _ => &mut icons.wifi,
+            };
+            *flag = !*flag;
+            save_app_commands(&self.settings)?;
+            self.hide_app_menu()?;
+            self.hide_clipboard_menu()?;
             self.redraw_topbar()?;
             self.redraw_settings()?;
             self.raise_ui()?;
@@ -220,13 +240,14 @@ impl Aurora {
                 6 => Some(SettingsTab::Startup),
                 7 => Some(SettingsTab::Apps),
                 8 => Some(SettingsTab::Shortcuts),
-                9 => Some(SettingsTab::About),
-                10 => Some(SettingsTab::Dock),
+                9 => Some(SettingsTab::Multitask),
+                10 => Some(SettingsTab::About),
                 _ => None,
             };
             if let Some(tab) = tab {
                 self.settings.tab = tab;
                 self.settings.scroll = 0;
+                self.settings.display_dropdown_open = false;
                 if tab == SettingsTab::Network {
                     self.ensure_wifi_refresh_started(false);
                 }
@@ -240,7 +261,7 @@ impl Aurora {
         }
 
         match self.settings.tab {
-            SettingsTab::Dock => self.handle_dock_settings_click(x, y)?,
+            SettingsTab::Multitask => self.handle_multitask_click(x, y)?,
             SettingsTab::Display => self.handle_display_click(x, y)?,
             SettingsTab::Power => self.handle_power_click(x, y)?,
             SettingsTab::Wallpaper => self.handle_wallpaper_click(y)?,
@@ -277,14 +298,14 @@ impl Aurora {
                 (lines.saturating_sub(4) * 24) as i32
             }
             SettingsTab::Startup | SettingsTab::About => 180,
-            SettingsTab::Shortcuts | SettingsTab::Dock => 0,
+            SettingsTab::Shortcuts | SettingsTab::Multitask => 0,
             SettingsTab::Audio | SettingsTab::Wallpaper => 80,
             SettingsTab::Apps => self
                 .available_apps(self.settings.app_kind)
                 .len()
                 .saturating_sub(6)
                 .saturating_mul(29) as i32,
-            SettingsTab::Display => 120,
+            SettingsTab::Display => 0,
             SettingsTab::Power | SettingsTab::Bluetooth => 40,
         };
         let old_scroll = self.settings.scroll;
@@ -341,28 +362,66 @@ impl Aurora {
     }
 
     pub(crate) fn handle_display_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
-        let sx = SIDEBAR_WIDTH + 24;
-        if x >= sx + 14 && x <= i32::from(self.settings_geometry().2) - 24 {
-            for idx in 0..self.display_modes.len().min(4) {
-                let row_y = 132 + idx as i32 * 25;
-                if y >= row_y - 6 && y <= row_y + 18 {
-                    self.settings.selected_mode = idx;
+        let width = i32::from(self.settings_geometry().2);
+        let l = DisplayLayout::new(width);
+        // An open resolution list takes the click: pick a mode, or close it.
+        if self.settings.display_dropdown_open {
+            self.settings.display_dropdown_open = false;
+            if let Some(idx) = l.list_row_at(x, y, self.display_modes.len()) {
+                if idx != self.settings.selected_mode {
                     self.apply_display_mode(idx);
-                    self.redraw_settings()?;
-                    return Ok(());
                 }
             }
+            self.redraw_settings()?;
+            return Ok(());
         }
-        let compositor_switch_x = i32::from(self.settings_geometry().2) - 78;
-        if y >= 274 && y <= 302 && x >= compositor_switch_x && x <= compositor_switch_x + 40 {
+        // Scale (GDK_SCALE) 1x / 2x / 3x: save it, then re-exec with the variable set.
+        if let Some(idx) = l.scale_seg_at(x, y) {
+            let scale = GDK_SCALE_CHOICES[idx];
+            if scale != crate::scale::gdk_scale() {
+                self.settings.gdk_scale = scale;
+                save_app_commands(&self.settings)?;
+                let value = scale.to_string();
+                self.restart_in_place_with(&[("GDK_SCALE", value.as_str())]);
+            }
+            self.redraw_settings()?;
+            return Ok(());
+        }
+        if l.in_dropdown_button(x, y) {
+            self.settings.display_dropdown_open = true;
+            self.redraw_settings()?;
+            return Ok(());
+        }
+        if let Some(idx) = l.seg_at(x, y) {
+            let (mode, label) = ROTATION_CHOICES[idx];
+            self.settings.display_status = Some(match set_rotation_mode(mode) {
+                Ok(()) if mode == RotationMode::Auto && !accelerometer_available() => {
+                    "Auto on, but no accelerometer this boot".to_string()
+                }
+                Ok(()) if mode == RotationMode::Auto => "Auto rotate on".to_string(),
+                Ok(()) if mode == RotationMode::Normal => "Rotation off: upright".to_string(),
+                Ok(()) => format!("Rotation locked at {label}"),
+                Err(err) => err,
+            });
+            self.redraw_settings()?;
+            return Ok(());
+        }
+        if (l.refresh_y - 6..=l.refresh_y + 26).contains(&y) && x >= l.switch_x - 4 && x <= l.switch_x + 44 {
             self.set_compositor_enabled(!self.settings.compositor_enabled)?;
             self.redraw_settings()?;
             return Ok(());
         }
-        let bar_x = sx + 16;
-        let bar_w = 230;
-        if x >= bar_x && x <= bar_x + bar_w && (404..=432).contains(&y) {
-            let percent = (10 + ((x - bar_x) * 90) / bar_w).clamp(10, 100) as u8;
+        let in_bright_row = (l.bar_y - 10..=l.bar_y + 22).contains(&y);
+        let plus_hit = in_bright_row && x >= l.bright_plus_x - 6 && x <= l.bright_plus_x + 34;
+        if plus_hit
+            || (in_bright_row && x >= l.bar_x - 6 && x <= l.bar_x + l.bar_w + 6)
+        {
+            let percent = if plus_hit {
+                // Step up to the next multiple of 10.
+                ((self.settings.brightness_percent / 10 + 1) * 10).min(100)
+            } else {
+                (10 + ((x - l.bar_x).clamp(0, l.bar_w) * 90) / l.bar_w).clamp(10, 100) as u8
+            };
             self.settings.brightness_percent = percent;
             self.settings.display_status = match self.apply_brightness_all(percent) {
                 Ok(()) => Some(format!("Brightness set to {percent}%")),
@@ -372,14 +431,14 @@ impl Aurora {
             self.redraw_settings()?;
             return Ok(());
         }
-        if y >= 509 && y <= 542 {
-            if x >= sx + 16 && x <= sx + 50 {
+        if (l.sleep_y - 2..=l.sleep_y + 30).contains(&y) {
+            if x >= l.minus_x - 4 && x <= l.minus_x + 32 {
                 self.settings.sleep_after_secs =
                     self.settings.sleep_after_secs.saturating_sub(60).max(0);
                 self.apply_sleep_timeout();
                 save_app_commands(&self.settings)?;
                 self.redraw_settings()?;
-            } else if x >= sx + 174 && x <= sx + 212 {
+            } else if x >= l.plus_x - 4 && x <= l.plus_x + 32 {
                 self.settings.sleep_after_secs = (self.settings.sleep_after_secs + 60).min(7200);
                 self.apply_sleep_timeout();
                 save_app_commands(&self.settings)?;
@@ -451,6 +510,13 @@ impl Aurora {
     pub(crate) fn handle_network_click(&mut self, x: i32, y: i32) -> AnyResult<()> {
         let sx = SIDEBAR_WIDTH + 24;
         let card_w = i32::from(self.settings_geometry().2) - sx - 24;
+
+        if self.network_restart_button_hit(x, y) {
+            if self.net_restart_rx.is_none() {
+                self.show_command_confirm(crate::session_actions::SessionAction::NetworkRestart)?;
+            }
+            return Ok(());
+        }
 
         // Clicks on the Refresh text button next to Wi-Fi title
         if y >= 273 && y <= 297 && x >= sx + 75 && x <= sx + 133 {
@@ -751,4 +817,20 @@ impl Aurora {
         Ok(())
     }
 
+}
+
+/// Index into `multitask_icon_items` of the switch row under (x, y), if any.
+fn multitask_icon_at(x: i32, y: i32, width: i32) -> Option<usize> {
+    let left = SIDEBAR_WIDTH + 24 + 16;
+    let col_w = (width - SIDEBAR_WIDTH - 24 - 24 - 32) / 2;
+    if x < left || x >= left + 2 * col_w {
+        return None;
+    }
+    if y < MULTITASK_ROW_Y || y >= MULTITASK_ROW_Y + 4 * MULTITASK_ROW_H {
+        return None;
+    }
+    let col = (x - left) / col_w;
+    let row = (y - MULTITASK_ROW_Y) / MULTITASK_ROW_H;
+    let index = (row * 2 + col) as usize;
+    (index < 7).then_some(index)
 }

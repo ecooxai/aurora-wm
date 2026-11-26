@@ -26,6 +26,16 @@ fn duration_label(duration: Duration) -> String {
         .unwrap_or_else(|| format!("{} minutes", duration.as_secs() / 60))
 }
 
+/// Timer inside the square topbar button: MM:SS, then e.g. 2h05 past 99 minutes.
+fn topbar_elapsed_label(seconds: u64) -> String {
+    if seconds < 100 * 60 {
+        format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}", seconds / 3600, seconds / 60 % 60)
+    }
+}
+
+#[allow(dead_code)]
 fn elapsed_label(seconds: u64) -> String {
     if seconds < 3600 {
         format!("{:02}:{:02}", seconds / 60, seconds % 60)
@@ -42,9 +52,9 @@ fn elapsed_label(seconds: u64) -> String {
 impl Aurora {
     pub(crate) fn recording_button_contains(&self, x: i32, y: i32) -> bool {
         let controls = self.topbar_controls();
-        (controls.recording_x - controls.recording_half_width
-            ..=controls.recording_x + controls.recording_half_width)
-            .contains(&x)
+        // Slightly larger than the tile so taps near its edge still count.
+        let reach = controls.recording_half_width + 4;
+        (controls.recording_x - reach..=controls.recording_x + reach).contains(&x)
             && (0..i32::from(TOPBAR_HEIGHT)).contains(&y)
     }
 
@@ -66,27 +76,35 @@ impl Aurora {
     }
 
     pub(crate) fn draw_topbar_recording_icon(&self, c: &mut Canvas, controls: &TopbarControls) {
+        // A square tile the size of the display icon. Idle: light blue with a
+        // red record dot. Recording: green with the elapsed MM:SS inside;
+        // preparing/countdown/saving keep the blue tile with a short label.
+        let size = TOPBAR_RECORD_SIZE;
+        let cx = controls.recording_x;
+        let x = cx - size / 2;
+        let y = 20 - size / 2;
         let Some(state) = self.recording.as_ref() else {
-            draw_record_icon(c, controls.recording_x, 20, BLUE_LIGHT);
+            c.draw_round_rect(x, y, size, size, 5, BLUE_LIGHT);
+            c.draw_circle(cx, 20, 7, Color::rgb(236, 248, 255));
+            c.draw_circle(cx, 20, 5, RECORD_DOT_LIGHT);
             return;
         };
-        // The timer is part of the camcorder body. Keep the control wide for all
-        // active stages so a press never moves while preparation finishes.
-        let x = controls.recording_x - controls.recording_half_width + 4;
-        let width = controls.recording_half_width * 2 - 22;
-        let color = if state.is_recording() { RED_LIGHT } else { BLUE_LIGHT };
-        draw_record_camera(c, x, 20, width, color);
+        let fill = if state.is_recording() { RECORD_GREEN } else { BLUE_LIGHT };
+        c.draw_round_rect(x, y, size, size, 5, fill);
         let label = state
             .elapsed()
-            .map(|elapsed| elapsed_label(elapsed.as_secs()))
+            .map(|elapsed| topbar_elapsed_label(elapsed.as_secs()))
             .unwrap_or_else(|| match state {
-                crate::screen_record::RecordingState::Preparing { .. } => "…".to_string(),
                 crate::screen_record::RecordingState::Countdown { shown, .. } => shown.to_string(),
-                _ => "Saving".to_string(),
+                _ => "…".to_string(),
             });
-        // Center the visible glyph bounds, including descenders in "Saving",
-        // so the 12px text stays inside the shared 16px camera height.
-        let scale = Scale::uniform(12.0);
+        // Largest size that keeps the label inside the tile with a 2 px margin.
+        let mut font_size = if label.chars().count() <= 2 { 14.0 } else { 9.5 };
+        while font_size > 6.0 && measure_text(&self.bold, &label, font_size) > size - 4 {
+            font_size -= 0.5;
+        }
+        // Centre the visible glyph bounds vertically.
+        let scale = Scale::uniform(font_size);
         let ascent = self.bold.v_metrics(scale).ascent;
         let bounds = self
             .bold
@@ -101,7 +119,7 @@ impl Aurora {
         let label_y = bounds
             .map(|(top, bottom)| 20 - (top + bottom) / 2)
             .unwrap_or(14);
-        c.draw_text_center(&self.bold, &label, x + width / 2, label_y, 12.0, INK);
+        c.draw_text_center(&self.bold, &label, cx, label_y, font_size, INK);
     }
 
     pub(crate) fn press_recording_button(&mut self) -> AnyResult<()> {

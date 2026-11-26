@@ -62,10 +62,10 @@ use crate::textutil::*;
 use crate::procutil::*;
 use crate::files::*;
 
-pub(crate) fn draw_card(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32) {
-    c.draw_round_rect(x, y, w, h, 12, Color::rgba(255, 255, 255, 184));
-    c.draw_round_rect(x, y, w, h, 12, Color::rgba(214, 230, 237, 42));
-    c.draw_rect(x + 12, y, w - 24, 1, CARD_LINE);
+/// A settings section: no inner panel, content sits on the window surface,
+/// separated from the section above by a hairline.
+pub(crate) fn draw_card(c: &mut Canvas, x: i32, y: i32, w: i32, _h: i32) {
+    c.draw_rect(x, y, w, 1, CARD_LINE);
 }
 
 pub(crate) fn draw_metric_bar(
@@ -458,27 +458,6 @@ pub(crate) fn draw_workspace_icon(c: &mut Canvas, x: i32, y: i32, active: bool) 
     );
 }
 
-pub(crate) fn draw_add_workspace_icon(c: &mut Canvas, x: i32, cy: i32) {
-    c.draw_round_rect(
-        x,
-        cy - WORKSPACE_SIZE / 2,
-        WORKSPACE_SIZE,
-        WORKSPACE_SIZE,
-        6,
-        Color::rgba(160, 238, 220, 38),
-    );
-    draw_round_line(c, x + 5, cy, x + WORKSPACE_SIZE - 5, cy, 2, MINT_LIGHT);
-    draw_round_line(
-        c,
-        x + WORKSPACE_SIZE / 2,
-        cy - 7,
-        x + WORKSPACE_SIZE / 2,
-        cy + 7,
-        2,
-        MINT_LIGHT,
-    );
-}
-
 pub(crate) fn draw_sparkline(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, value: f64, color: Color) {
     if w <= 4 {
         return;
@@ -511,7 +490,8 @@ pub(crate) fn draw_sidebar_icon(c: &mut Canvas, idx: usize, cx: i32, cy: i32, co
         6 => draw_sidebar_startup_icon(c, cx, cy, color),
         7 => draw_sidebar_apps_icon(c, cx, cy, color),
         8 => draw_sidebar_keyboard_icon(c, cx, cy, color),
-        9 => draw_sidebar_about_icon(c, cx, cy, color),
+        9 => draw_sidebar_multitask_icon(c, cx, cy, color),
+        10 => draw_sidebar_about_icon(c, cx, cy, color),
         _ => {
             c.draw_round_rect(cx - 14, cy - 6, 28, 14, 4, Color::rgba(color.r, color.g, color.b, 70));
             for offset in [-8, 0, 8] { c.draw_round_rect(cx + offset - 2, cy - 2, 5, 5, 1, color); }
@@ -562,46 +542,33 @@ pub(crate) fn draw_arc(
     let ep0 = get_end_point(start_degrees);
     let ep1 = get_end_point(end_degrees);
 
-    for y in y_min..y_max {
-        for x in x_min..x_max {
-            let dx = x as f32 - cx as f32;
-            let dy = y as f32 - cy as f32;
-            let d_center = (dx * dx + dy * dy).sqrt();
+    let s = c.s;
+    c.shade(x_min, y_min, x_max, y_max, color, |x, y| {
+        let dx = x - cx as f32;
+        let dy = y - cy as f32;
+        let d_center = (dx * dx + dy * dy).sqrt();
 
-            let mut angle = dy.atan2(dx).to_degrees();
-            if angle < 0.0 {
-                angle += 360.0;
-            }
-
-            let in_angle_range = if start_degrees <= end_degrees {
-                angle >= start_degrees && angle <= end_degrees
-            } else {
-                angle >= start_degrees || angle <= end_degrees
-            };
-
-            let d = if in_angle_range {
-                (d_center - r).abs()
-            } else {
-                let d0 = ((x as f32 - ep0.0).powi(2) + (y as f32 - ep0.1).powi(2)).sqrt();
-                let d1 = ((x as f32 - ep1.0).powi(2) + (y as f32 - ep1.1).powi(2)).sqrt();
-                d0.min(d1)
-            };
-
-            let coverage = if d <= half_t - 0.5 {
-                1.0
-            } else if d >= half_t + 0.5 {
-                0.0
-            } else {
-                half_t + 0.5 - d
-            };
-
-            if coverage > 0.0 {
-                let mut blended = color;
-                blended.a = (color.a as f32 * coverage).round() as u8;
-                c.blend_pixel(x, y, blended);
-            }
+        let mut angle = dy.atan2(dx).to_degrees();
+        if angle < 0.0 {
+            angle += 360.0;
         }
-    }
+
+        let in_angle_range = if start_degrees <= end_degrees {
+            angle >= start_degrees && angle <= end_degrees
+        } else {
+            angle >= start_degrees || angle <= end_degrees
+        };
+
+        let d = if in_angle_range {
+            (d_center - r).abs()
+        } else {
+            let d0 = ((x - ep0.0).powi(2) + (y - ep0.1).powi(2)).sqrt();
+            let d1 = ((x - ep1.0).powi(2) + (y - ep1.1).powi(2)).sqrt();
+            d0.min(d1)
+        };
+        // Anti-aliasing ramp one physical pixel wide.
+        ((half_t - d) * s + 0.5).clamp(0.0, 1.0)
+    });
 }
 
 pub(crate) fn draw_sidebar_tile(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -641,7 +608,8 @@ pub(crate) fn draw_sidebar_display_icon(c: &mut Canvas, cx: i32, cy: i32, color:
     };
 
     let (outer_x, outer_y, outer_w, outer_h, inner_x, inner_y, inner_w, inner_h) = if is_topbar {
-        (cx - 11, cy - 10, 22, 20, cx - 8, cy - 7, 16, 14)
+        let s = TOPBAR_ICON_SIZE;
+        (cx - s / 2, cy - s / 2, s, s, cx - s / 2 + 3, cy - s / 2 + 3, s - 6, s - 6)
     } else {
         (cx - 9, cy - 7, 18, 14, cx - 7, cy - 5, 14, 10)
     };
@@ -818,6 +786,13 @@ pub(crate) fn draw_sidebar_keyboard_icon(c: &mut Canvas, cx: i32, cy: i32, color
         }
     }
     c.draw_rect(cx - 5, cy + 3, 10, 2, accent_color);
+}
+
+/// Multitask: four tiles in a 2x2 grid.
+pub(crate) fn draw_sidebar_multitask_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    for (dx, dy) in [(-10, -10), (2, -10), (-10, 2), (2, 2)] {
+        c.draw_round_rect(cx + dx, cy + dy, 8, 8, 2, color);
+    }
 }
 
 pub(crate) fn draw_sidebar_about_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -1041,13 +1016,48 @@ pub(crate) fn draw_screenshot_icon(c: &mut Canvas, cx: i32, cy: i32, color: Colo
         color
     };
     let (x, y, w, h, lens) = if color == MINT_LIGHT {
-        (cx - 11, cy - 10, 22, 21, 6)
+        let s = TOPBAR_ICON_SIZE;
+        (cx - s / 2, cy - s / 2, s, s, 6)
     } else {
         (cx - 10, cy - 8, 20, 16, 4)
     };
     c.draw_round_rect(x, y, w, h, 5, fill);
     c.draw_circle(cx, cy, lens, Color::rgba(255, 255, 255, 210));
     c.draw_circle(cx, cy, (lens - 2).max(2), fill);
+}
+
+/// Select all: a dashed square outline.
+pub(crate) fn draw_select_all_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
+    let (x0, y0) = (cx - 8, cy - 8);
+    let (x1, y1) = (cx + 8, cy + 8);
+    for offset in (0..16).step_by(5) {
+        let len = (offset + 3).min(16) - offset;
+        c.draw_rect(x0 + offset, y0, len, 2, color);
+        c.draw_rect(x0 + offset, y1 - 2, len, 2, color);
+        c.draw_rect(x0, y0 + offset, 2, len, color);
+        c.draw_rect(x1 - 2, y0 + offset, 2, len, color);
+    }
+}
+
+/// Undo (or redo): a half-turn arc over the top, ending in a downward arrowhead.
+pub(crate) fn draw_undo_icon(c: &mut Canvas, cx: i32, cy: i32, redo: bool, color: Color) {
+    let radius = 6.5_f64;
+    let dir = if redo { -1.0 } else { 1.0 };
+    let (ox, oy) = (f64::from(cx), f64::from(cy + 2));
+    let mut prev: Option<(i32, i32)> = None;
+    for step in 0..=18 {
+        let theta = std::f64::consts::PI * f64::from(step) / 18.0;
+        let x = (ox + dir * radius * theta.cos()).round() as i32;
+        let y = (oy - radius * theta.sin()).round() as i32;
+        if let Some((px, py)) = prev {
+            c.draw_line(px, py, x, y, 2, color);
+        }
+        prev = Some((x, y));
+    }
+    if let Some((tx, ty)) = prev {
+        c.draw_line(tx, ty, tx - 4, ty - 4, 2, color);
+        c.draw_line(tx, ty, tx + 4, ty - 4, 2, color);
+    }
 }
 
 pub(crate) fn draw_clipboard_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color) {
@@ -1062,10 +1072,13 @@ pub(crate) fn draw_clipboard_icon(c: &mut Canvas, cx: i32, cy: i32, color: Color
         Color::rgba(255, 255, 255, 150)
     };
     if color == MINT_LIGHT {
-        c.draw_round_rect(cx - 10, cy - 7, 20, 18, 5, fill);
-        c.draw_round_rect(cx - 6, cy - 3, 12, 11, 2, paper);
-        c.draw_round_rect(cx - 6, cy - 11, 12, 7, 4, fill);
-        c.draw_round_rect(cx - 3, cy - 9, 6, 2, 1, paper);
+        // Square tile; the clip sits inside the top edge so the footprint
+        // stays TOPBAR_ICON_SIZE square like its neighbours.
+        let s = TOPBAR_ICON_SIZE;
+        c.draw_round_rect(cx - s / 2, cy - s / 2, s, s, 5, fill);
+        c.draw_round_rect(cx - 7, cy - 5, 14, 13, 2, paper);
+        c.draw_round_rect(cx - 5, cy - 8, 10, 5, 2, fill);
+        c.draw_round_rect(cx - 3, cy - 7, 6, 2, 1, paper);
     } else {
         c.draw_round_rect(cx - 8, cy - 6, 16, 16, 4, fill);
         c.draw_round_rect(cx - 5, cy - 3, 10, 10, 2, paper);
@@ -1246,28 +1259,18 @@ pub(crate) fn draw_speaker_icon_small(c: &mut Canvas, cx: i32, cy: i32, color: C
     let top_left = cy - base_h / 2;
     let bottom_left = cy + base_h / 2;
 
-    for y in y_start..=y_end {
-        for x in x_start..=x_end {
-            let x_f = x as f32;
-            let y_f = y as f32;
+    let s = c.s;
+    c.shade(x_start, y_start, x_end + 1, y_end + 1, base_color, |x_f, y_f| {
+        let top_y =
+            top_left as f32 - (x_f - x_start as f32) * ((top_left - y_start) as f32 / cone_w);
+        let bottom_y = bottom_left as f32
+            + (x_f - x_start as f32) * ((y_end - bottom_left) as f32 / cone_w);
 
-            let top_y =
-                top_left as f32 - (x_f - x_start as f32) * ((top_left - y_start) as f32 / cone_w);
-            let bottom_y = bottom_left as f32
-                + (x_f - x_start as f32) * ((y_end - bottom_left) as f32 / cone_w);
+        let coverage_top = ((y_f - top_y) * s + 0.5).clamp(0.0, 1.0);
+        let coverage_bottom = ((bottom_y - y_f) * s + 0.5).clamp(0.0, 1.0);
+        let coverage_left = ((x_f - (cx - 5) as f32) * s + 0.5).clamp(0.0, 1.0);
+        let coverage_right = (((cx + 5) as f32 - x_f) * s + 0.5).clamp(0.0, 1.0);
 
-            let coverage_top = (y_f - top_y + 0.5).clamp(0.0, 1.0);
-            let coverage_bottom = (bottom_y - y_f + 0.5).clamp(0.0, 1.0);
-            let coverage_left = (x_f - (cx - 5) as f32 + 0.5).clamp(0.0, 1.0);
-            let coverage_right = ((cx + 5) as f32 - x_f + 0.5).clamp(0.0, 1.0);
-
-            let coverage = coverage_top * coverage_bottom * coverage_left * coverage_right;
-
-            if coverage > 0.0 {
-                let mut blended = base_color;
-                blended.a = (base_color.a as f32 * coverage).round() as u8;
-                c.blend_pixel(x, y, blended);
-            }
-        }
-    }
+        coverage_top * coverage_bottom * coverage_left * coverage_right
+    });
 }

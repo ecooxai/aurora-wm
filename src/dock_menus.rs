@@ -163,6 +163,7 @@ impl Aurora {
         if self.app_menu_visible {
             self.hide_dock_more_menu()?;
             self.app_menu_more = false;
+            self.app_menu_power_open = false;
             self.app_menu_scroll = 0;
             self.app_menu_query.clear();
             self.app_menu_expanded_categories.clear();
@@ -204,6 +205,7 @@ impl Aurora {
         if self.app_menu_visible {
             self.app_menu_visible = false;
             self.app_menu_more = false;
+            self.app_menu_power_open = false;
             self.app_menu_scroll = 0;
             self.app_menu_query.clear();
             self.app_menu_expanded_categories.clear();
@@ -368,6 +370,7 @@ impl Aurora {
             self.hide_dock_more_menu()?;
             self.app_menu_visible = false;
             self.app_menu_more = false;
+            self.app_menu_power_open = false;
             self.app_menu_scroll = 0;
             self.app_menu_query.clear();
             self.app_menu_expanded_categories.clear();

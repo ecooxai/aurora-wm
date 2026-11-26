@@ -323,6 +323,54 @@ impl Aurora {
         Ok(())
     }
 
+    /// Whether the window with keyboard focus uses Ctrl+Shift for copy and paste.
+    pub(crate) fn focused_app_is_terminal(&self) -> AnyResult<bool> {
+        let focused = self.conn.get_input_focus()?.reply()?.focus;
+        let class = if focused == self.ui.folder_terminal {
+            "aurora-terminal".to_string()
+        } else {
+            let target = self.client_key_for(focused).or(self.active_client);
+            target.map(|window| self.window_class(window)).unwrap_or_default()
+        };
+        Ok(terminal_uses_native_paste_shortcut(&class))
+    }
+
+    /// Presses `modifiers` then `key` at the focused window through XTEST, then releases them.
+    pub(crate) fn send_key_chord(&self, modifiers: &[u32], key: u32) -> AnyResult<()> {
+        if self
+            .conn
+            .extension_information(xtest::X11_EXTENSION_NAME)?
+            .is_none()
+        {
+            eprintln!("aurora-wm: cannot send keys: XTEST extension is unavailable");
+            return Ok(());
+        }
+        let mut modifier_codes = Vec::with_capacity(modifiers.len());
+        for &keysym in modifiers {
+            let Some(code) = self.keycode_for_keysym(keysym)? else {
+                return Ok(());
+            };
+            modifier_codes.push(code);
+        }
+        let Some(key_code) = self.keycode_for_keysym(key)? else {
+            return Ok(());
+        };
+        for &code in &modifier_codes {
+            self.conn
+                .xtest_fake_input(KEY_PRESS_EVENT, code, CURRENT_TIME, self.root, 0, 0, 0)?;
+        }
+        self.conn
+            .xtest_fake_input(KEY_PRESS_EVENT, key_code, CURRENT_TIME, self.root, 0, 0, 0)?;
+        self.conn
+            .xtest_fake_input(KEY_RELEASE_EVENT, key_code, CURRENT_TIME, self.root, 0, 0, 0)?;
+        for &code in modifier_codes.iter().rev() {
+            self.conn
+                .xtest_fake_input(KEY_RELEASE_EVENT, code, CURRENT_TIME, self.root, 0, 0, 0)?;
+        }
+        self.conn.flush()?;
+        Ok(())
+    }
+
     pub(crate) fn paste_clipboard_into_focused_app(&self) -> AnyResult<()> {
         if self
             .conn
@@ -333,14 +381,7 @@ impl Aurora {
             return Ok(());
         }
 
-        let focused = self.conn.get_input_focus()?.reply()?.focus;
-        let class = if focused == self.ui.folder_terminal {
-            "aurora-terminal".to_string()
-        } else {
-            let target = self.client_key_for(focused).or(self.active_client);
-            target.map(|window| self.window_class(window)).unwrap_or_default()
-        };
-        let terminal = terminal_uses_native_paste_shortcut(&class);
+        let terminal = self.focused_app_is_terminal()?;
 
         let Some(control) = self
             .keycode_for_keysym(0xffe3)?

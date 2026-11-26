@@ -207,6 +207,26 @@ pub(crate) fn read_text_clipboard() -> Option<String> {
     None
 }
 
+/// Text selected in the focused window (X PRIMARY). Used only for the clipboard menu preview;
+/// it is never recorded in the history.
+pub(crate) fn read_primary_selection() -> Option<String> {
+    let commands: [(&str, &[&str]); 2] = [
+        ("xclip", &["-selection", "primary", "-o"]),
+        ("xsel", &["--primary", "--output"]),
+    ];
+    for (name, args) in commands {
+        if !command_exists(name) {
+            continue;
+        }
+        if let Some(output) = command_output_timeout(name, args, CLIPBOARD_COMMAND_TIMEOUT) {
+            if output.status.success() {
+                return Some(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn read_image_clipboard() -> Option<(PathBuf, u64)> {
     let target = clipboard_image_target()?;
     let output = command_output_timeout(

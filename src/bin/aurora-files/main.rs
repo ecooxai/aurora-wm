@@ -7,6 +7,9 @@
 //!   aurora-files --terminal    open with the terminal focused
 //!   aurora-files --register-default   register as default file manager
 
+#[path = "../../scale.rs"]
+#[allow(dead_code)]
+mod scale;
 mod canvas;
 mod fsmodel;
 mod imgwin;
@@ -41,7 +44,7 @@ const FONT_BOLD: &[u8] = include_bytes!("../../../fonts/NotoSans-Bold.ttf");
 const FONT_MONO: &[u8] = include_bytes!("../../../fonts/NotoSansMono-Regular.ttf");
 
 const HEADER_H: i32 = 74;
-const SIDEBAR_W: i32 = 172;
+const SIDEBAR_W: i32 = 120;
 const TAB_BAR_H: i32 = 30;
 const ROW_H: i32 = 34;
 const CELL_W: i32 = 8;
@@ -215,7 +218,7 @@ enum PendingOpen {
 }
 
 struct App {
-    conn: RustConnection,
+    conn: scale::ScaledConn,
     display: String,
     root: Window,
     window: Window,
@@ -584,11 +587,23 @@ fn run(args: &[String]) -> AnyResult<()> {
     let viewer_only = args.iter().any(|arg| arg == "--image-viewer");
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
     let (conn, screen_num) = RustConnection::connect(None)?;
-    let screen = conn.setup().roots[screen_num].clone();
+    // HiDPI, GTK convention: GDK_SCALE (1, 2 or 3; GTK's default is 1) is the
+    // whole-number scale. Lay out in logical pixels and let ScaledConn/Canvas
+    // render at the panel's native resolution.
+    let ui_scale = std::env::var("GDK_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| (1..=3).contains(v))
+        .unwrap_or(1) as f32;
+    scale::set_ui_scale(ui_scale);
+    let conn = scale::ScaledConn(conn);
+    let mut screen = conn.setup().roots[screen_num].clone();
+    screen.width_in_pixels = scale::lg_len(u32::from(screen.width_in_pixels)) as u16;
+    screen.height_in_pixels = scale::lg_len(u32::from(screen.height_in_pixels)) as u16;
     let window = conn.generate_id()?;
-    let compact_size = (screen.width_in_pixels / 3)
-        .clamp(360, 500)
-        .min(screen.height_in_pixels.saturating_sub(80));
+    let compact_size = (screen.width_in_pixels / 2)
+        .clamp(540, 750)
+        .min(screen.width_in_pixels.saturating_sub(24));
     let width = if picker_mode { 760.min(screen.width_in_pixels.saturating_sub(24)) } else { compact_size };
     let height = (screen.height_in_pixels * 4 / 5)
         .max(360)
@@ -2001,15 +2016,15 @@ impl App {
             }
         }
         let xi = Image::new(
-            c.width,
-            c.height,
+            c.pw,
+            c.ph,
             ScanlinePad::Pad32,
             self.depth,
             BitsPerPixel::B32,
             ImageOrder::LsbFirst,
             Cow::Borrowed(&c.data),
         )?;
-        xi.put(&self.conn, win.window, win.gc, 0, 0)?;
+        xi.put(&*self.conn, win.window, win.gc, 0, 0)?;
         Ok(())
     }
 
@@ -2458,15 +2473,15 @@ impl App {
             c.draw_text(&self.regular, &text.status, 21, h - 30, 11.0, INK);
         }
         let xi = Image::new(
-            c.width,
-            c.height,
+            c.pw,
+            c.ph,
             ScanlinePad::Pad32,
             self.depth,
             BitsPerPixel::B32,
             ImageOrder::LsbFirst,
             Cow::Borrowed(&c.data),
         )?;
-        xi.put(&self.conn, win.window, win.gc, 0, 0)?;
+        xi.put(&*self.conn, win.window, win.gc, 0, 0)?;
         Ok(())
     }
 
@@ -3835,7 +3850,7 @@ impl App {
             self.draw_folder_icon(c, 19, y + 8);
             c.draw_text(
                 &self.regular,
-                &compact(&place.name, 17),
+                &compact(&place.name, 11),
                 34,
                 y,
                 13.0,
@@ -4353,7 +4368,9 @@ impl App {
     }
 
     fn xdnd_position(&self, target: Window, root_x: i16, root_y: i16) -> AnyResult<()> {
-        let pos = ((root_x as u32) << 16) | (root_y as u32 & 0xffff);
+        // Client messages carry physical root coordinates.
+        let (px_x, px_y) = (scale::px(i32::from(root_x)), scale::px(i32::from(root_y)));
+        let pos = ((px_x as u32) << 16) | (px_y as u32 & 0xffff);
         self.send_client_message(
             target,
             self.xdnd.position,
@@ -4662,15 +4679,15 @@ impl App {
 
     fn upload(&self, c: &Canvas) -> AnyResult<()> {
         let img = Image::new(
-            c.width,
-            c.height,
+            c.pw,
+            c.ph,
             ScanlinePad::Pad32,
             self.depth,
             BitsPerPixel::B32,
             ImageOrder::LsbFirst,
             Cow::Borrowed(&c.data),
         )?;
-        img.put(&self.conn, self.window, self.gc, 0, 0)?;
+        img.put(&*self.conn, self.window, self.gc, 0, 0)?;
         Ok(())
     }
 }

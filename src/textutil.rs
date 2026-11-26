@@ -611,8 +611,12 @@ pub(crate) fn csi_values(params: &str) -> Vec<usize> {
         .collect()
 }
 
-pub(crate) fn format_clock() -> String {
+/// Topbar clock text: time only, or `Mon D   HH:MM` when `full` is set.
+pub(crate) fn format_clock(full: bool) -> String {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    if !full {
+        return format!("{:02}:{:02}", now.hour(), now.minute());
+    }
     let month = match u8::from(now.month()) {
         1 => "Jan",
         2 => "Feb",

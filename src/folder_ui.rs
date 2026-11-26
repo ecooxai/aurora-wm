@@ -315,8 +315,8 @@ impl Aurora {
         let xdnd_drop = self.atom(b"XdndDrop")?;
         let uri = self.atom(b"text/uri-list")?;
         let action_copy = self.atom(b"XdndActionCopy")?;
-        let packed_xy =
-            ((u32::from(pointer.root_x as u16)) << 16) | u32::from(pointer.root_y as u16);
+        let packed_xy = ((u32::from(crate::scale::px(i32::from(pointer.root_x)) as u16)) << 16)
+            | u32::from(crate::scale::px(i32::from(pointer.root_y)) as u16);
         self.conn.send_event(
             false,
             target,

@@ -36,6 +36,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+const TOPBAR_BATTERY_W: i32 = 34;
 const TOPBAR_HEIGHT: u16 = 40;
 const DOCK_ICON_SIZE: i32 = 44;
 const DOCK_ICON_RADIUS: i32 = 12;
@@ -55,6 +56,9 @@ const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const SETTINGS_MIN_WIDTH: u16 = 420;
 const SETTINGS_TARGET_WIDTH: u16 = 600;
 const SETTINGS_MARGIN: u16 = 24;
+const SETTINGS_EDGE_GAP: u16 = 6;
+/// Settings → Display scale choices: GTK's whole-number GDK_SCALE.
+const GDK_SCALE_CHOICES: [u32; 3] = [1, 2, 3];
 const SIDEBAR_WIDTH: i32 = 58;
 const SETTINGS_SIDEBAR_TOP: i32 = 26;
 const SETTINGS_SIDEBAR_STRIDE: i32 = 44;
@@ -116,6 +120,11 @@ mod system;
 mod textutil;
 mod procutil;
 mod files;
+mod touch_keyboard;
+mod scale;
+mod session_actions;
+mod app_control;
+mod hold_menu;
 use canvas::*;
 use wm_extras::*;
 use model::*;
@@ -154,6 +163,30 @@ fn main() {
 fn run() -> AnyResult<()> {
     let args: Vec<String> = env::args().collect();
 
+    // Ask the running aurora-wm on this display to do something; the X server is not touched.
+    if args.len() >= 2 && matches!(args[1].as_str(), "--toggle-keyboard" | "--home-button" | "--restart-wm") {
+        let display = env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        let (conn, _screen_num) = RustConnection::connect(Some(&display))?;
+        let root = conn.setup().roots[0].root;
+        let name: &[u8] = if args[1] == "--restart-wm" {
+            b"_AURORA_RESTART_IN_PLACE"
+        } else {
+            b"_AURORA_TOGGLE_KEYBOARD"
+        };
+        let atom = conn.intern_atom(false, name)?.reply()?.atom;
+        let event = ClientMessageEvent {
+            response_type: CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: root,
+            type_: atom,
+            data: ClientMessageData::from([0, 0, 0, 0, 0]),
+        };
+        conn.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, event)?
+            .check()?;
+        return Ok(());
+    }
+
     if args.len() >= 3 && args[1] == "--open-folder" {
         let display = env::var("DISPLAY").unwrap_or_else(|_| ":11".to_string());
         let (conn, _screen_num) = RustConnection::connect(Some(&display))?;
@@ -186,7 +219,7 @@ fn run() -> AnyResult<()> {
             type_: open_atom,
             data: ClientMessageData::from([0, 0, 0, 0, 0]),
         };
-        conn.send_event(false, root, EventMask::STRUCTURE_NOTIFY, event)?;
+        conn.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, event)?;
         conn.flush()?;
         println!("Requested folder opening for {}", path_str);
         return Ok(());
@@ -215,7 +248,7 @@ fn run() -> AnyResult<()> {
             type_: choose_atom,
             data: ClientMessageData::from([0, 0, 0, 0, 0]),
         };
-        conn.send_event(false, root, EventMask::STRUCTURE_NOTIFY, event)?;
+        conn.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, event)?;
         conn.flush()?;
 
         let string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
@@ -319,10 +352,84 @@ fn run() -> AnyResult<()> {
         conn.set_selection_owner(wm_window, wm_s_atom, CURRENT_TIME)?;
     }
 
-    let mut app = Aurora::new(conn, display, &screen, screen_num, compositor_override)?;
+    // HiDPI: lay out in logical pixels and render at the panel's native
+    // resolution. The scale is GTK's GDK_SCALE (see configured_ui_scale).
+    let scale = configured_ui_scale(&screen);
+    scale::set_ui_scale(scale);
+    apply_app_scale_environment(&display, scale);
+    let mut logical_screen = screen.clone();
+    logical_screen.width_in_pixels = scale::lg_len(u32::from(screen.width_in_pixels)) as u16;
+    logical_screen.height_in_pixels = scale::lg_len(u32::from(screen.height_in_pixels)) as u16;
+    let mut app = Aurora::new(conn, display, &logical_screen, screen_num, compositor_override)?;
     app.scan_existing_windows()?;
     app.redraw_everything()?;
     app.run_loop()
+}
+
+/// UI scale for this session, following GTK's GDK_SCALE convention: the
+/// GDK_SCALE environment variable when it is 1, 2 or 3; otherwise the scale
+/// saved in Settings → Display; otherwise an automatic choice from the panel
+/// density (2 on the iPad's 1536x2048 panel, 1 on small displays).
+fn configured_ui_scale(screen: &Screen) -> f32 {
+    if let Some(value) = env::var("GDK_SCALE").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+        if GDK_SCALE_CHOICES.contains(&value) {
+            return value as f32;
+        }
+    }
+    let saved = crate::system::saved_gdk_scale();
+    if saved != 0 {
+        return saved as f32;
+    }
+    auto_ui_scale(screen)
+}
+
+pub(crate) fn auto_ui_scale(screen: &Screen) -> f32 {
+    let short_px = screen.width_in_pixels.min(screen.height_in_pixels);
+    let short_mm = screen.width_in_millimeters.min(screen.height_in_millimeters);
+    let dpi = if short_mm > 0 {
+        f32::from(short_px) * 25.4 / f32::from(short_mm)
+    } else {
+        96.0
+    };
+    if dpi >= 180.0 || short_px >= 1400 {
+        2.0
+    } else {
+        1.0
+    }
+}
+
+/// Exports the GTK scale to applications started from this session, the same
+/// way GTK expects it: GDK_SCALE is the whole-number scale (GDK_DPI_SCALE 1),
+/// so Xft.dpi stays 96. Text and widgets then grow once, through GDK_SCALE.
+fn apply_app_scale_environment(display: &str, scale: f32) {
+    let int_scale = scale.round().clamp(1.0, 3.0) as u32;
+    let cursor = 24 * int_scale;
+    // SAFETY: called before any threads are spawned.
+    unsafe {
+        env::set_var("GDK_SCALE", int_scale.to_string());
+        env::set_var("GDK_DPI_SCALE", "1");
+        env::set_var("QT_SCALE_FACTOR", int_scale.to_string());
+        env::set_var("QT_AUTO_SCREEN_SCALE_FACTOR", "0");
+        env::set_var("XCURSOR_SIZE", cursor.to_string());
+        env::remove_var("ELM_SCALE");
+        env::remove_var("AURORA_SCALE");
+    }
+    let resources = format!("Xft.dpi: 96\nXcursor.size: {cursor}\nXft.antialias: 1\nXft.hinting: 1\nXft.hintstyle: hintslight\nXft.rgba: none\n");
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf '{resources}' | xrdb -merge"))
+        .env("DISPLAY", display)
+        .status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "import-environment", "GDK_SCALE", "GDK_DPI_SCALE", "QT_SCALE_FACTOR", "XCURSOR_SIZE"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "unset-environment", "AURORA_SCALE", "ELM_SCALE"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn become_wm(conn: &RustConnection, screen: &Screen) -> Result<(), ReplyError> {

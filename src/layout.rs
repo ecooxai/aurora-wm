@@ -254,6 +254,7 @@ impl Aurora {
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
+        self.raise_touch_keyboard()?;
         Ok(())
     }
 
@@ -298,6 +299,7 @@ impl Aurora {
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             )?;
         }
+        self.raise_touch_keyboard()?;
         Ok(())
     }
 
@@ -322,16 +324,23 @@ impl Aurora {
         x: i32,
         y: i32,
     ) -> AnyResult<()> {
+        // Canvas data is physical; place it at the physical offset.
         let img = Image::new(
-            canvas.width,
-            canvas.height,
+            canvas.pw,
+            canvas.ph,
             ScanlinePad::Pad32,
             self.depth,
             BitsPerPixel::B32,
             XrbImageOrder::LsbFirst,
             Cow::Borrowed(&canvas.data),
         )?;
-        img.put(&self.conn, drawable, self.gc, x as i16, y as i16)?;
+        img.put(
+            &*self.conn,
+            drawable,
+            self.gc,
+            crate::scale::px(x) as i16,
+            crate::scale::px(y) as i16,
+        )?;
         Ok(())
     }
 
@@ -402,9 +411,10 @@ impl Aurora {
             if w == 0 || h == 0 || pos + count > data.len() {
                 break;
             }
-            let score = (w as i32 - size).abs() + (h as i32 - size).abs();
+            let target = crate::scale::px(size);
+            let score = (w as i32 - target).abs() + (h as i32 - target).abs();
             let replace = best
-                .map(|(_, bw, bh)| score < (bw as i32 - size).abs() + (bh as i32 - size).abs())
+                .map(|(_, bw, bh)| score < (bw as i32 - target).abs() + (bh as i32 - target).abs())
                 .unwrap_or(true);
             if replace {
                 best = Some((pos, w, h));
@@ -414,21 +424,18 @@ impl Aurora {
         let Some((start, w, h)) = best else {
             return false;
         };
-        for yy in 0..size {
-            for xx in 0..size {
-                let sx = (xx as usize * w / size as usize).min(w - 1);
-                let sy = (yy as usize * h / size as usize).min(h - 1);
-                let argb = data[start + sy * w + sx];
-                let a = ((argb >> 24) & 0xff) as u8;
-                if a == 0 {
-                    continue;
-                }
-                let r = ((argb >> 16) & 0xff) as u8;
-                let g = ((argb >> 8) & 0xff) as u8;
-                let b = (argb & 0xff) as u8;
-                canvas.blend_pixel(x + xx, y + yy, Color::rgba(r, g, b, a));
-            }
-        }
+        let rgba: Vec<u8> = data[start..start + w * h]
+            .iter()
+            .flat_map(|&argb| {
+                [
+                    ((argb >> 16) & 0xff) as u8,
+                    ((argb >> 8) & 0xff) as u8,
+                    (argb & 0xff) as u8,
+                    ((argb >> 24) & 0xff) as u8,
+                ]
+            })
+            .collect();
+        canvas.paint_rgba_image(&rgba, w as u32, h as u32, x, y, size, size, false);
         true
     }
 
@@ -478,7 +485,8 @@ impl Aurora {
                     .saturating_sub(TOPBAR_HEIGHT + SETTINGS_MARGIN * 2),
             )
             .max(440.min(self.screen_height));
-        let x = self.screen_width.saturating_sub(width + SETTINGS_MARGIN) as i16;
+        // Docked against the right edge, under the topbar icons that open it.
+        let x = self.screen_width.saturating_sub(width + SETTINGS_EDGE_GAP) as i16;
         let y = (TOPBAR_HEIGHT + SETTINGS_MARGIN) as i16;
         (x, y, width, height)
     }
@@ -552,12 +560,14 @@ impl Aurora {
             .min(self.screen_width.saturating_sub(24))
             .max(260.min(self.screen_width));
         let height = if self.clipboard_history.is_empty() {
-            150
+            170
         } else {
-            (56 + self.clipboard_page_content_height() + 10) as u16
+            (CLIPBOARD_MENU_LIST_TOP + 8 + self.clipboard_page_content_height() + 10) as u16
         };
         let controls = self.topbar_controls();
-        let mut x = controls.clipboard_x - i32::from(width) / 2;
+        // A hidden clipboard icon has no centre: open beside the tray instead.
+        let anchor = if topbar_icon_shown(controls.clipboard_x) { controls.clipboard_x } else { controls.tray_left };
+        let mut x = anchor - i32::from(width) / 2;
         let max_x = i32::from(self.screen_width.saturating_sub(width)).saturating_sub(12);
         x = x.max(12).min(max_x.max(12));
         (x as i16, TOPBAR_HEIGHT as i16 + 4, width, height)
@@ -580,8 +590,9 @@ impl Aurora {
     }
 
     pub(crate) fn topbar_task_capacity(&self) -> usize {
-        let clock_width = measure_text(&self.regular, &format_clock(), 16.0) + 32;
-        let available = self.topbar_controls().clipboard_x - 24 - clock_width - self.topbar_tasks_x();
+        // Reserve the full-date width so tasks never slide under the clock when it is expanded.
+        let clock_width = measure_text(&self.regular, &format_clock(true), 16.0) + 32;
+        let available = self.topbar_controls().tray_left - 24 - clock_width - self.topbar_tasks_x();
         dock_slot_capacity(available, TOPBAR_TASK_STRIDE)
     }
 
@@ -596,7 +607,7 @@ impl Aurora {
     }
 
     pub(crate) fn topbar_tasks_x(&self) -> i32 {
-        self.add_workspace_x() + WORKSPACE_SIZE + 22
+        self.workspaces_end_x() + 22
     }
 
     pub(crate) fn dock_task_limit(&self) -> usize {
@@ -736,9 +747,11 @@ impl Aurora {
             || window == self.ui.clipboard_menu
             || window == self.ui.dock_more_menu
             || window == self.ui.title_menu
+            || window == self.ui.hold_menu
             || window == self.ui.confirm_dialog
             || window == self.ui.tooltip
             || self.ui.media.contains(&window)
+            || (window != x11rb::NONE && self.osk.window_id() == Some(window))
     }
 
     pub(crate) fn media_slot_for_window(&self, window: Window) -> Option<usize> {

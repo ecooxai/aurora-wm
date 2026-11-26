@@ -74,8 +74,8 @@ impl Aurora {
             SettingsTab::Startup,
             SettingsTab::Apps,
             SettingsTab::Shortcuts,
+            SettingsTab::Multitask,
             SettingsTab::About,
-            SettingsTab::Dock,
         ];
         for (idx, tab) in items.iter().enumerate() {
             let y = SETTINGS_SIDEBAR_TOP + idx as i32 * SETTINGS_SIDEBAR_STRIDE;
@@ -94,121 +94,199 @@ impl Aurora {
         }
     }
 
-    pub(crate) fn draw_dock_tab(&self, c: &mut Canvas) {
+    pub(crate) fn draw_multitask_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
-        c.draw_text(&self.bold, "Dock", sx, 22, 24.0, INK);
-        c.draw_text(&self.regular, "Choose where your apps appear.", sx, 54, 13.0, MUTED);
-        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 132);
+        let card_w = i32::from(c.width) - sx - 24;
+        c.draw_text(&self.bold, "Multitask", sx, 22, 24.0, INK);
+        c.draw_text(&self.regular, "Dock placement and the icons on the topbar.", sx, 54, 13.0, MUTED);
+
+        // Dock placement. The switch row (86..132) is hit-tested in settings_events.
+        draw_card(c, sx, 86, card_w, 132);
         c.draw_text(&self.bold, "Merge dock into topbar", sx + 16, 105, 16.0, INK);
         c.draw_text(&self.regular, "Keep Files and running apps beside workspaces.", sx + 16, 144, 12.0, MUTED);
         c.draw_text(&self.regular, "The clock moves beside the clipboard button.", sx + 16, 171, 12.0, MUTED);
-        let tx = i32::from(c.width) - 80;
-        c.draw_round_rect(tx, 103, 40, 24, 12, if self.settings.dock_in_topbar { MINT_DARK } else { Color::rgb(180,192,201) });
-        c.draw_circle(tx + if self.settings.dock_in_topbar { 28 } else { 12 }, 115, 8, Color::rgb(255,255,255));
-        c.draw_text(&self.regular, "Click Aurora to open the start menu.", sx, 246, 13.0, MUTED);
+        draw_switch(c, i32::from(c.width) - 80, 103, self.settings.dock_in_topbar);
+
+        // Topbar icons: a two-column grid, filled row by row in MULTITASK_ICONS order.
+        draw_card(c, sx, MULTITASK_ICONS_CARD_Y, card_w, 0);
+        c.draw_text(&self.bold, "Topbar icons", sx + 16, MULTITASK_ICONS_CARD_Y + 14, 15.0, INK);
+        c.draw_text(
+            &self.regular,
+            "Hidden icons take no space. Recording stays visible while it runs.",
+            sx + 16,
+            MULTITASK_ICONS_CARD_Y + 36,
+            12.0,
+            MUTED,
+        );
+        let col_w = (card_w - 32) / 2;
+        for (index, (label, on)) in multitask_icon_items(self.settings.topbar_icons).iter().enumerate() {
+            let col = (index % 2) as i32;
+            let row = (index / 2) as i32;
+            let x = sx + 16 + col * col_w;
+            let y = MULTITASK_ROW_Y + row * MULTITASK_ROW_H;
+            c.draw_text(&self.regular, label, x, y + 6, 13.0, INK);
+            draw_switch(c, x + col_w - 64, y, *on);
+        }
+        c.draw_text(
+            &self.regular,
+            "Click Aurora to open the start menu.",
+            sx,
+            MULTITASK_ROW_Y + 4 * MULTITASK_ROW_H + 18,
+            13.0,
+            MUTED,
+        );
     }
 
     pub(crate) fn draw_display_tab(&self, c: &mut Canvas) {
         let sx = SIDEBAR_WIDTH + 24;
+        let l = DisplayLayout::new(i32::from(c.width));
         c.draw_text(&self.bold, "Display", sx, 22, 24.0, INK);
         c.draw_text(
             &self.regular,
-            "Resolution, refresh rate, and idle sleep.",
+            "Resolution, rotation, brightness, and idle sleep.",
             sx,
             54,
             13.0,
             MUTED,
         );
 
-        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 156);
-        c.draw_text(&self.bold, "Resolution", sx + 16, 104, 15.0, INK);
-        let modes = self.display_modes.iter().take(4).collect::<Vec<_>>();
-        for (idx, mode) in modes.iter().enumerate() {
-            let y = 132 + idx as i32 * 25;
-            let selected = idx == self.settings.selected_mode;
-            c.draw_round_rect(
-                sx + 14,
-                y - 4,
-                i32::from(c.width) - sx - 52,
-                22,
-                8,
-                if selected {
-                    Color::rgba(116, 213, 198, 90)
-                } else {
-                    Color::rgba(255, 255, 255, 120)
-                },
-            );
-            c.draw_text(
-                &self.regular,
-                &mode.label(),
-                sx + 24,
-                y,
-                12.0,
-                if selected { MINT_DARK } else { INK },
-            );
-            if mode.current {
-                c.draw_text_right(
-                    &self.regular,
-                    "current",
-                    i32::from(c.width) - 38,
-                    y,
-                    11.0,
-                    MINT_DARK,
-                );
-            }
+        // Resolution: the panel's real modes (xrandr). Scale below it is GTK's
+        // GDK_SCALE (1, 2 or 3); scale does not change the panel mode.
+        draw_card(c, sx, 86, l.card_w, 0);
+        c.draw_text(&self.bold, "Resolution", sx + 16, l.dd_y + 6, 15.0, INK);
+        let (native_w, native_h) = self.native_screen_size();
+        let open = self.settings.display_dropdown_open;
+        c.draw_round_rect(
+            l.dd_x,
+            l.dd_y,
+            l.dd_w,
+            l.dd_h,
+            9,
+            if open { Color::rgba(188, 224, 255, 245) } else { Color::rgba(255, 255, 255, 205) },
+        );
+        let selected_mode = self.display_modes.get(self.settings.selected_mode);
+        let shown = selected_mode
+            .map(|m| format!("{} × {}", m.width, m.height))
+            .unwrap_or_else(|| format!("{native_w} × {native_h}"));
+        c.draw_text(&self.bold, &shown, l.dd_x + 12, l.dd_y + 7, 13.0, INK);
+        if let Some(rate) = selected_mode.and_then(|m| m.refresh) {
+            c.draw_text_right(&self.regular, &format!("{rate:.0} Hz"), l.dd_x + l.dd_w - 30, l.dd_y + 8, 12.0, MUTED);
         }
+        draw_chevron(c, l.dd_x + l.dd_w - 16, l.dd_y + l.dd_h / 2, open, SOFT_INK);
 
-        draw_card(c, sx, 258, i32::from(c.width) - sx - 24, 86);
-        c.draw_text(&self.bold, "Refresh rate", sx + 16, 276, 15.0, INK);
+        // Scale: 1× / 2× / 3× (GDK_SCALE), right-aligned like the rotation row.
+        let scale = crate::scale::gdk_scale();
+        c.draw_text(&self.bold, "Scale", sx + 16, l.scale_y, 15.0, INK);
+        c.draw_round_rect(l.seg_x, l.scale_seg_y, l.seg_w, l.seg_h, 9, Color::rgba(234, 244, 248, 220));
+        for (idx, &choice) in GDK_SCALE_CHOICES.iter().enumerate() {
+            let (x, w) = l.scale_seg_rect(idx);
+            let selected = choice == scale;
+            if selected {
+                c.draw_round_rect(x + 2, l.scale_seg_y + 2, w - 4, l.seg_h - 4, 7, Color::rgba(160, 238, 220, 235));
+            } else if idx > 0 && GDK_SCALE_CHOICES[idx - 1] != scale {
+                c.draw_rect(x, l.scale_seg_y + 7, 1, l.seg_h - 14, Color::rgba(180, 196, 206, 200));
+            }
+            c.draw_text_center(
+                if selected { &self.bold } else { &self.regular },
+                &format!("{choice}×"),
+                x + w / 2,
+                l.scale_seg_y + 6,
+                12.0,
+                if selected { INK } else { SOFT_INK },
+            );
+        }
+        let (desk_w, desk_h) = (native_w / scale as u16, native_h / scale as u16);
+        c.draw_text(
+            &self.regular,
+            &format!("Desktop {desk_w} × {desk_h} at {scale}×. Open apps keep their scale."),
+            sx + 16,
+            l.scale_hint_y,
+            11.0,
+            MUTED,
+        );
+
+        // Rotation: Auto / Off / 90° / 180° / 270° selector.
+        c.draw_text(&self.bold, "Rotation", sx + 16, l.rotate_y, 15.0, INK);
+        let mode = rotation_mode();
+        let sensor = accelerometer_available();
+        c.draw_round_rect(l.seg_x, l.seg_y, l.seg_w, l.seg_h, 9, Color::rgba(234, 244, 248, 220));
+        for (idx, &(choice, label)) in ROTATION_CHOICES.iter().enumerate() {
+            let (x, w) = l.seg_rect(idx);
+            let selected = choice == mode;
+            if selected {
+                c.draw_round_rect(
+                    x + 2,
+                    l.seg_y + 2,
+                    w - 4,
+                    l.seg_h - 4,
+                    7,
+                    if choice == RotationMode::Auto && !sensor {
+                        Color::rgba(255, 214, 160, 235)
+                    } else {
+                        Color::rgba(160, 238, 220, 235)
+                    },
+                );
+            } else if idx > 0 && ROTATION_CHOICES[idx - 1].0 != mode {
+                c.draw_rect(x, l.seg_y + 7, 1, l.seg_h - 14, Color::rgba(180, 196, 206, 200));
+            }
+            let color = if selected {
+                INK
+            } else if choice == RotationMode::Auto && !sensor {
+                MUTED
+            } else {
+                SOFT_INK
+            };
+            c.draw_text_center(
+                if selected { &self.bold } else { &self.regular },
+                label,
+                x + w / 2,
+                l.seg_y + 6,
+                12.0,
+                color,
+            );
+        }
+        let (hint, hint_color): (Cow<str>, Color) = match (mode, sensor) {
+            (RotationMode::Auto, true) => ("Turns the screen when you rotate the iPad".into(), MUTED),
+            (RotationMode::Auto, false) => (
+                "Auto: sensor unavailable this boot - stays upright; pick an angle to lock".into(),
+                Color::rgb(196, 110, 24),
+            ),
+            (fixed, sensor) => {
+                let angle = match fixed {
+                    RotationMode::Left => "90°",
+                    RotationMode::Inverted => "180°",
+                    RotationMode::Right => "270°",
+                    _ => "0° (upright)",
+                };
+                let mut text = format!("Locked at {angle}");
+                if !sensor {
+                    text.push_str(" · auto: sensor unavailable this boot");
+                }
+                (text.into(), MUTED)
+            }
+        };
+        c.draw_text(&self.regular, &hint, sx + 16, l.rotate_y + 28, 11.0, hint_color);
+
+        // Refresh rate + compositor.
+        draw_card(c, sx, l.refresh_card_y, l.card_w, 0);
+        c.draw_text(&self.bold, "Refresh rate", sx + 16, l.refresh_y, 15.0, INK);
         let refresh = self
             .display_modes
             .get(self.settings.selected_mode)
             .and_then(|m| m.refresh)
             .unwrap_or(60.0);
+        c.draw_text(&self.bold, &format!("{refresh:.0} Hz"), sx + 16, l.refresh_y + 22, 12.0, MINT_DARK);
         c.draw_text(
             &self.regular,
-            &format!("{refresh:.0} Hz"),
-            sx + 16,
-            306,
-            20.0,
-            MINT_DARK,
+            &format!("native {native_w}×{native_h}"),
+            sx + 60,
+            l.refresh_y + 23,
+            11.0,
+            MUTED,
         );
-        c.draw_text(&self.regular, "xrandr mode list", sx + 92, 310, 11.0, MUTED);
-        let compositor_switch_x = i32::from(c.width) - 78;
-        let compositor_switch_y = 276;
-        let compositor_label_x = (i32::from(c.width) - 180).max(sx + 150);
-        c.draw_text(&self.bold, "Compositor", compositor_label_x, 276, 15.0, INK);
-        if self.settings.compositor_enabled {
-            c.draw_round_rect(
-                compositor_switch_x,
-                compositor_switch_y,
-                40,
-                24,
-                12,
-                Color::rgba(160, 238, 220, 210),
-            );
-            c.draw_circle(
-                compositor_switch_x + 28,
-                compositor_switch_y + 12,
-                8,
-                Color::rgb(255, 255, 255),
-            );
-        } else {
-            c.draw_round_rect(
-                compositor_switch_x,
-                compositor_switch_y,
-                40,
-                24,
-                12,
-                Color::rgba(200, 200, 200, 180),
-            );
-            c.draw_circle(
-                compositor_switch_x + 12,
-                compositor_switch_y + 12,
-                8,
-                Color::rgb(255, 255, 255),
-            );
-        }
+        let compositor_label_x = (l.switch_x - 108).max(sx + 170);
+        c.draw_text(&self.bold, "Compositor", compositor_label_x, l.refresh_y, 15.0, INK);
+        draw_switch(c, l.switch_x, l.refresh_y - 2, self.settings.compositor_enabled);
         c.draw_text(
             &self.regular,
             if self.compositor_active {
@@ -219,58 +297,78 @@ impl Aurora {
                 "off"
             },
             compositor_label_x,
-            306,
+            l.refresh_y + 23,
             11.0,
-            if self.settings.compositor_enabled {
-                MINT_DARK
-            } else {
-                MUTED
-            },
+            if self.settings.compositor_enabled { MINT_DARK } else { MUTED },
         );
-        if let Some(status) = self.settings.display_status.as_deref() {
-            c.draw_text(
-                &self.regular,
-                &compact(status, 54),
-                sx + 16,
-                328,
-                11.0,
-                BLUE,
-            );
-        }
 
-        draw_card(c, sx, 360, i32::from(c.width) - sx - 24, 86);
-        c.draw_text(&self.bold, "Brightness", sx + 16, 379, 15.0, INK);
-        c.draw_text_right(
+        // Brightness: current level on the left, slider, "+" step button on
+        // the right (no end labels).
+        draw_card(c, sx, l.bright_card_y, l.card_w, 0);
+        c.draw_text(&self.bold, "Brightness", sx + 16, l.bright_y, 15.0, INK);
+        c.draw_text(
             &self.bold,
             &format!("{}%", self.settings.brightness_percent),
-            i32::from(c.width) - 42,
-            379,
-            15.0,
+            sx + 16,
+            l.bar_y - 2,
+            13.0,
             MINT_DARK,
         );
-        let bar_x = sx + 16;
-        let bar_y = 412;
-        let bar_w = 230;
-        c.draw_round_rect(bar_x, bar_y, bar_w, 12, 6, Color::rgba(225, 235, 238, 235));
-        let fill_w = ((i32::from(self.settings.brightness_percent) - 10) * bar_w / 90).max(6);
-        c.draw_round_rect(bar_x, bar_y, fill_w, 12, 6, Color::rgba(116, 213, 198, 220));
-        c.draw_text(&self.regular, "10%", bar_x, 430, 11.0, MUTED);
-        c.draw_text_right(&self.regular, "100%", bar_x + bar_w, 430, 11.0, MUTED);
-
-        draw_card(c, sx, 462, i32::from(c.width) - sx - 24, 94);
-        c.draw_text(&self.bold, "Sleep after", sx + 16, 481, 15.0, INK);
-        c.draw_round_rect(sx + 18, 511, 28, 28, 9, Color::rgba(234, 244, 248, 220));
-        c.draw_text_center(&self.bold, "-", sx + 32, 513, 18.0, MINT_DARK);
+        c.draw_round_rect(l.bar_x, l.bar_y, l.bar_w, 12, 6, Color::rgba(225, 235, 238, 235));
+        let fill_w = ((i32::from(self.settings.brightness_percent) - 10) * l.bar_w / 90).max(6);
+        c.draw_round_rect(l.bar_x, l.bar_y, fill_w, 12, 6, Color::rgba(116, 213, 198, 220));
+        let at_max = self.settings.brightness_percent >= 100;
+        c.draw_round_rect(l.bright_plus_x, l.bar_y - 8, 28, 28, 9, Color::rgba(234, 244, 248, 220));
         c.draw_text_center(
             &self.bold,
-            &format!("{} s", self.settings.sleep_after_secs),
-            sx + 112,
-            515,
-            15.0,
-            INK,
+            "+",
+            l.bright_plus_x + 14,
+            l.bar_y - 6,
+            18.0,
+            if at_max { MUTED } else { MINT_DARK },
         );
-        c.draw_round_rect(sx + 178, 511, 28, 28, 9, Color::rgba(234, 244, 248, 220));
-        c.draw_text_center(&self.bold, "+", sx + 192, 513, 18.0, MINT_DARK);
+
+        // Sleep after: label left, stepper right.
+        draw_card(c, sx, l.sleep_card_y, l.card_w, 0);
+        c.draw_text(&self.bold, "Sleep after", sx + 16, l.sleep_y + 5, 15.0, INK);
+        c.draw_round_rect(l.minus_x, l.sleep_y, 28, 28, 9, Color::rgba(234, 244, 248, 220));
+        c.draw_text_center(&self.bold, "-", l.minus_x + 14, l.sleep_y + 2, 18.0, MINT_DARK);
+        let sleep = if self.settings.sleep_after_secs == 0 {
+            "never".to_string()
+        } else if self.settings.sleep_after_secs % 60 == 0 {
+            format!("{} min", self.settings.sleep_after_secs / 60)
+        } else {
+            format!("{} s", self.settings.sleep_after_secs)
+        };
+        c.draw_text_center(&self.bold, &sleep, (l.minus_x + 28 + l.plus_x) / 2, l.sleep_y + 5, 14.0, INK);
+        c.draw_round_rect(l.plus_x, l.sleep_y, 28, 28, 9, Color::rgba(234, 244, 248, 220));
+        c.draw_text_center(&self.bold, "+", l.plus_x + 14, l.sleep_y + 2, 18.0, MINT_DARK);
+
+        if let Some(status) = self.settings.display_status.as_deref() {
+            c.draw_text(&self.regular, &compact(status, 60), sx + 16, l.status_y, 11.0, BLUE);
+        }
+
+        // The open list floats over the cards below the button: the panel's modes.
+        if open {
+            let (lx, ly, lw, lh) = l.list_rect(self.display_modes.len());
+            c.draw_round_rect(lx - 1, ly - 1, lw + 2, lh + 4, 11, Color::rgba(40, 60, 80, 40));
+            c.draw_round_rect(lx, ly, lw, lh, 10, Color::rgb(250, 253, 255));
+            for (idx, mode) in self.display_modes.iter().enumerate() {
+                let ry = l.list_row_y(idx);
+                let selected = idx == self.settings.selected_mode;
+                if selected {
+                    c.draw_round_rect(lx + 4, ry, lw - 8, DISPLAY_LIST_ROW_H - 2, 7, Color::rgba(116, 213, 198, 90));
+                }
+                let color = if selected { MINT_DARK } else { INK };
+                c.draw_text(&self.regular, &format!("{} × {}", mode.width, mode.height), lx + 12, ry + 5, 12.5, color);
+                if mode.width == native_w && mode.height == native_h {
+                    c.draw_text(&self.regular, "panel native", lx + 104, ry + 6, 11.0, MUTED);
+                }
+                if let Some(rate) = mode.refresh {
+                    c.draw_text_right(&self.regular, &format!("{rate:.0} Hz"), lx + lw - 12, ry + 6, 11.0, if selected { MINT_DARK } else { MUTED });
+                }
+            }
+        }
     }
 
     pub(crate) fn draw_power_tab(&self, c: &mut Canvas) {
@@ -284,7 +382,7 @@ impl Aurora {
             13.0,
             MUTED,
         );
-        draw_card(c, sx, 86, i32::from(c.width) - sx - 24, 206);
+        draw_card(c, sx, 86, i32::from(c.width) - sx - 12, 206);
         c.draw_text(&self.bold, "Auto power saver", sx + 16, 106, 15.0, INK);
         let switch_x = i32::from(c.width) - 78;
         let switch_y = 98;
@@ -423,67 +521,120 @@ impl Aurora {
             );
         }
 
-        draw_card(c, sx, 304, i32::from(c.width) - sx - 24, 166);
+        draw_card(c, sx, 304, i32::from(c.width) - sx - 12, 166);
         c.draw_text(&self.bold, "System", sx + 16, 324, 15.0, INK);
-        draw_metric_bar(
-            c,
-            &self.regular,
-            sx + 16,
-            352,
-            "CPU",
-            self.metrics.cpu_usage,
-            "%",
-        );
-        // GPU usage right below the CPU bar: supports NVIDIA (nvidia-smi),
-        // AMD and Intel (sysfs) and lists each GPU on multi-GPU systems.
-        let mut bar_y = 352;
-        for gpu in self.metrics.gpu_usage.iter().take(3) {
-            bar_y += 30;
-            draw_metric_bar(
-                c,
-                &self.regular,
-                sx + 16,
-                bar_y,
-                &compact(&gpu.name, 9),
-                gpu.percent,
-                "%",
-            );
-        }
-        if self.metrics.gpu_usage.is_empty() {
-            bar_y += 22;
-            c.draw_text(
-                &self.regular,
-                if self.settings_cache.gpu_usage.is_some() {
-                    "GPU usage unavailable (no driver metric exposed)"
-                } else {
-                    "Reading GPU usage..."
-                },
-                sx + 16,
-                bar_y,
-                11.0,
-                MUTED,
-            );
-            bar_y += 8;
-        }
-        if bar_y + 30 <= 452 {
-            bar_y += 30;
-            let ram_pct = if self.metrics.ram_total_kb > 0 {
-                self.metrics.ram_used_kb as f32 * 100.0 / self.metrics.ram_total_kb as f32
-            } else {
-                0.0
-            };
-            draw_metric_bar(c, &self.regular, sx + 16, bar_y, "RAM", ram_pct, "%");
-        }
-        let freq_lines = cpu_frequency_lines(&self.metrics.cpu_frequencies, 46);
-        if let Some(line) = freq_lines.first() {
-            if bar_y + 26 <= 458 {
-                c.draw_text(&self.regular, "CPU frequency", sx + 16, bar_y + 24, 11.0, MUTED);
-                c.draw_text(&self.regular, line, sx + 110, bar_y + 24, 11.0, INK);
+        // Plain text rows with the usage percent pinned to the card's right
+        // edge: the clock says more than a bar on a two-core tablet, and
+        // memory reads best as used / total.
+        let label_x = sx + 16;
+        let value_x = sx + 64;
+        let pct_right = i32::from(c.width) - 14;
+        let pct_w = measure_text(&self.bold, "100%", 13.0);
+        let max_w = pct_right - pct_w - 12 - value_x;
+        let fit_in = |text: &str, size: f32, max_w: i32| {
+            let mut t = text.to_string();
+            if measure_text(&self.regular, &t, size) <= max_w {
+                return t;
             }
+            while measure_text(&self.regular, &format!("{t}…"), size) > max_w && t.chars().count() > 2 {
+                t.pop();
+            }
+            format!("{}…", t.trim_end())
+        };
+        let fit = |text: &str, size: f32| fit_in(text, size, max_w);
+        let pct_text = |v: f32| format!("{:.0}%", v.clamp(0.0, 100.0));
+        let pct = |c: &mut Canvas, value: Option<f32>, y: i32| {
+            if let Some(v) = value {
+                let color = if v >= 85.0 { Color::rgb(196, 72, 72) } else { MINT_DARK };
+                c.draw_text_right(&self.bold, &pct_text(v), pct_right, y, 13.0, color);
+            }
+        };
+        let ratio = |used: u64, total: u64| (total > 0).then(|| used as f32 * 100.0 / total as f32);
+        const ROW: i32 = 24;
+
+        // CPU: the clock sits right next to the usage percent.
+        let mut row_y = 350;
+        c.draw_text(&self.regular, "CPU", label_x, row_y, 12.0, MUTED);
+        pct(c, Some(self.metrics.cpu_usage), row_y);
+        let clock = format_cpu_clock(self.metrics.cpu_mhz);
+        let clock_right = pct_right - measure_text(&self.bold, &pct_text(self.metrics.cpu_usage), 13.0) - 10;
+        c.draw_text_right(&self.bold, &clock, clock_right, row_y, 13.0, INK);
+        let model_w = clock_right - measure_text(&self.bold, &clock, 13.0) - 12 - value_x;
+        if !self.metrics.cpu_model.is_empty() && model_w > 40 {
+            c.draw_text(&self.regular, &fit_in(&self.metrics.cpu_model, 12.0, model_w), value_x, row_y + 1, 12.0, MUTED);
+        }
+        row_y += ROW;
+        let gpu_rows: Vec<(String, Option<f32>)> = if self.metrics.gpu_info.is_empty() {
+            vec![("No GPU exposed".to_string(), None)]
+        } else {
+            self.metrics.gpu_info.iter().take(2).cloned().collect()
+        };
+        for (line, load) in gpu_rows.iter() {
+            c.draw_text(&self.regular, "GPU", label_x, row_y, 12.0, MUTED);
+            c.draw_text(&self.regular, &fit(line, 12.5), value_x, row_y, 12.5, INK);
+            pct(c, *load, row_y);
+            row_y += ROW;
+        }
+        let ram = if self.metrics.ram_total_kb > 0 {
+            format!(
+                "{} / {}",
+                format_gb(self.metrics.ram_used_kb),
+                format_gb(self.metrics.ram_total_kb)
+            )
+        } else {
+            "unknown".to_string()
+        };
+        c.draw_text(&self.regular, "RAM", label_x, row_y, 12.0, MUTED);
+        c.draw_text(&self.regular, &ram, value_x, row_y, 12.5, INK);
+        pct(c, ratio(self.metrics.ram_used_kb, self.metrics.ram_total_kb), row_y);
+        row_y += ROW;
+
+        // Swap: zram and disk swap each get their own used / total rows.
+        let used_total = |area: &SwapArea| {
+            format!("{} / {}", format_swap_size(area.used_kb), format_swap_size(area.size_kb))
+        };
+        let zram: Vec<&SwapArea> = self.metrics.swaps.iter().filter(|a| a.zram).collect();
+        let disk: Vec<&SwapArea> = self.metrics.swaps.iter().filter(|a| !a.zram).collect();
+        if zram.is_empty() {
+            c.draw_text(&self.regular, "Zram", label_x, row_y, 12.0, MUTED);
+            c.draw_text(&self.regular, "off", value_x, row_y, 12.5, MUTED);
+            row_y += ROW;
+        }
+        for area in zram.iter().take(2) {
+            let name = area.path.trim_start_matches("/dev/");
+            let mut parts = vec![name.to_string()];
+            if let Some(algo) = area.zram_algorithm.as_deref() {
+                parts.push(algo.to_string());
+            }
+            parts.push(used_total(area));
+            let mut text = parts.join("  ·  ");
+            if let Some(ram) = area.zram_ram_kb {
+                let with_ram = format!("{text}  ·  {} in RAM", format_swap_size(ram));
+                if measure_text(&self.regular, &with_ram, 12.5) <= max_w {
+                    text = with_ram;
+                }
+            }
+            c.draw_text(&self.regular, "Zram", label_x, row_y, 12.0, MUTED);
+            c.draw_text(&self.regular, &fit(&text, 12.5), value_x, row_y, 12.5, INK);
+            pct(c, ratio(area.used_kb, area.size_kb), row_y);
+            row_y += ROW;
+        }
+        if disk.is_empty() {
+            c.draw_text(&self.regular, "Swap", label_x, row_y, 12.0, MUTED);
+            c.draw_text(&self.regular, "no swap file", value_x, row_y, 12.5, MUTED);
+            row_y += ROW;
+        }
+        for area in disk.iter().take(2) {
+            let text = format!("{}  ·  {}", area.path, used_total(area));
+            c.draw_text(&self.regular, "Swap", label_x, row_y, 12.0, MUTED);
+            c.draw_text(&self.regular, &fit(&text, 12.5), value_x, row_y, 12.5, INK);
+            pct(c, ratio(area.used_kb, area.size_kb), row_y);
+            row_y += ROW;
         }
 
-        draw_card(c, sx, 486, i32::from(c.width) - sx - 24, 70);
-        c.draw_text(&self.bold, "Battery", sx + 16, 502, 15.0, INK);
+        let battery_y = row_y + 10;
+        draw_card(c, sx, battery_y, i32::from(c.width) - sx - 12, 64);
+        c.draw_text(&self.bold, "Battery", sx + 16, battery_y + 14, 15.0, INK);
         c.draw_text(
             &self.regular,
             self.metrics
@@ -491,7 +642,7 @@ impl Aurora {
                 .as_deref()
                 .unwrap_or("No battery exposed"),
             sx + 16,
-            528,
+            battery_y + 38,
             14.0,
             MINT_DARK,
         );
@@ -736,6 +887,7 @@ impl Aurora {
         let sx = SIDEBAR_WIDTH + 24;
         let card_w = i32::from(c.width) - sx - 24;
         c.draw_text(&self.bold, "Network", sx, 22, 24.0, INK);
+        self.draw_network_restart_button(c);
         c.draw_text(
             &self.regular,
             "Wired and Wi-Fi interfaces.",
@@ -746,6 +898,25 @@ impl Aurora {
         );
         draw_card(c, sx, 86, card_w, 154);
         c.draw_text(&self.bold, "Current status", sx + 16, 106, 15.0, INK);
+        // Total throughput sits in the header: sparklines, then the totals on the right.
+        let spark_span = card_w - 150 - 190 - 12;
+        if spark_span >= 80 {
+            let w = spark_span / 2;
+            draw_sparkline(c, sx + 150, 96, w, 20, self.metrics.net_rx_bps, BLUE);
+            draw_sparkline(c, sx + 150 + w + 12, 96, w, 20, self.metrics.net_tx_bps, MINT_DARK);
+        }
+        c.draw_text_right(
+            &self.regular,
+            &format!(
+                "Down {}  Up {}",
+                format_bps(self.metrics.net_rx_bps),
+                format_bps(self.metrics.net_tx_bps)
+            ),
+            sx + card_w - 16,
+            108,
+            12.0,
+            INK,
+        );
 
         // Scroll exactly with step 24 matching line spacing!
         let start = (self.settings.scroll / 24).max(0) as usize;
@@ -766,14 +937,27 @@ impl Aurora {
             );
         }
         for (idx, line) in details.iter().skip(start).take(4).enumerate() {
+            let y = 134 + idx as i32 * 24;
             c.draw_text(
                 &self.regular,
-                &compact(line, 62),
+                &compact(line, 44),
                 sx + 16,
-                134 + idx as i32 * 24,
+                y,
                 13.0,
-                if idx % 3 == 0 { INK } else { MUTED },
+                if line.contains("  up  ") { INK } else { MUTED },
             );
+            // Live speed of this interface, right-aligned on its row.
+            let nic = line.split_whitespace().next().unwrap_or("");
+            if let Some((_, rx, tx)) = self.metrics.nic_rates.iter().find(|(name, _, _)| name == nic) {
+                c.draw_text_right(
+                    &self.regular,
+                    &format!("Down {}  Up {}", format_bps(*rx), format_bps(*tx)),
+                    sx + card_w - 16,
+                    y,
+                    12.0,
+                    MUTED,
+                );
+            }
         }
 
         draw_card(c, sx, 258, card_w, 288);
@@ -1319,45 +1503,181 @@ impl Aurora {
         };
         draw_info_row(c, &self.regular, sx + 16, 276, "NIC", &nics);
         draw_info_row(c, &self.regular, sx + 16, 304, "Display", &self.display);
-
-        draw_card(c, sx, 354, i32::from(c.width) - sx - 24, 154);
-        c.draw_text(&self.bold, "Network speed", sx + 16, 376, 15.0, INK);
-        c.draw_text(&self.regular, "Down", sx + 16, 408, 12.0, MUTED);
-        c.draw_text(
-            &self.bold,
-            &format_bps(self.metrics.net_rx_bps),
-            sx + 70,
-            405,
-            17.0,
-            INK,
-        );
-        c.draw_text(&self.regular, "Up", sx + 16, 450, 12.0, MUTED);
-        c.draw_text(
-            &self.bold,
-            &format_bps(self.metrics.net_tx_bps),
-            sx + 70,
-            447,
-            17.0,
-            INK,
-        );
-        draw_sparkline(
-            c,
-            sx + 152,
-            402,
-            i32::from(c.width) - sx - 190,
-            22,
-            self.metrics.net_rx_bps,
-            BLUE,
-        );
-        draw_sparkline(
-            c,
-            sx + 152,
-            444,
-            i32::from(c.width) - sx - 190,
-            22,
-            self.metrics.net_tx_bps,
-            MINT_DARK,
-        );
     }
 
+}
+
+/// Row height of the open resolution dropdown.
+pub(crate) const DISPLAY_LIST_ROW_H: i32 = 28;
+
+/// Multitask tab: the topbar icon grid (two columns, four rows).
+pub(crate) const MULTITASK_ICONS_CARD_Y: i32 = 232;
+pub(crate) const MULTITASK_ROW_Y: i32 = MULTITASK_ICONS_CARD_Y + 60;
+pub(crate) const MULTITASK_ROW_H: i32 = 40;
+
+/// Labels and current state of the topbar icon switches, in grid order.
+pub(crate) fn multitask_icon_items(icons: TopbarIcons) -> [(&'static str, bool); 7] {
+    [
+        ("Keyboard", icons.keyboard),
+        ("Clipboard", icons.clipboard),
+        ("Screenshot", icons.screenshot),
+        ("Recording", icons.recording),
+        ("Display", icons.display),
+        ("Audio", icons.audio),
+        ("Wi-Fi", icons.wifi),
+    ]
+}
+
+/// Display tab geometry shared by drawing and hit testing.
+pub(crate) struct DisplayLayout {
+    pub(crate) card_w: i32,
+    pub(crate) right: i32,
+    pub(crate) dd_x: i32,
+    pub(crate) dd_y: i32,
+    pub(crate) dd_w: i32,
+    pub(crate) dd_h: i32,
+    /// Scale row: label, 1×/2×/3× selector box, and its hint line.
+    pub(crate) scale_y: i32,
+    pub(crate) scale_seg_y: i32,
+    pub(crate) scale_hint_y: i32,
+    pub(crate) rotate_y: i32,
+    /// Rotation selector box (five equal segments).
+    pub(crate) seg_x: i32,
+    pub(crate) seg_y: i32,
+    pub(crate) seg_w: i32,
+    pub(crate) seg_h: i32,
+    pub(crate) switch_x: i32,
+    pub(crate) refresh_card_y: i32,
+    pub(crate) refresh_y: i32,
+    pub(crate) bright_card_y: i32,
+    pub(crate) bright_y: i32,
+    pub(crate) bar_x: i32,
+    pub(crate) bar_y: i32,
+    pub(crate) bar_w: i32,
+    /// Left edge of the brightness "+" button (28x28, centred on the bar).
+    pub(crate) bright_plus_x: i32,
+    pub(crate) sleep_card_y: i32,
+    pub(crate) sleep_y: i32,
+    pub(crate) minus_x: i32,
+    pub(crate) plus_x: i32,
+    pub(crate) status_y: i32,
+}
+
+impl DisplayLayout {
+    pub(crate) fn new(width: i32) -> Self {
+        let sx = SIDEBAR_WIDTH + 24;
+        let right = width - 38;
+        let dd_x = sx + 130;
+        // Rotation selector: right-aligned, clear of the "Rotation" label.
+        let seg_w = 280.min(right - (sx + 16 + 96)).max(5 * 34);
+        Self {
+            card_w: width - sx - 24,
+            right,
+            dd_x,
+            dd_y: 98,
+            dd_w: (right - dd_x).max(140),
+            dd_h: 30,
+            scale_y: 146,
+            scale_seg_y: 140,
+            scale_hint_y: 174,
+            rotate_y: 200,
+            seg_x: right - seg_w,
+            seg_y: 194,
+            seg_w,
+            seg_h: 28,
+            switch_x: width - 78,
+            refresh_card_y: 258,
+            refresh_y: 274,
+            bright_card_y: 326,
+            bright_y: 342,
+            // Room on the left for the current level ("100%").
+            bar_x: sx + 62,
+            bar_y: 370,
+            bar_w: (right - 28 - 12 - (sx + 62)).max(100),
+            bright_plus_x: right - 28,
+            sleep_card_y: 396,
+            sleep_y: 408,
+            minus_x: right - 150,
+            plus_x: right - 28,
+            status_y: 452,
+        }
+    }
+
+    /// The open resolution list: one row per panel mode.
+    pub(crate) fn list_rect(&self, rows: usize) -> (i32, i32, i32, i32) {
+        let h = rows.max(1) as i32 * DISPLAY_LIST_ROW_H + 8;
+        (self.dd_x, self.dd_y + self.dd_h + 4, self.dd_w, h)
+    }
+
+    pub(crate) fn list_row_y(&self, idx: usize) -> i32 {
+        self.list_rect(0).1 + 4 + idx as i32 * DISPLAY_LIST_ROW_H
+    }
+
+    /// Left edge and width of scale segment `idx` (three equal segments).
+    pub(crate) fn scale_seg_rect(&self, idx: usize) -> (i32, i32) {
+        let n = GDK_SCALE_CHOICES.len() as i32;
+        let x0 = self.seg_x + self.seg_w * idx as i32 / n;
+        let x1 = self.seg_x + self.seg_w * (idx as i32 + 1) / n;
+        (x0, x1 - x0)
+    }
+
+    /// Scale segment under (x, y), with a little slack for touch.
+    pub(crate) fn scale_seg_at(&self, x: i32, y: i32) -> Option<usize> {
+        if y < self.scale_seg_y - 8 || y > self.scale_seg_y + self.seg_h + 8 || x < self.seg_x - 4 || x > self.seg_x + self.seg_w + 4 {
+            return None;
+        }
+        let n = GDK_SCALE_CHOICES.len();
+        Some((0..n).find(|&i| x < self.scale_seg_rect(i).0 + self.scale_seg_rect(i).1).unwrap_or(n - 1))
+    }
+
+    /// Left edge and width of rotation segment `idx`.
+    pub(crate) fn seg_rect(&self, idx: usize) -> (i32, i32) {
+        let n = ROTATION_CHOICES.len() as i32;
+        let x0 = self.seg_x + self.seg_w * idx as i32 / n;
+        let x1 = self.seg_x + self.seg_w * (idx as i32 + 1) / n;
+        (x0, x1 - x0)
+    }
+
+    /// Rotation segment under (x, y), with a little slack for touch.
+    pub(crate) fn seg_at(&self, x: i32, y: i32) -> Option<usize> {
+        if y < self.seg_y - 8 || y > self.seg_y + self.seg_h + 8 || x < self.seg_x - 4 || x > self.seg_x + self.seg_w + 4 {
+            return None;
+        }
+        let n = ROTATION_CHOICES.len();
+        Some((0..n).find(|&i| x < self.seg_rect(i).0 + self.seg_rect(i).1).unwrap_or(n - 1))
+    }
+
+    pub(crate) fn in_dropdown_button(&self, x: i32, y: i32) -> bool {
+        point_in_rect(x, y, self.dd_x, self.dd_y, self.dd_w, self.dd_h)
+    }
+
+    /// Index of the resolution row under (x, y) in a list of `rows`, if any.
+    pub(crate) fn list_row_at(&self, x: i32, y: i32, rows: usize) -> Option<usize> {
+        let (lx, ly, lw, lh) = self.list_rect(rows);
+        if !point_in_rect(x, y, lx, ly + 4, lw, lh - 8) {
+            return None;
+        }
+        let idx = ((y - ly - 4) / DISPLAY_LIST_ROW_H) as usize;
+        (idx < rows).then_some(idx)
+    }
+}
+
+/// Settings on/off switch (40x24), as used by the compositor toggle.
+pub(crate) fn draw_switch(c: &mut Canvas, x: i32, y: i32, on: bool) {
+    if on {
+        c.draw_round_rect(x, y, 40, 24, 12, Color::rgba(160, 238, 220, 210));
+        c.draw_circle(x + 28, y + 12, 8, Color::rgb(255, 255, 255));
+    } else {
+        c.draw_round_rect(x, y, 40, 24, 12, Color::rgba(200, 200, 200, 180));
+        c.draw_circle(x + 12, y + 12, 8, Color::rgb(255, 255, 255));
+    }
+}
+
+/// Small dropdown chevron centred at (cx, cy); points up when open.
+pub(crate) fn draw_chevron(c: &mut Canvas, cx: i32, cy: i32, up: bool, color: Color) {
+    for i in 0..5 {
+        let half = 4 - i;
+        let y = if up { cy + 2 - i } else { cy - 2 + i };
+        c.draw_rect(cx - half, y, half * 2 + 1, 1, color);
+    }
 }

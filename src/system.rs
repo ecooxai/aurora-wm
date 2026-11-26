@@ -345,6 +345,189 @@ pub(crate) fn read_memory() -> (u64, u64, u64, u64) {
     )
 }
 
+fn user_config_dir() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".config"))
+}
+
+/// Screen rotation choice (Settings > Display > Rotation), applied by
+/// /usr/local/libexec/aurora-rotate (started from /etc/aurora/xinitrc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RotationMode {
+    /// Follow the accelerometer.
+    Auto,
+    /// Locked upright (0 degrees, "Off").
+    Normal,
+    /// Locked at 90 degrees (xrandr "left").
+    Left,
+    /// Locked at 180 degrees.
+    Inverted,
+    /// Locked at 270 degrees (xrandr "right").
+    Right,
+}
+
+/// Selector order and labels.
+pub(crate) const ROTATION_CHOICES: [(RotationMode, &str); 5] = [
+    (RotationMode::Auto, "Auto"),
+    (RotationMode::Normal, "Off"),
+    (RotationMode::Left, "90°"),
+    (RotationMode::Inverted, "180°"),
+    (RotationMode::Right, "270°"),
+];
+
+impl RotationMode {
+    /// The word stored in the mode file (also the xrandr rotation).
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            RotationMode::Auto => "auto",
+            RotationMode::Normal => "normal",
+            RotationMode::Left => "left",
+            RotationMode::Inverted => "inverted",
+            RotationMode::Right => "right",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Some(match key.trim().to_ascii_lowercase().as_str() {
+            "auto" => RotationMode::Auto,
+            "normal" | "off" | "0" | "locked" => RotationMode::Normal,
+            "left" | "90" => RotationMode::Left,
+            "inverted" | "180" => RotationMode::Inverted,
+            "right" | "270" => RotationMode::Right,
+            _ => return None,
+        })
+    }
+}
+
+/// One word per user (auto/normal/left/inverted/right), read by aurora-rotate.
+pub(crate) fn rotation_mode_path() -> PathBuf {
+    user_config_dir().join("aurora-wm").join("rotation")
+}
+
+/// Pre-selector lock file (auto rotate off); still honoured when no mode
+/// file exists, as "Off".
+fn legacy_rotation_lock_path() -> PathBuf {
+    user_config_dir().join("omarchy").join("rotation-lock")
+}
+
+pub(crate) fn rotation_mode() -> RotationMode {
+    match fs::read_to_string(rotation_mode_path()) {
+        Ok(text) => RotationMode::from_key(&text).unwrap_or(RotationMode::Auto),
+        Err(_) if legacy_rotation_lock_path().exists() => RotationMode::Normal,
+        Err(_) => RotationMode::Auto,
+    }
+}
+
+pub(crate) fn set_rotation_mode(mode: RotationMode) -> Result<(), String> {
+    let path = rotation_mode_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|err| format!("Rotation: {err}"))?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, format!("{}\n", mode.key()))
+        .and_then(|()| fs::rename(&tmp, &path))
+        .map_err(|err| format!("Rotation: {err}"))?;
+    let _ = fs::remove_file(legacy_rotation_lock_path());
+    wake_rotate_helper();
+    Ok(())
+}
+
+/// Nudge aurora-rotate to re-read the mode now instead of at its next poll:
+/// it sleeps reading this FIFO. Non-blocking; no reader (helper not
+/// running) is not an error.
+fn wake_rotate_helper() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let fifo = dir.join("aurora-rotate.wake");
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+    {
+        let _ = f.write_all(b"\n");
+    }
+}
+
+/// Whether an IIO accelerometer exists now. On some boots the AOP (motion
+/// coprocessor) firmware crashes during init and there is none until reboot.
+pub(crate) fn accelerometer_available() -> bool {
+    fs::read_dir("/sys/bus/iio/devices")
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().join("in_accel_x_raw").exists())
+        })
+        .unwrap_or(false)
+}
+
+/// One active swap area from /proc/swaps; zram devices carry their
+/// compressor and the RAM their compressed pages occupy.
+#[derive(Clone, Default)]
+pub(crate) struct SwapArea {
+    pub(crate) path: String,
+    pub(crate) zram: bool,
+    pub(crate) size_kb: u64,
+    pub(crate) used_kb: u64,
+    pub(crate) zram_algorithm: Option<String>,
+    pub(crate) zram_ram_kb: Option<u64>,
+}
+
+pub(crate) fn read_swaps() -> Vec<SwapArea> {
+    let Ok(text) = fs::read_to_string("/proc/swaps") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        // /proc/swaps escapes spaces in paths as \040.
+        let path = fields[0].replace("\\040", " ");
+        let size_kb = fields[2].parse().unwrap_or(0);
+        let used_kb = fields[3].parse().unwrap_or(0);
+        let zram_name = path
+            .strip_prefix("/dev/")
+            .filter(|name| name.starts_with("zram"))
+            .map(str::to_string);
+        let mut area = SwapArea { path, zram: zram_name.is_some(), size_kb, used_kb, ..Default::default() };
+        if let Some(name) = zram_name {
+            let sys = format!("/sys/block/{name}");
+            // "lzo [lz4] zstd": the selected algorithm is bracketed.
+            area.zram_algorithm = fs::read_to_string(format!("{sys}/comp_algorithm"))
+                .ok()
+                .and_then(|algos| {
+                    algos
+                        .split_whitespace()
+                        .find_map(|a| a.strip_prefix('[').and_then(|a| a.strip_suffix(']')))
+                        .map(str::to_string)
+                });
+            // mm_stat: orig_data_size compr_data_size mem_used_total ... (bytes)
+            area.zram_ram_kb = fs::read_to_string(format!("{sys}/mm_stat"))
+                .ok()
+                .and_then(|stat| stat.split_whitespace().nth(2)?.parse::<u64>().ok())
+                .map(|bytes| bytes / 1024);
+        }
+        out.push(area);
+    }
+    out
+}
+
+/// Compact size for swap rows: MB below 1 GB, otherwise GB.
+pub(crate) fn format_swap_size(kib: u64) -> String {
+    if kib < 1024 * 1024 {
+        format!("{} MB", (kib + 512) / 1024)
+    } else {
+        format_gb(kib)
+    }
+}
+
 pub(crate) fn read_gpus() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir("/sys/class/drm") {
@@ -694,25 +877,43 @@ pub(crate) fn move_current_audio_streams(kind: AudioDeviceKind, device_name: &st
 }
 
 pub(crate) fn read_network_details() -> Vec<String> {
-    let mut out = Vec::new();
+    // One line per real interface ("wld0  up  192.168.1.7/24"), live ones
+    // first: the card only has room for four. Tunnels and other non-Ethernet
+    // links (sit0, ip6tnl0) are skipped unless they carry an address.
+    let mut rows: Vec<(bool, String)> = Vec::new();
     for nic in read_nics() {
-        let state = fs::read_to_string(format!("/sys/class/net/{nic}/operstate"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        out.push(format!("{nic}  {state}"));
+        let read = |f: &str| {
+            fs::read_to_string(format!("/sys/class/net/{nic}/{f}"))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let state = read("operstate");
+        let ethernet = read("type") == "1";
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
         if let Ok(output) = Command::new("ip")
-            .args(["-o", "addr", "show", "dev", &nic])
+            .args(["-o", "addr", "show", "dev", &nic, "scope", "global"])
             .output()
         {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
                 let parts = line.split_whitespace().collect::<Vec<_>>();
-                if parts.len() > 3 && (parts[2] == "inet" || parts[2] == "inet6") {
-                    out.push(format!("{} {}", parts[2], parts[3]));
+                if parts.len() > 3 && parts[2] == "inet" {
+                    v4.push(parts[3].to_string());
+                } else if parts.len() > 3 && parts[2] == "inet6" {
+                    v6.push(parts[3].to_string());
                 }
             }
         }
+        if !ethernet && v4.is_empty() {
+            continue;
+        }
+        let addr = v4.first().or(v6.first()).cloned().unwrap_or_else(|| "no address".to_string());
+        let live = state == "up" && !v4.is_empty();
+        rows.push((live, format!("{nic}  {state}  {addr}")));
     }
+    rows.sort_by_key(|(live, _)| !*live);
+    let mut out = rows.into_iter().map(|(_, line)| line).collect::<Vec<_>>();
     if out.is_empty() {
         out.push("No network devices found".to_string());
     }
@@ -948,6 +1149,19 @@ pub(crate) fn read_u32_setting(key: &str, fallback: u32) -> u32 {
         .unwrap_or(fallback)
 }
 
+/// GTK scale saved in Settings → Display: 1, 2 or 3, or 0 when automatic.
+/// Older builds saved `ui_scale_percent`; that is read once and rounded to a
+/// whole scale (200 → 2, 125 → 1, 150 → 2).
+pub(crate) fn saved_gdk_scale() -> u32 {
+    if let Some(value) = read_setting_value("gdk_scale").and_then(|v| v.trim().parse::<u32>().ok()) {
+        return if (1..=3).contains(&value) { value } else { 0 };
+    }
+    match read_u32_setting("ui_scale_percent", 0) {
+        pct if pct >= 100 => ((pct + 50) / 100).clamp(1, 3),
+        _ => 0,
+    }
+}
+
 pub(crate) fn read_bool_setting(key: &str, fallback: bool) -> bool {
     read_setting_value(key)
         .and_then(|value| match value.trim() {
@@ -971,7 +1185,7 @@ pub(crate) fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
     fs::write(
         path,
         format!(
-            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\ncompositor_enabled={}\ndock_in_topbar={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\nshortcut_folder={}\nshortcut_terminal={}\nshortcut_clipboard={}\nshortcut_screenshot={}\n",
+            "terminal={}\nbrowser={}\nphoto={}\nvideo={}\nsleep_after_secs={}\nbrightness_percent={}\ncompositor_enabled={}\ndock_in_topbar={}\nauto_power_saver_enabled={}\nauto_power_saver_minutes={}\nshortcut_folder={}\nshortcut_terminal={}\nshortcut_clipboard={}\nshortcut_screenshot={}\ngdk_scale={}\ntopbar_keyboard={}\ntopbar_clipboard={}\ntopbar_screenshot={}\ntopbar_recording={}\ntopbar_display={}\ntopbar_audio={}\ntopbar_wifi={}\n",
             clean(&settings.terminal_command),
             clean(&settings.browser_command),
             clean(&settings.photo_command),
@@ -988,6 +1202,14 @@ pub(crate) fn save_app_commands(settings: &SettingsState) -> AnyResult<()> {
             shortcut_setting_string(settings.shortcuts.terminal),
             shortcut_setting_string(settings.shortcuts.clipboard),
             shortcut_setting_string(settings.shortcuts.screenshot),
+            settings.gdk_scale,
+            u8::from(settings.topbar_icons.keyboard),
+            u8::from(settings.topbar_icons.clipboard),
+            u8::from(settings.topbar_icons.screenshot),
+            u8::from(settings.topbar_icons.recording),
+            u8::from(settings.topbar_icons.display),
+            u8::from(settings.topbar_icons.audio),
+            u8::from(settings.topbar_icons.wifi),
         ),
     )?;
     Ok(())
@@ -1343,6 +1565,31 @@ pub(crate) fn command_can_launch(command: &str) -> bool {
     }
 }
 
+/// Byte counters per interface (name, rx, tx), excluding loopback.
+pub(crate) fn read_nic_totals() -> Vec<(String, u64, u64)> {
+    let Ok(text) = fs::read_to_string("/proc/net/dev") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines().skip(2) {
+        let Some((iface, data)) = line.split_once(':') else {
+            continue;
+        };
+        let name = iface.trim();
+        if name == "lo" {
+            continue;
+        }
+        let nums: Vec<u64> = data
+            .split_whitespace()
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect();
+        if nums.len() >= 16 {
+            out.push((name.to_string(), nums[0], nums[8]));
+        }
+    }
+    out
+}
+
 pub(crate) fn read_net_totals() -> Option<NetTotals> {
     let text = fs::read_to_string("/proc/net/dev").ok()?;
     let mut rx = 0u64;
@@ -1469,5 +1716,231 @@ mod desktop_catalog_cache_tests {
         assert_ne!(removed, edited);
         assert!(removed.iter().all(|(path, _, _)| path != &application));
         fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+pub(crate) fn read_cpu_mhz() -> u32 {
+    let mut khz = 0u64;
+    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
+        for entry in entries.flatten() {
+            if let Some(v) = fs::read_to_string(entry.path().join("scaling_cur_freq"))
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+            {
+                khz = khz.max(v);
+            }
+        }
+    }
+    (khz / 1000) as u32
+}
+
+/// Battery state for the topbar (re-read every idle tick; two tiny sysfs reads).
+pub(crate) fn read_topbar_status() -> TopbarStatus {
+    let read = |path: &std::path::Path| fs::read_to_string(path).ok().map(|s| s.trim().to_string());
+    let mut status = TopbarStatus::default();
+    if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match read(&path.join("type")).as_deref() {
+                Some("Battery") if status.battery_pct.is_none() => {
+                    status.battery_pct = read(&path.join("capacity"))
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .map(|v| v.min(100) as u8);
+                    let state = read(&path.join("status")).unwrap_or_default();
+                    status.charging |= matches!(state.as_str(), "Charging" | "Full");
+                }
+                Some("Mains" | "USB") => {
+                    status.charging |= read(&path.join("online")).as_deref() == Some("1");
+                }
+                _ => {}
+            }
+        }
+    }
+    status
+}
+
+pub(crate) fn format_gb(kib: u64) -> String {
+    let gb = kib as f64 / 1024.0 / 1024.0;
+    if gb >= 10.0 { format!("{gb:.0} GB") } else { format!("{gb:.1} GB") }
+}
+
+/// GPU memory in use by this user's processes, from DRM fdinfo
+/// (drm-resident-*/drm-total-* keys, deduplicated by drm-client-id), in KiB.
+fn read_drm_client_memory_kib(driver: &str) -> Option<u64> {
+    let mut seen = HashSet::new();
+    let mut total = 0u64;
+    let mut any = false;
+    let procs = fs::read_dir("/proc").ok()?;
+    for proc_entry in procs.flatten() {
+        let name = proc_entry.file_name();
+        if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(proc_entry.path().join("fd")) else { continue };
+        for fd in fds.flatten() {
+            let Ok(target) = fs::read_link(fd.path()) else { continue };
+            if !target.to_string_lossy().starts_with("/dev/dri/") {
+                continue;
+            }
+            let info_path = proc_entry.path().join("fdinfo").join(fd.file_name());
+            let Ok(info) = fs::read_to_string(info_path) else { continue };
+            let mut driver_ok = false;
+            let mut client = None;
+            let mut resident = 0u64;
+            let mut total_mem = 0u64;
+            for line in info.lines() {
+                let Some((key, value)) = line.split_once(':') else { continue };
+                let value = value.trim();
+                let parse = |v: &str| {
+                    let mut it = v.split_whitespace();
+                    let n = it.next()?.parse::<u64>().ok()?;
+                    Some(match it.next() {
+                        Some("MiB") => n * 1024,
+                        Some("GiB") => n * 1024 * 1024,
+                        Some("KiB") => n,
+                        _ => n / 1024,
+                    })
+                };
+                match key {
+                    "drm-driver" => driver_ok = value == driver,
+                    "drm-client-id" => client = value.parse::<u64>().ok(),
+                    k if k.starts_with("drm-resident-") => resident += parse(value).unwrap_or(0),
+                    k if k.starts_with("drm-total-") => total_mem += parse(value).unwrap_or(0),
+                    _ => {}
+                }
+            }
+            if !driver_ok {
+                continue;
+            }
+            if let Some(id) = client {
+                if !seen.insert(id) {
+                    continue;
+                }
+            }
+            any = true;
+            total += if resident > 0 { resident } else { total_mem };
+        }
+    }
+    any.then_some(total)
+}
+
+/// Parses a devfreq `trans_stat` table into (frequency Hz, residency ms) rows.
+fn read_devfreq_residency(devfreq: &Path) -> Option<Vec<(u64, u64)>> {
+    let text = fs::read_to_string(devfreq.join("trans_stat")).ok()?;
+    let rows: Vec<(u64, u64)> = text
+        .lines()
+        .filter_map(|line| {
+            let (head, rest) = line.split_once(':')?;
+            let hz = head.trim().trim_start_matches('*').trim().parse::<u64>().ok()?;
+            let ms = rest.split_whitespace().last()?.parse::<u64>().ok()?;
+            Some((hz, ms))
+        })
+        .collect();
+    (!rows.is_empty()).then_some(rows)
+}
+
+/// Load estimate from devfreq residency since the previous sample: where the
+/// time-weighted clock sat between the lowest and highest p-state. The
+/// ondemand governor tracks GPU busy time, so this follows real load without
+/// needing driver-specific busy counters (PowerVR exposes none).
+fn devfreq_load(prev: Option<&Vec<(u64, u64)>>, now: &[(u64, u64)]) -> Option<f32> {
+    let min = now.iter().map(|r| r.0).min()?;
+    let max = now.iter().map(|r| r.0).max()?;
+    if max <= min {
+        return None;
+    }
+    let prev = prev?;
+    let mut weighted = 0f64;
+    let mut total = 0f64;
+    for &(hz, ms) in now {
+        let before = prev.iter().find(|r| r.0 == hz).map_or(0, |r| r.1);
+        let dt = ms.saturating_sub(before) as f64;
+        weighted += dt * hz as f64;
+        total += dt;
+    }
+    if total <= 0.0 {
+        return Some(0.0);
+    }
+    let avg = weighted / total;
+    Some((((avg - min as f64) / (max - min) as f64) * 100.0).clamp(0.0, 100.0) as f32)
+}
+
+pub(crate) fn read_gpu_info(
+    prev_residency: &mut HashMap<String, Vec<(u64, u64)>>,
+) -> Vec<(String, Option<f32>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else { return out };
+    let mut cards: Vec<_> = entries
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with("card") && !n.contains('-')
+        })
+        .map(|e| e.path())
+        .collect();
+    cards.sort();
+    for card in cards {
+        let dev = card.join("device");
+        let driver = fs::read_link(dev.join("driver"))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        // Display-only controllers are not GPUs.
+        if driver.is_empty() || driver.contains("adp") || driver.contains("display") || driver.contains("adbe") {
+            continue;
+        }
+        let mut parts = vec![match driver.as_str() {
+            "powervr" => "PowerVR".to_string(),
+            "amdgpu" => "AMD".to_string(),
+            "i915" | "xe" => "Intel".to_string(),
+            "nvidia" | "nouveau" => "NVIDIA".to_string(),
+            "asahi" => "Apple AGX".to_string(),
+            other => other.to_string(),
+        }];
+        let devfreq_dir = fs::read_dir(dev.join("devfreq"))
+            .ok()
+            .and_then(|mut d| d.next())
+            .and_then(|e| e.ok())
+            .map(|e| e.path());
+        let mut load = None;
+        if let Some(dir) = devfreq_dir.as_deref() {
+            if let Some(hz) = fs::read_to_string(dir.join("cur_freq"))
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+            {
+                parts.push(format!("{} MHz", hz / 1_000_000));
+            }
+            if let Some(now) = read_devfreq_residency(dir) {
+                let key = card.to_string_lossy().to_string();
+                load = devfreq_load(prev_residency.get(&key), &now);
+                prev_residency.insert(key, now);
+            }
+        }
+        let busy = fs::read_to_string(dev.join("gpu_busy_percent"))
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok());
+        if busy.is_some() {
+            load = busy;
+        }
+        let vram = |name: &str| {
+            fs::read_to_string(dev.join(name)).ok().and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        if let (Some(used), Some(total)) = (vram("mem_info_vram_used"), vram("mem_info_vram_total")) {
+            parts.push(format!("VRAM {} / {}", format_gb(used / 1024), format_gb(total / 1024)));
+        } else if let Some(kib) = read_drm_client_memory_kib(&driver).filter(|&k| k >= 1024) {
+            parts.push(format!("{:.0} MB shared", kib as f64 / 1024.0));
+        } else {
+            parts.push("shared RAM".to_string());
+        }
+        out.push((parts.join("  ·  "), load));
+    }
+    out
+}
+
+pub(crate) fn format_cpu_clock(mhz: u32) -> String {
+    if mhz >= 1000 {
+        format!("{:.2} GHz", f64::from(mhz) / 1000.0)
+    } else {
+        format!("{mhz} MHz")
     }
 }

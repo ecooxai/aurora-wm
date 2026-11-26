@@ -67,10 +67,16 @@ pub(crate) fn render_wallpaper_pixels(
     screen_width: u16,
     screen_height: u16,
 ) -> AnyResult<Vec<u8>> {
-    render_cover_pixels_nearest(bytes, screen_width, screen_height)
+    // The wallpaper buffer is at physical resolution; callers pass logical size.
+    let w = crate::scale::px_len(u32::from(screen_width)).min(u32::from(u16::MAX)) as u16;
+    let h = crate::scale::px_len(u32::from(screen_height)).min(u32::from(u16::MAX)) as u16;
+    render_cover_pixels_nearest(bytes, w, h)
 }
 
 pub(crate) fn render_asset_preview_pixels(bytes: &[u8], w: u16, h: u16) -> AnyResult<Vec<u8>> {
+    // Physical size; paint_bgr_pixels maps it 1:1.
+    let w = crate::scale::px_len(u32::from(w)) as u16;
+    let h = crate::scale::px_len(u32::from(h)) as u16;
     render_cover_pixels_nearest(bytes, w, h)
 }
 
@@ -87,6 +93,42 @@ pub(crate) fn render_cover_pixels_nearest(bytes: &[u8], w: u16, h: u16) -> AnyRe
     let src_x0 = ((iw as f32 - view_w) * 0.5).max(0.0);
     let src_y0 = ((ih as f32 - view_h) * 0.5).max(0.0);
     let raw = img.as_raw();
+    if scale > 1.05 {
+        // Upscaling (e.g. landscape art covering a portrait HiDPI panel):
+        // bilinear avoids blocky nearest-neighbour stairs.
+        let mut out = vec![0; usize::from(w) * usize::from(h) * 4];
+        let stride = iw as usize * 4;
+        let max_x = iw.saturating_sub(1) as f32;
+        let max_y = ih.saturating_sub(1) as f32;
+        let xs: Vec<(usize, usize, f32)> = (0..u32::from(w))
+            .map(|x| {
+                let fx = (src_x0 + (x as f32 + 0.5) * view_w / f32::from(w) - 0.5).clamp(0.0, max_x);
+                let x0 = fx.floor() as usize;
+                (x0, (x0 + 1).min(max_x as usize), fx - x0 as f32)
+            })
+            .collect();
+        for y in 0..usize::from(h) {
+            let fy = (src_y0 + (y as f32 + 0.5) * view_h / f32::from(h) - 0.5).clamp(0.0, max_y);
+            let y0 = fy.floor() as usize;
+            let y1 = (y0 + 1).min(max_y as usize);
+            let ty = fy - y0 as f32;
+            let (r0, r1) = (y0 * stride, y1 * stride);
+            for (x, &(x0, x1, tx)) in xs.iter().enumerate() {
+                let dst = (y * usize::from(w) + x) * 4;
+                for ch in 0..3 {
+                    let a = f32::from(raw[r0 + x0 * 4 + ch]);
+                    let b = f32::from(raw[r0 + x1 * 4 + ch]);
+                    let c = f32::from(raw[r1 + x0 * 4 + ch]);
+                    let d = f32::from(raw[r1 + x1 * 4 + ch]);
+                    let top = a + (b - a) * tx;
+                    let bot = c + (d - c) * tx;
+                    // Output is BGRX.
+                    out[dst + 2 - ch] = (top + (bot - top) * ty).round() as u8;
+                }
+            }
+        }
+        return Ok(out);
+    }
     let x_map = (0..u32::from(w))
         .map(|x| {
             (src_x0 + (x as f32 + 0.5) * view_w / f32::from(w))
@@ -122,6 +164,15 @@ pub(crate) fn paint_bgr_pixels(c: &mut Canvas, pixels: &[u8], x: i32, y: i32, w:
     if w <= 0 || h <= 0 {
         return;
     }
+    let (pw, ph) = (crate::scale::px_len(w as u32), crate::scale::px_len(h as u32));
+    if c.s != 1.0 && pixels.len() == (pw * ph * 4) as usize {
+        let rgba: Vec<u8> = pixels
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], 255])
+            .collect();
+        c.paint_rgba_image(&rgba, pw, ph, x, y, w, h, true);
+        return;
+    }
     for yy in 0..h {
         for xx in 0..w {
             let idx = ((yy * w + xx) * 4) as usize;
@@ -138,6 +189,11 @@ pub(crate) fn paint_bgr_pixels(c: &mut Canvas, pixels: &[u8], x: i32, y: i32, w:
 
 pub(crate) fn paint_rgba_pixels(c: &mut Canvas, pixels: &[u8], x: i32, y: i32, w: i32, h: i32) {
     if w <= 0 || h <= 0 {
+        return;
+    }
+    let (pw, ph) = (crate::scale::px_len(w as u32), crate::scale::px_len(h as u32));
+    if c.s != 1.0 && pixels.len() == (pw * ph * 4) as usize {
+        c.paint_rgba_image(pixels, pw, ph, x, y, w, h, false);
         return;
     }
     for yy in 0..h {
@@ -161,12 +217,9 @@ pub(crate) fn paint_rgba_pixels(c: &mut Canvas, pixels: &[u8], x: i32, y: i32, w
 
 pub(crate) fn decode_icon_pixels(bytes: &[u8], size: i32) -> AnyResult<Vec<u8>> {
     let img = image::load_from_memory(bytes)?.to_rgba8();
-    let resized = image::imageops::resize(
-        &img,
-        size.max(1) as u32,
-        size.max(1) as u32,
-        FilterType::Triangle,
-    );
+    // Decoded at physical size; paint_rgba_pixels maps it 1:1.
+    let ps = crate::scale::px_len(size.max(1) as u32);
+    let resized = image::imageops::resize(&img, ps, ps, FilterType::Triangle);
     Ok(resized.into_raw())
 }
 
@@ -318,15 +371,13 @@ pub(crate) fn paint_file_preview(c: &mut Canvas, path: &std::path::Path, x: i32,
     let scale = (w as f32 / iw as f32).min(h as f32 / ih as f32);
     let nw = (iw as f32 * scale).round().max(1.0) as u32;
     let nh = (ih as f32 * scale).round().max(1.0) as u32;
-    let resized = image::imageops::resize(&img, nw, nh, FilterType::Triangle);
+    // Resize to the physical size of the slot, then paint 1:1.
+    let pnw = crate::scale::px_len(nw);
+    let pnh = crate::scale::px_len(nh);
+    let resized = image::imageops::resize(&img, pnw, pnh, FilterType::Triangle);
     let dx = x + (w - nw as i32) / 2;
     let dy = y + (h - nh as i32) / 2;
-    for yy in 0..nh as i32 {
-        for xx in 0..nw as i32 {
-            let p = resized.get_pixel(xx as u32, yy as u32);
-            c.blend_pixel(dx + xx, dy + yy, Color::rgba(p[0], p[1], p[2], 255));
-        }
-    }
+    c.paint_rgba_image(resized.as_raw(), pnw, pnh, dx, dy, nw as i32, nh as i32, true);
 }
 
 pub(crate) fn render_image_preview(path: &std::path::Path, w: i32, h: i32) -> Option<ImagePreview> {
@@ -467,6 +518,13 @@ pub(crate) fn scale_masked_channel(pixel: u32, mask: u32) -> u8 {
 
 pub(crate) fn canvas_from_preview(preview: &ImagePreview, width: u16, height: u16) -> Canvas {
     let mut c = Canvas::new(width, height, Color::rgba(0, 0, 0, 255));
+    if preview.width == c.pw && preview.height == c.ph {
+        // Physical capture of the same area: copy rows straight in.
+        for (dst, src) in c.data.chunks_exact_mut(4).zip(preview.pixels.chunks_exact(4)) {
+            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+        }
+        return c;
+    }
     let pw = usize::from(preview.width);
     let ph = usize::from(preview.height);
     let cw = usize::from(width);
@@ -475,11 +533,18 @@ pub(crate) fn canvas_from_preview(preview: &ImagePreview, width: u16, height: u1
         for xx in 0..pw.min(cw) {
             let src = (yy * pw + xx) * 4;
             let dst = (yy * cw + xx) * 4;
-            if src + 3 < preview.pixels.len() && dst + 3 < c.data.len() {
-                c.data[dst] = preview.pixels[src + 2];
-                c.data[dst + 1] = preview.pixels[src + 1];
-                c.data[dst + 2] = preview.pixels[src];
-                c.data[dst + 3] = preview.pixels[src + 3];
+            let _ = dst;
+            if src + 3 < preview.pixels.len() {
+                c.set_pixel_raw(
+                    xx as i32,
+                    yy as i32,
+                    [
+                        preview.pixels[src + 2],
+                        preview.pixels[src + 1],
+                        preview.pixels[src],
+                        preview.pixels[src + 3],
+                    ],
+                );
             }
         }
     }
@@ -489,6 +554,21 @@ pub(crate) fn canvas_from_preview(preview: &ImagePreview, width: u16, height: u1
 pub(crate) fn paint_preview_region(c: &mut Canvas, preview: &ImagePreview, x: i32, y: i32, w: i32, h: i32) {
     let pw = i32::from(preview.width);
     let ph = i32::from(preview.height);
+    if c.s != 1.0 && preview.width == c.pw {
+        // Physical screen capture: copy the physical span of the region.
+        let (x0, w) = crate::scale::px_span(x, w);
+        let (y0, h) = crate::scale::px_span(y, h);
+        for py in y0.max(0)..(y0 + h).min(ph) {
+            for pxx in x0.max(0)..(x0 + w).min(pw) {
+                let i = ((py * pw + pxx) * 4) as usize;
+                if i + 3 < preview.pixels.len() {
+                    let p = &preview.pixels[i..i + 4];
+                    c.blend_phys(pxx, py, Color::rgba(p[0], p[1], p[2], 255));
+                }
+            }
+        }
+        return;
+    }
     for yy in 0..h {
         for xx in 0..w {
             let sx = x + xx;

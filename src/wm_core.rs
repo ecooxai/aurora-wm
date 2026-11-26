@@ -70,6 +70,7 @@ impl Aurora {
         screen_num: usize,
         compositor_override: Option<bool>,
     ) -> AnyResult<Self> {
+        let conn = crate::scale::ScaledConn(conn);
         let gc = conn.generate_id()?;
         conn.create_gc(
             gc,
@@ -134,6 +135,7 @@ impl Aurora {
                 conn.generate_id()?,
             ],
             dock_more_menu: conn.generate_id()?,
+            hold_menu: conn.generate_id()?,
             title_menu: conn.generate_id()?,
             confirm_dialog: conn.generate_id()?,
             tooltip: conn.generate_id()?,
@@ -167,6 +169,8 @@ impl Aurora {
             wallpaper_previews,
             wallpaper_pixmap: None,
             compositor_active,
+            screen_asleep: false,
+            sleep_cover: None,
             shape_supported,
             ui,
             regular,
@@ -191,6 +195,7 @@ impl Aurora {
             pending_ui_resize: None,
             ui_resize: None,
             pending_client_drag: None,
+            pending_titlebar: None,
             title_hover: None,
             ignored_unmaps: Vec::new(),
             settings_visible: true,
@@ -227,6 +232,10 @@ impl Aurora {
             app_menu_expanded_categories: HashSet::new(),
             dock_more_visible: false,
             dock_more_scroll: 0,
+            hold_menu_open: None,
+            pending_hold: None,
+            confirm_workspace: None,
+            app_priorities: crate::app_control::load_priorities(),
             aurora_menu_visible: false,
             aurora_menu_about: false,
             aurora_menu_restart_confirm: false,
@@ -243,6 +252,9 @@ impl Aurora {
             clipboard_dirty: true,
             last_seen_clipboard_text: None,
             last_seen_clipboard_image_sig: None,
+            clipboard_selection: None,
+            selection_poll_rx: None,
+            last_selection_poll: Instant::now(),
             command_paste_armed: false,
             wm_s_atom,
             folder_context_open: false,
@@ -257,7 +269,8 @@ impl Aurora {
             xdnd_source: None,
             dock_last_click: None,
             icon_cache: HashMap::new(),
-            last_clock_label: format_clock(),
+            last_clock_label: format_clock(false),
+            clock_show_date: false,
             last_tick: Instant::now(),
             last_media_tick: Instant::now(),
             last_pointer_pos: None,
@@ -289,7 +302,12 @@ impl Aurora {
             title_menu_open: None,
             title_menu_workspaces: false,
             confirm_close: None,
+            confirm_command: None,
+            app_menu_power_open: false,
+            net_restart_rx: None,
             tooltip_shown: None,
+            topbar_status: read_topbar_status(),
+            osk: Default::default(),
         };
         app.apply_sleep_timeout();
         if app.settings.auto_power_saver_enabled && app.settings.auto_power_saver_minutes > 0 {
@@ -299,6 +317,17 @@ impl Aurora {
         let _ = save_app_commands(&app.settings);
         app.create_ui_windows()?;
         app.request_settings_data(app.settings.tab);
+        // Screen sleep: the X screensaver timer blanks the screen; we hear
+        // about it and power the backlight down (see set_screen_asleep).
+        let _ = app.conn.screensaver_select_input(
+            app.root,
+            x11rb::protocol::screensaver::Event::NOTIFY_MASK,
+        );
+        app.apply_sleep_timeout();
+        // Start in step with the server: a WM (re)started while the X
+        // screensaver is already on never gets its ON notify, and would treat
+        // the next OFF as "already awake", leaving the backlight powered down.
+        app.sync_screen_sleep_with_server();
         if let Err(err) = app.init_clipboard_watcher() {
             eprintln!("aurora-wm: clipboard watcher unavailable, using polling: {err}");
         }
@@ -310,6 +339,7 @@ impl Aurora {
         let mut trace_counts: HashMap<&'static str, usize> = HashMap::new();
         let mut next_trace_log = Instant::now() + Duration::from_secs(1);
         let mut next_pointer_poll = Instant::now();
+        let mut next_backlight_check = Instant::now();
         let mut last_builtin_front = self.builtin_window_is_front();
         loop {
             let mut handled_event = false;
@@ -339,6 +369,7 @@ impl Aurora {
 
             if self.poll_screen_recording()? { handled_event = true; }
             if self.poll_recording_button()? { handled_event = true; }
+            if self.poll_hold()? { handled_event = true; }
             if self.folder_terminal.visible && self.poll_folder_terminal()? {
                 handled_event = true;
             }
@@ -368,6 +399,7 @@ impl Aurora {
             let needs_pointer_poll = self.pending_resize.is_some()
                 || self.pending_ui_resize.is_some()
                 || self.pending_client_drag.is_some()
+                || self.pending_titlebar.is_some()
                 || self.settings.auto_power_saver_slider_dragging
                 || self.drag.is_some()
                 || self.ui_resize.is_some()
@@ -409,6 +441,22 @@ impl Aurora {
                 }
             }
 
+            if let (Some(pending), Some(pointer)) = (self.pending_titlebar, pointer.as_ref()) {
+                let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
+                let moved = (i32::from(pointer.root_x) - i32::from(pending.root_x)).abs() > 4
+                    || (i32::from(pointer.root_y) - i32::from(pending.root_y)).abs() > 4;
+                if moved && self.drag.is_none() {
+                    self.start_titlebar_move(pending)?;
+                    let _ = self.update_drag_position_inner(pointer.root_x, pointer.root_y, false)?;
+                } else if !button_down {
+                    // The release never reached the event stream: finish the click from the poll.
+                    if let Some(press) = self.pending_titlebar.take() {
+                        if self.drag.is_none() {
+                            self.run_titlebar_press(press.client, press.press)?;
+                        }
+                    }
+                }
+            }
             if let (Some(pending), Some(pointer)) = (self.pending_client_drag, pointer.as_ref()) {
                 let button_down = u16::from(pointer.mask) & u16::from(KeyButMask::BUTTON1) != 0;
                 if !button_down {
@@ -508,6 +556,9 @@ impl Aurora {
             if self.process_pending_window_nudges()? {
                 handled_event = true;
             }
+            if self.touch_keyboard_tick()? {
+                handled_event = true;
+            }
             if self.poll_settings_data()? {
                 handled_event = true;
             }
@@ -528,6 +579,7 @@ impl Aurora {
                 || self.pending_resize.is_some()
                 || self.pending_ui_resize.is_some()
                 || self.pending_client_drag.is_some()
+                || self.pending_titlebar.is_some()
                 || self.settings.auto_power_saver_slider_dragging
                 || self.pending_screenshot_button.is_some();
 
@@ -538,9 +590,13 @@ impl Aurora {
                 if self.poll_wifi_refresh()? {
                     idle_changed = true;
                 }
+                if self.poll_net_restart()? {
+                    idle_changed = true;
+                }
                 if self.poll_clipboard_history()? {
                     idle_changed = true;
                 }
+                self.poll_selection_preview()?;
                 if self.poll_clipboard_image_previews()? {
                     idle_changed = true;
                 }
@@ -558,8 +614,11 @@ impl Aurora {
                     idle_changed = true;
                 }
 
-                let clock_label = format_clock();
-                let clock_changed = clock_label != self.last_clock_label;
+                let status = read_topbar_status();
+                let status_changed = status != self.topbar_status;
+                self.topbar_status = status;
+                let clock_label = format_clock(self.clock_show_date);
+                let clock_changed = clock_label != self.last_clock_label || status_changed;
                 let metrics_visible = self.settings_visible
                     && matches!(self.settings.tab, SettingsTab::Power | SettingsTab::About);
                 if clock_changed || metrics_visible {
@@ -601,6 +660,14 @@ impl Aurora {
                 }
             }
 
+            if Instant::now() >= next_backlight_check {
+                self.keep_backlight_awake();
+                // Asleep, check often: omarchy-powerd lights the panel on a button
+                // press, and the sleep cover must not stay black over it.
+                next_backlight_check = Instant::now()
+                    + if self.screen_asleep { Duration::from_millis(250) } else { Duration::from_secs(2) };
+            }
+
             if trace_events && Instant::now() >= next_trace_log {
                 if !trace_counts.is_empty() {
                     eprintln!("event counts: {:?}", trace_counts);
@@ -636,6 +703,7 @@ impl Aurora {
             || self.pending_resize.is_some()
             || self.pending_ui_resize.is_some()
             || self.pending_client_drag.is_some()
+            || self.pending_titlebar.is_some()
             || self.settings.auto_power_saver_slider_dragging
             || self.pending_screenshot_button.is_some();
         let mut timeout = if handled_event {
@@ -670,6 +738,13 @@ impl Aurora {
                 (pending.pressed_at + Duration::from_millis(500)).saturating_duration_since(now),
             );
         }
+        if let Some(pending) = self.pending_hold.as_ref() {
+            if !pending.done {
+                timeout = timeout.min(
+                    (pending.pressed_at + crate::hold_menu::HOLD_DELAY).saturating_duration_since(now),
+                );
+            }
+        }
         if let Some(pending) = self.pending_screenshot_button {
             timeout = timeout
                 .min((pending.pressed_at + Duration::from_secs(2)).saturating_duration_since(now));
@@ -683,6 +758,9 @@ impl Aurora {
             timeout = timeout.min((*until).saturating_duration_since(now));
         }
         if let Some(at) = self.pending_auto_power_saver_apply {
+            timeout = timeout.min(at.saturating_duration_since(now));
+        }
+        if let Some(at) = self.osk.repeat_at {
             timeout = timeout.min(at.saturating_duration_since(now));
         }
         if self.has_playing_internal_media() {
@@ -1026,6 +1104,26 @@ impl Aurora {
             &more_menu_aux,
         )?;
 
+        let hold_aux = CreateWindowAux::new()
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS)
+            .cursor(self.cursor)
+            .background_pixel(0)
+            .backing_store(BackingStore::WHEN_MAPPED);
+        self.conn.create_window(
+            self.depth,
+            self.ui.hold_menu,
+            self.root,
+            0,
+            0,
+            crate::hold_menu::MENU_WIDTH,
+            40,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual,
+            &hold_aux,
+        )?;
+
         let aurora_menu = self.aurora_menu_geometry();
         let aurora_menu_aux = CreateWindowAux::new()
             .override_redirect(1)
@@ -1143,6 +1241,7 @@ impl Aurora {
             self.ui.aurora_menu,
             self.ui.clipboard_menu,
             self.ui.dock_more_menu,
+            self.ui.hold_menu,
         ];
         windows.extend(self.ui.media);
         windows.extend(self.clients.values().map(|info| info.frame));

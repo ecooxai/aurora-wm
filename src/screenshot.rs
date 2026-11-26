@@ -199,6 +199,8 @@ impl Aurora {
             i32::from(self.screen_width),
             i32::from(self.screen_height),
         ));
+        let (x, w) = crate::scale::px_span(x, w);
+        let (y, h) = crate::scale::px_span(y, h);
         let Ok((pixels, width, height)) = capture_root_rgba(
             &self.conn,
             self.root,
